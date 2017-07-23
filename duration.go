@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-func formatDuration(duration time.Duration, includeMillis bool) string {
+func FormatDuration(duration time.Duration, includeMillis bool) string {
 	if duration < 0 {
 		duration = 0
 	}

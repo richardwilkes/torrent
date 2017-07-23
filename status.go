@@ -48,7 +48,7 @@ func (s Status) String() string {
 	case Seeding:
 		return fmt.Sprintf("Seeding: Up %.2f KB/s   %s remaining   Peers %dC/%dL/%dP",
 			float64(s.UploadBytesPerSecond)/1024,
-			formatDuration(time.Until(s.SeedingStopsAt), false),
+			FormatDuration(time.Until(s.SeedingStopsAt), false),
 			s.PeersConnected,
 			s.Leechers,
 			s.Seeders)
