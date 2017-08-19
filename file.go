@@ -13,7 +13,8 @@ import (
 	"github.com/zeebo/bencode"
 )
 
-const downloadExt = ".tordata"
+// DownloadExt is the extension used for the torrent download data file.
+const DownloadExt = ".tordata"
 
 // File holds the contents of a .torrent file.
 type File struct {
@@ -136,10 +137,10 @@ func (f *File) StoragePath() string {
 	dir, filename := filepath.Split(f.Path)
 	ext := filepath.Ext(filename)
 	filename = filename[:len(filename)-len(ext)]
-	if len(filename)+len(downloadExt) > 255 {
-		filename = filename[:255-len(downloadExt)]
+	if len(filename)+len(DownloadExt) > 255 {
+		filename = filename[:255-len(DownloadExt)]
 	}
-	return filepath.Join(dir, filename+downloadExt)
+	return filepath.Join(dir, filename+DownloadExt)
 }
 
 func (f *File) validate(index int, buffer []byte) bool {
