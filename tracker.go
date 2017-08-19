@@ -96,12 +96,6 @@ func (t *tracker) peerAddressesMap() map[string]int {
 	return t.peerAddresses
 }
 
-func (t *tracker) state() State {
-	t.lock.RLock()
-	defer t.lock.RUnlock()
-	return t.currentState
-}
-
 func (t *tracker) setStateAndProgress(state State, progress float64) {
 	t.lock.Lock()
 	t.currentState = state
