@@ -178,7 +178,7 @@ func (p *peer) processIncomingMessages() {
 	for {
 		if err := readWithDeadline(p.conn, lengthBuffer, msgReadDeadline); err != nil {
 			if shouldLogIOError(err) {
-				p.logger.Error(err)
+				p.logger.Warn(err)
 			}
 			return
 		}
@@ -187,7 +187,7 @@ func (p *peer) processIncomingMessages() {
 			buffer := make([]byte, length)
 			if err := readWithDeadline(p.conn, buffer, msgReadDeadline); err != nil {
 				if shouldLogIOError(err) {
-					p.logger.Error(err)
+					p.logger.Warn(err)
 				}
 				return
 			}
@@ -220,7 +220,7 @@ func (p *peer) processIncomingMessages() {
 				p.lock.Lock()
 				if length != uint32(1+len(p.has.data)) {
 					p.lock.Unlock()
-					p.logger.Errorf("Expected bit field to be %d bytes long, but was %d bytes long", len(p.has.data), length-1)
+					p.logger.Warnf("Expected bit field to be %d bytes long, but was %d bytes long", len(p.has.data), length-1)
 					return
 				}
 				p.has.data = buffer[1:]
@@ -236,7 +236,7 @@ func (p *peer) processIncomingMessages() {
 			case pieceID:
 				if err := p.receivedChunk(int(binary.BigEndian.Uint32(buffer[1:5])), int(binary.BigEndian.Uint32(buffer[5:9])), buffer[9:]); err != nil {
 					if shouldLogIOError(err) {
-						p.logger.Error(err)
+						p.logger.Warn(err)
 					}
 					return
 				}
@@ -253,7 +253,7 @@ func (p *peer) processIncomingMessages() {
 		p.lock.Unlock()
 		if err := <-p.client.InRate.Use(int(length + 4)); err != nil {
 			if shouldLogIOError(err) {
-				p.logger.Error(err)
+				p.logger.Warn(err)
 			}
 			return
 		}
@@ -422,7 +422,7 @@ func (p *peer) processPieceRequests(in chan *pieceRequest) {
 		if _, err := p.client.file.ReadAt(buffer[13:], p.client.torrentFile.offsetOf(req.index)+int64(req.begin)); err != nil {
 			p.logger.Error(errs.NewfWithCause(err, "Unable to read piece %d (begin=%d, length=%d)", req.index, req.begin, req.length))
 			if err = p.conn.Close(); shouldLogIOError(err) {
-				p.logger.Error(err)
+				p.logger.Warn(err)
 			}
 			return
 		}
@@ -452,10 +452,10 @@ func (p *peer) processWriteQueue() {
 		}
 		if err != nil || buffer == nil {
 			if shouldLogIOError(err) {
-				p.logger.Error(err)
+				p.logger.Warn(err)
 			}
 			if err = p.conn.Close(); shouldLogIOError(err) {
-				p.logger.Error(err)
+				p.logger.Warn(err)
 			}
 			// Drain any remaining entries in the queue
 			for {

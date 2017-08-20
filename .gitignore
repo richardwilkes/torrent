@@ -1,3 +1,4 @@
 *.torrent
 *.tordata
 logs
+.dirtlock

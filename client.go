@@ -307,14 +307,14 @@ func (c *Client) prepareFile() error {
 func (c *Client) handleConnection(conn net.Conn, log Logger, extensions [extensionsSize]byte, infoHash [sha1.Size]byte, sendHandshake bool) {
 	log = &Prefixer{Logger: log, Prefix: c.logger.Prefix}
 	if !bytes.Equal(infoHash[:], c.torrentFile.InfoHash[:]) {
-		log.Error("Rejecting due to InfoHash mis-match")
+		log.Warn("Rejecting due to InfoHash mis-match")
 		return
 	}
 	if sendHandshake {
 		var myExtensions [extensionsSize]byte
 		if err := sendTorrentHandshake(conn, myExtensions, c.torrentFile.InfoHash, c.id); err != nil {
 			if shouldLogIOError(err) {
-				log.Error(err)
+				log.Warn(err)
 			}
 			return
 		}
@@ -322,7 +322,7 @@ func (c *Client) handleConnection(conn net.Conn, log Logger, extensions [extensi
 	var peerID [peerIDSize]byte
 	if err := readWithDeadline(conn, peerID[:], 0); err != nil {
 		if shouldLogIOError(err) {
-			log.Error(err)
+			log.Warn(err)
 		}
 		return
 	}
@@ -353,14 +353,14 @@ func (c *Client) connectToPeer(addr string, port int) {
 	raddr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf("%s:%d", addr, port))
 	if err != nil {
 		if shouldLogIOError(err) {
-			c.logger.Error(errs.Wrap(err))
+			c.logger.Warn(errs.Wrap(err))
 		}
 		return
 	}
 	conn, err := net.DialTCP("tcp", nil, raddr)
 	if err != nil {
 		if shouldLogIOError(err) {
-			c.logger.Error(errs.Wrap(err))
+			c.logger.Warn(errs.Wrap(err))
 		}
 		return
 	}
@@ -375,14 +375,14 @@ func (c *Client) connectToPeer(addr string, port int) {
 	var myExtensions [extensionsSize]byte
 	if err = sendTorrentHandshake(conn, myExtensions, c.torrentFile.InfoHash, c.id); err != nil {
 		if shouldLogIOError(err) {
-			log.Error(err)
+			log.Warn(err)
 		}
 		return
 	}
 	extensions, infoHash, err := receiveTorrentHandshake(conn)
 	if err != nil {
 		if shouldLogIOError(err) {
-			log.Error(err)
+			log.Warn(err)
 		}
 		return
 	}
@@ -401,7 +401,7 @@ func (c *Client) finish(err error) {
 		if err == errStopRequested {
 			c.logger.Info(err)
 		} else if shouldLogIOError(err) {
-			c.logger.Error(err)
+			c.logger.Warn(err)
 		}
 	}
 	close(c.peerMgmtStop)
@@ -483,7 +483,7 @@ func (c *Client) adjustPeers() {
 				return pd[i].peer.created.After(pd[j].peer.created)
 			})
 			if err := pd[0].peer.conn.Close(); shouldLogIOError(err) {
-				pd[0].peer.logger.Error(err)
+				pd[0].peer.logger.Warn(err)
 			}
 			pd = pd[1:]
 			count = 1
@@ -544,7 +544,7 @@ func (c *Client) dropPeerIfPossible() bool {
 		})
 	}
 	if err := pd[0].peer.conn.Close(); shouldLogIOError(err) {
-		pd[0].peer.logger.Error(err)
+		pd[0].peer.logger.Warn(err)
 	}
 	return true
 }

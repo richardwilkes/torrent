@@ -283,7 +283,7 @@ func (d *Dispatcher) dispatch(conn net.Conn) {
 	extensions, infoHash, err := receiveTorrentHandshake(conn)
 	if err != nil {
 		if shouldLogIOError(err) {
-			log.Error(err)
+			log.Warn(err)
 		}
 		return
 	}
@@ -305,7 +305,7 @@ func (d *Dispatcher) monitorNatPMP() {
 			d.portLock.Unlock()
 			d.logger.Infof("External port changed from %d to %d", old, value)
 		case error:
-			d.logger.Error(value)
+			d.logger.Warn(value)
 		default:
 			return
 		}

@@ -199,7 +199,7 @@ func (t *tracker) periodicAnnounce() {
 		select {
 		case <-timer:
 			if err := t.announce(""); shouldLogIOError(err) {
-				t.client.logger.Error(err)
+				t.client.logger.Warn(err)
 			}
 		case <-t.stopAnnounceChan:
 			return
