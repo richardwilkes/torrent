@@ -178,6 +178,13 @@ func (c *Client) Stop(timeout time.Duration) {
 	c.lock.Unlock()
 	select {
 	case <-time.After(timeout):
+		if c.stoppedNotifier != nil {
+			// Notify that we've stopped, but only if we won't block
+			select {
+			case c.stoppedNotifier <- c:
+			default:
+			}
+		}
 	case <-c.stoppedChan:
 	}
 }
