@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/richardwilkes/errs"
+	"github.com/richardwilkes/fileutil"
 	"github.com/richardwilkes/rate"
 )
 
@@ -344,6 +345,11 @@ func (c *Client) handleConnection(conn net.Conn, log Logger, extensions [extensi
 	c.peerWaitGroup.Add(1)
 	defer c.peerWaitGroup.Done()
 	p.processIncomingMessages()
+	c.disconnect(conn)
+}
+
+func (c *Client) disconnect(conn net.Conn) {
+	fileutil.CloseIgnoringErrors(conn)
 	c.lock.Lock()
 	delete(c.peers, conn)
 	c.lock.Unlock()
@@ -365,13 +371,7 @@ func (c *Client) connectToPeer(addr string, port int) {
 		return
 	}
 	log := &Prefixer{Logger: c.dispatcher.logger, Prefix: conn.RemoteAddr().String() + " | "}
-	defer func() {
-		if err = conn.Close(); err != nil {
-			if shouldLogIOError(err) {
-				log.Warn(errs.Wrap(err))
-			}
-		}
-	}()
+	defer fileutil.CloseIgnoringErrors(conn)
 	var myExtensions [extensionsSize]byte
 	if err = sendTorrentHandshake(conn, myExtensions, c.torrentFile.InfoHash, c.id); err != nil {
 		if shouldLogIOError(err) {
@@ -407,9 +407,7 @@ func (c *Client) finish(err error) {
 	close(c.peerMgmtStop)
 	c.lock.Lock()
 	for conn := range c.peers {
-		if err = conn.Close(); err != nil {
-			c.logger.Warn(errs.Wrap(err))
-		}
+		fileutil.CloseIgnoringErrors(conn)
 	}
 	c.lock.Unlock()
 	c.peerWaitGroup.Wait()
@@ -482,9 +480,7 @@ func (c *Client) adjustPeers() {
 				}
 				return pd[i].peer.created.After(pd[j].peer.created)
 			})
-			if err := pd[0].peer.conn.Close(); shouldLogIOError(err) {
-				pd[0].peer.logger.Warn(err)
-			}
+			c.disconnect(pd[0].peer.conn)
 			pd = pd[1:]
 			count = 1
 		}
@@ -543,9 +539,7 @@ func (c *Client) dropPeerIfPossible() bool {
 			return pd[i].peer.created.After(pd[j].peer.created)
 		})
 	}
-	if err := pd[0].peer.conn.Close(); shouldLogIOError(err) {
-		pd[0].peer.logger.Warn(err)
-	}
+	c.disconnect(pd[0].peer.conn)
 	return true
 }
 

@@ -11,8 +11,8 @@ import (
 )
 
 const (
-	msgReadDeadline      = 2 * time.Minute
-	msgWriteDeadline     = 2 * time.Minute
+	msgReadDeadline      = 30 * time.Second
+	msgWriteDeadline     = 30 * time.Second
 	keepAlivePeriod      = 2 * time.Minute
 	downloadReadDeadline = 30 * time.Second
 	chunkSize            = 16384
@@ -421,9 +421,7 @@ func (p *peer) processPieceRequests(in chan *pieceRequest) {
 		binary.BigEndian.PutUint32(buffer[9:13], uint32(req.begin))
 		if _, err := p.client.file.ReadAt(buffer[13:], p.client.torrentFile.offsetOf(req.index)+int64(req.begin)); err != nil {
 			p.logger.Error(errs.NewfWithCause(err, "Unable to read piece %d (begin=%d, length=%d)", req.index, req.begin, req.length))
-			if err = p.conn.Close(); shouldLogIOError(err) {
-				p.logger.Warn(err)
-			}
+			p.client.disconnect(p.conn)
 			return
 		}
 		p.writeQueue <- buffer
@@ -454,9 +452,7 @@ func (p *peer) processWriteQueue() {
 			if shouldLogIOError(err) {
 				p.logger.Warn(err)
 			}
-			if err = p.conn.Close(); shouldLogIOError(err) {
-				p.logger.Warn(err)
-			}
+			p.client.disconnect(p.conn)
 			// Drain any remaining entries in the queue
 			for {
 				select {

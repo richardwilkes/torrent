@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/richardwilkes/errs"
+	"github.com/richardwilkes/fileutil"
 	"github.com/richardwilkes/natpmp"
 	"github.com/richardwilkes/rate"
 )
@@ -270,13 +271,7 @@ func (d *Dispatcher) listen() {
 
 func (d *Dispatcher) dispatch(conn net.Conn) {
 	log := &Prefixer{Logger: d.logger, Prefix: conn.RemoteAddr().String() + " | "}
-	defer func() {
-		if err := conn.Close(); err != nil {
-			if shouldLogIOError(err) {
-				log.Warn(errs.Wrap(err))
-			}
-		}
-	}()
+	defer fileutil.CloseIgnoringErrors(conn)
 	if !d.isAddressAcceptable(conn.RemoteAddr()) {
 		return
 	}

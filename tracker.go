@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/richardwilkes/errs"
+	"github.com/richardwilkes/fileutil"
 	"github.com/richardwilkes/natpmp"
 	"github.com/zeebo/bencode"
 )
@@ -229,7 +230,10 @@ func (t *tracker) announce(event string) error {
 		for i := 0; i < len(value); i += 6 {
 			addr := net.IPv4(value[i], value[i+1], value[i+2], value[i+3]).String()
 			if addr != externalAddr {
-				peerAddresses[addr] = int(binary.BigEndian.Uint16([]byte(value[i+4 : i+6])))
+				port := int(binary.BigEndian.Uint16([]byte(value[i+4 : i+6])))
+				if port != 0 {
+					peerAddresses[addr] = port
+				}
 			}
 		}
 	case []map[string]interface{}:
@@ -246,7 +250,7 @@ func (t *tracker) announce(event string) error {
 			return errs.Wrap(err)
 		}
 		for _, one := range inPeerAddresses {
-			if one.IP != externalAddr {
+			if one.IP != externalAddr && one.Port != 0 {
 				peerAddresses[one.IP] = one.Port
 			}
 		}
@@ -311,9 +315,7 @@ func (t *tracker) get(url string) (*trackerWire, error) {
 		if _, closeErr := io.Copy(ioutil.Discard, resp.Body); closeErr != nil {
 			t.client.logger.Warn(errs.Wrap(closeErr))
 		}
-		if closeErr := resp.Body.Close(); closeErr != nil {
-			t.client.logger.Warn(errs.Wrap(closeErr))
-		}
+		fileutil.CloseIgnoringErrors(resp.Body)
 	}()
 	if resp.StatusCode != http.StatusOK {
 		return nil, errs.New("Unexpected status: " + resp.Status)
