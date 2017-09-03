@@ -5,11 +5,17 @@ import (
 	"crypto/sha1"
 	"io"
 	"io/ioutil"
+	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
 
 	"github.com/richardwilkes/errs"
 	"github.com/richardwilkes/fileutil"
+	"github.com/richardwilkes/strutil"
 	"github.com/zeebo/bencode"
 )
 
@@ -32,6 +38,9 @@ type File struct {
 		Private bool `bencode:"private"`
 	} `bencode:"info"`
 	InfoHash [sha1.Size]byte `bencode:"-"`
+	lock     sync.Mutex
+	root     *vfile
+	fs       map[string]*vfile
 }
 
 // NewFileFromPath creates a torrent file structure from the raw torrent file data.
@@ -76,35 +85,6 @@ func NewFileFromBytes(data []byte) (*File, error) {
 	return &f, nil
 }
 
-// EmbeddedFiles returns the files embedded in the torrent file. This should
-// only be used after a torrent has completely downloaded.
-func (f *File) EmbeddedFiles() []*EmbeddedFile {
-	path := f.StoragePath()
-	if f.Info.Length != 0 {
-		list := make([]*EmbeddedFile, 1)
-		list[0] = &EmbeddedFile{
-			Name:   f.Info.Name,
-			Dir:    "",
-			Length: f.Info.Length,
-			path:   path,
-		}
-		return list
-	}
-	list := make([]*EmbeddedFile, len(f.Info.Files))
-	var offset int64
-	for i, one := range f.Info.Files {
-		list[i] = &EmbeddedFile{
-			Name:   one.Path[len(one.Path)-1],
-			Dir:    filepath.Join(one.Path[:len(one.Path)-1]...),
-			Length: one.Length,
-			offset: offset,
-			path:   path,
-		}
-		offset += one.Length
-	}
-	return list
-}
-
 func (f *File) offsetOf(index int) int64 {
 	return int64(index) * int64(f.Info.PieceLength)
 }
@@ -146,4 +126,133 @@ func (f *File) StoragePath() string {
 func (f *File) validate(index int, buffer []byte) bool {
 	s := sha1.Sum(buffer)
 	return bytes.Equal(s[:], f.Info.Pieces[index*sha1.Size:(index+1)*sha1.Size])
+}
+
+// EmbeddedFiles returns the files embedded in the torrent file. This should
+// only be used after a torrent has completely downloaded.
+func (f *File) EmbeddedFiles() []os.FileInfo {
+	f.buildFS()
+	var files []os.FileInfo
+	for _, one := range f.fs {
+		if !one.IsDir() {
+			files = append(files, one)
+		}
+	}
+	sort.Slice(files, func(i, j int) bool {
+		return strutil.NaturalLess(files[i].Name(), files[j].Name(), true)
+	})
+	return files
+}
+
+// Open implements the http.FileSystem interface.
+func (f *File) Open(name string) (http.File, error) {
+	if name == "" {
+		return nil, os.ErrInvalid
+	}
+	if !filepath.IsAbs(name) {
+		name = "/" + name
+	}
+	name = filepath.Clean(name)
+	f.buildFS()
+	file, ok := f.fs[name]
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	return file.open()
+}
+
+func (f *File) buildFS() {
+	f.lock.Lock()
+	defer f.lock.Unlock()
+	if f.root == nil {
+		f.fs = make(map[string]*vfile)
+		storage := f.StoragePath()
+		modTime := time.Now()
+		f.root = &vfile{
+			storage: storage,
+			name:    "/",
+			mode:    os.ModeDir | 0775,
+			modTime: modTime,
+		}
+		f.fs[f.root.name] = f.root
+		if f.Info.Length != 0 {
+			child := &vfile{
+				storage: storage,
+				name:    f.root.name + f.Info.Name,
+				length:  f.Info.Length,
+				mode:    0664,
+				modTime: modTime,
+			}
+			f.root.children = []*vfile{child}
+			f.fs[child.name] = child
+		} else {
+			var offset int64
+			for _, one := range f.Info.Files {
+				path := filepath.Clean("/" + filepath.Join(one.Path...))
+				dir := f.mkdirs(filepath.Dir(path))
+				child := &vfile{
+					storage: storage,
+					name:    path,
+					offset:  offset,
+					length:  one.Length,
+					mode:    0664,
+					modTime: modTime,
+				}
+				dir.children = append(dir.children, child)
+				f.fs[child.name] = child
+				offset += one.Length
+			}
+		}
+		sortDirs(f.root)
+	}
+}
+
+func (f *File) mkdirs(path string) *vfile {
+	if !filepath.IsAbs(path) {
+		path = "/" + path
+	}
+	path = filepath.Clean(path)
+	dir := f.root
+	cur := "/"
+	for _, part := range strings.Split(path, "/") {
+		if part != "" {
+			cur += "/" + part
+			found := false
+			for _, child := range dir.children {
+				if child.name == cur {
+					dir = child
+					found = true
+					break
+				}
+			}
+			if !found {
+				d := &vfile{
+					storage: dir.storage,
+					name:    cur,
+					mode:    os.ModeDir | 0775,
+					modTime: dir.modTime,
+				}
+				dir.children = append(dir.children, d)
+				f.fs[d.name] = d
+				dir = d
+			}
+		}
+	}
+	return dir
+}
+
+func sortDirs(dir *vfile) {
+	if dir.IsDir() {
+		sort.Slice(dir.children, func(i, j int) bool {
+			iDir := dir.children[i].IsDir()
+			jDir := dir.children[j].IsDir()
+			if iDir == jDir {
+				return strutil.NaturalLess(dir.children[i].name, dir.children[j].name, true)
+			}
+			return iDir
+		})
+		for _, child := range dir.children {
+			sortDirs(child)
+		}
+	}
 }
