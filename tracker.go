@@ -24,6 +24,13 @@ const (
 	stoppedMsg = "stopped"
 )
 
+var (
+	// TrackerUserAgent will be used as the http client user agent header if
+	// not empty.
+	TrackerUserAgent = ""
+	httpClient       = &http.Client{Timeout: 30 * time.Second}
+)
+
 type tracker struct {
 	client           *Client
 	stopAnnounceChan chan bool
@@ -305,7 +312,14 @@ func (t *tracker) announceURL(event string) string {
 }
 
 func (t *tracker) get(url string) (*trackerWire, error) {
-	resp, err := http.Get(url)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, errs.Wrap(err)
+	}
+	if TrackerUserAgent != "" {
+		req.Header.Set("user-agent", TrackerUserAgent)
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, errs.Wrap(err)
 	}
