@@ -29,7 +29,6 @@ type Status struct {
 	Leechers               int
 	Seeders                int
 	SeedingStopsAt         time.Time
-	Errored                bool
 }
 
 func (s Status) String() string {
