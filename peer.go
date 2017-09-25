@@ -47,6 +47,7 @@ type peer struct {
 	amInterested   bool
 	peerChoking    bool
 	peerInterested bool
+	bail           bool
 }
 
 type pieceRequest struct {
@@ -176,6 +177,13 @@ func (p *peer) processIncomingMessages() {
 	defer close(p.requestChan)
 	lengthBuffer := make([]byte, 4)
 	for {
+		p.lock.RLock()
+		bail := p.bail
+		p.lock.RUnlock()
+		if bail {
+			p.logger.Warn("Piece download taking too long, closing connection to peer")
+			return
+		}
 		if err := readWithDeadline(p.conn, lengthBuffer, msgReadDeadline); err != nil {
 			if shouldLogIOError(err) {
 				p.logger.Warn(err)
@@ -318,7 +326,9 @@ func (p *peer) receivedChunk(index, begin int, buffer []byte) error {
 		return errs.New("Chunk data would overrun buffer")
 	}
 	one.lock.Lock()
-	one.timeout = time.Now().Add(downloadReadDeadline)
+	now := time.Now()
+	bailIfNotFinish := one.timeout.Before(now)
+	one.timeout = now.Add(downloadReadDeadline)
 	copy(one.buffer[begin:last], buffer)
 	var hadOverlap bool
 	one.ranges, hadOverlap = span{start: begin, length: len(buffer)}.insertInto(one.ranges)
@@ -354,6 +364,11 @@ func (p *peer) receivedChunk(index, begin int, buffer []byte) error {
 		}
 	} else {
 		one.lock.Unlock()
+		if bailIfNotFinish {
+			p.lock.Lock()
+			p.bail = true
+			p.lock.Unlock()
+		}
 	}
 	return nil
 }
@@ -494,6 +509,7 @@ func (p *peer) clearExpiredDownloads() {
 		if remove {
 			p.lock.Lock()
 			delete(p.pieces, k)
+			p.bail = true
 			p.lock.Unlock()
 			p.client.tracker.clearDownload(k)
 		}
