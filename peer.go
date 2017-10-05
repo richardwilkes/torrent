@@ -158,6 +158,7 @@ func (p *peer) processIncomingMessages() {
 		close(p.requestChan)
 		p.writeQueue <- nil
 		p.lock.Lock()
+		p.bail = true
 		for {
 			list := make([]int, 0)
 			for index := range p.pieces {
@@ -171,6 +172,14 @@ func (p *peer) processIncomingMessages() {
 			p.lock.Lock()
 			if len(p.pieces) == 0 {
 				p.lock.Unlock()
+				// Notify other peers on the client to check for potential
+				// downloads, since we may have freed up some pieces to
+				// download
+				for _, other := range p.client.currentPeers() {
+					if other != p {
+						other.startDownloadIfNeeded()
+					}
+				}
 				return
 			}
 		}
@@ -273,7 +282,7 @@ func (p *peer) processIncomingMessages() {
 func (p *peer) startDownloadIfNeeded() {
 	var has *bits
 	p.lock.RLock()
-	if !p.peerChoking && len(p.pieces) == 0 {
+	if !p.bail && !p.peerChoking && len(p.pieces) == 0 {
 		has = p.has.Clone()
 	}
 	p.lock.RUnlock()
