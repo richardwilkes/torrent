@@ -457,6 +457,7 @@ func (c *Client) adjustPeers() {
 		if data.state.downloading {
 			if data.state.peerChoking || now.Sub(data.state.lastReceived) > maxWaitForChunkDownload {
 				c.logger.Infof("AdjustPeers: Disconnecting peer due to lack of progress: %s", data.peer.conn.RemoteAddr().String())
+				c.dispatcher.rejectAddress(data.peer.conn.RemoteAddr())
 				c.disconnect(data.peer.conn)
 				continue
 			}
