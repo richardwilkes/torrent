@@ -11,11 +11,12 @@ import (
 )
 
 const (
-	msgReadDeadline      = 30 * time.Second
-	msgWriteDeadline     = 30 * time.Second
-	keepAlivePeriod      = 2 * time.Minute
-	downloadReadDeadline = 30 * time.Second
-	chunkSize            = 16384
+	msgReadDeadline         = 10 * time.Second
+	msgWriteDeadline        = 10 * time.Second
+	keepAlivePeriod         = 2 * time.Minute
+	downloadReadDeadline    = 10 * time.Second
+	maxWaitForChunkDownload = 15 * time.Second
+	chunkSize               = 16384
 )
 
 const (
@@ -43,6 +44,7 @@ type peer struct {
 	pieces         map[int]*piece
 	bytesRead      int64
 	bytesWritten   int64
+	lastReceived   time.Time
 	amChoking      bool
 	amInterested   bool
 	peerChoking    bool
@@ -91,6 +93,7 @@ func newPeer(client *Client, conn net.Conn, log Logger) *peer {
 type peerState struct {
 	bytesRead      int64
 	bytesWritten   int64
+	lastReceived   time.Time
 	amChoking      bool
 	amInterested   bool
 	peerChoking    bool
@@ -105,6 +108,7 @@ func (p *peer) updateInterest() peerState {
 	ps := peerState{
 		bytesRead:      p.bytesRead,
 		bytesWritten:   p.bytesWritten,
+		lastReceived:   p.lastReceived,
 		amChoking:      p.amChoking,
 		amInterested:   p.amInterested,
 		peerChoking:    p.peerChoking,
@@ -151,6 +155,8 @@ func (p *peer) setChoked(choked bool) {
 
 func (p *peer) processIncomingMessages() {
 	defer func() {
+		close(p.requestChan)
+		p.writeQueue <- nil
 		p.lock.Lock()
 		for {
 			list := make([]int, 0)
@@ -170,11 +176,7 @@ func (p *peer) processIncomingMessages() {
 		}
 	}()
 	go p.processWriteQueue()
-	defer func() {
-		p.writeQueue <- nil
-	}()
 	go p.pieceRequestQueue()
-	defer close(p.requestChan)
 	lengthBuffer := make([]byte, 4)
 	for {
 		p.lock.RLock()
@@ -338,6 +340,9 @@ func (p *peer) receivedChunk(index, begin int, buffer []byte) error {
 		p.client.dispatcher.rejectAddress(p.conn.RemoteAddr())
 		return errs.New("Chunk data would overlap existing data -- don't trust this peer")
 	}
+	p.lock.Lock()
+	p.lastReceived = now
+	p.lock.Unlock()
 	if len(one.ranges) == 1 && one.ranges[0].start == 0 && one.ranges[0].length == len(one.buffer) {
 		if p.client.torrentFile.validate(index, one.buffer) {
 			n, err := p.client.file.WriteAt(one.buffer, p.client.torrentFile.offsetOf(index))

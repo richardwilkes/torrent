@@ -132,7 +132,7 @@ func NewClient(dispatcher *Dispatcher, torrentFile *File, options ...func(*Clien
 		dispatcher:    dispatcher,
 		torrentFile:   torrentFile,
 		logger:        &Prefixer{Logger: dispatcher.logger, Prefix: prefix},
-		peersWanted:   30,
+		peersWanted:   16,
 		peerWaitGroup: &sync.WaitGroup{},
 		peerMgmtStop:  make(chan bool),
 		seedDuration:  96 * time.Hour,
@@ -321,7 +321,7 @@ func (c *Client) handleConnection(conn net.Conn, log Logger, extensions [extensi
 		}
 	}
 	var peerID [peerIDSize]byte
-	if err := readWithDeadline(conn, peerID[:], 0); err != nil {
+	if err := readWithDeadline(conn, peerID[:], handshakeDeadline); err != nil {
 		if shouldLogIOError(err) {
 			log.Warn(err)
 		}
@@ -446,24 +446,35 @@ type peerData struct {
 
 func (c *Client) adjustPeers() {
 	peers := c.currentPeers()
-	pd := make([]peerData, len(peers))
+	pd := make([]*peerData, 0, len(peers))
+	now := time.Now()
 	downloadCount := 0
-	for i, p := range peers {
-		pd[i].peer = p
-		pd[i].state = p.updateInterest()
-		if pd[i].state.downloading && !pd[i].state.peerChoking {
-			downloadCount++
+	for _, p := range peers {
+		data := &peerData{
+			peer:  p,
+			state: p.updateInterest(),
 		}
+		if data.state.downloading {
+			if data.state.peerChoking || now.Sub(data.state.lastReceived) > maxWaitForChunkDownload {
+				c.logger.Infof("AdjustPeers: Disconnecting peer due to lack of progress: %s", data.peer.conn.RemoteAddr().String())
+				c.disconnect(data.peer.conn)
+				continue
+			}
+			if !data.state.peerChoking && now.Sub(data.state.lastReceived) <= maxWaitForChunkDownload {
+				downloadCount++
+			}
+		}
+		pd = append(pd, data)
 	}
 	if downloadCount < desiredConcurrentDownloads && !c.tracker.isSeedingComplete() {
 		existing := make(map[string]bool)
-		for _, one := range peers {
-			if host, _, err := net.SplitHostPort(one.conn.RemoteAddr().String()); err != nil {
+		for _, one := range pd {
+			if host, _, err := net.SplitHostPort(one.peer.conn.RemoteAddr().String()); err != nil {
 				existing[host] = true
 			}
 		}
-		count := c.peersWanted - len(peers)
-		if count < 1 {
+		count := c.peersWanted - len(pd)
+		if count < 1 && len(pd) > 0 {
 			// Find one to disconnect so we can add an alternate
 			sort.Slice(pd, func(i, j int) bool {
 				if !pd[i].state.amInterested && pd[j].state.amInterested {
@@ -475,31 +486,56 @@ func (c *Client) adjustPeers() {
 				if pd[i].state.peerChoking && !pd[j].state.peerChoking {
 					return true
 				}
+				if now.Sub(pd[i].state.lastReceived) > maxWaitForChunkDownload && now.Sub(pd[j].state.lastReceived) <= maxWaitForChunkDownload {
+					return true
+				}
 				if pd[i].peer.bytesRead < pd[j].peer.bytesRead {
 					return true
 				}
 				return pd[i].peer.created.After(pd[j].peer.created)
 			})
+			c.logger.Infof("AdjustPeers: Disconnecting peer to make room: %s", pd[0].peer.conn.RemoteAddr().String())
 			c.disconnect(pd[0].peer.conn)
 			pd = pd[1:]
 			count = 1
 		}
-		if count > 4 {
-			count = 4
-		}
-		peerAddressMap := c.tracker.peerAddressesMap()
-		for i := 0; i < count; i++ {
-			for addr, port := range peerAddressMap {
-				if _, exists := existing[addr]; !exists && c.dispatcher.isAddressStringAcceptable(addr) {
-					go c.connectToPeer(addr, port)
-					existing[addr] = true
+		if count > 0 {
+			if count > 4 {
+				count = 4
+			}
+			peerAddressMap := c.tracker.peerAddressesMap()
+			for i := 0; i < count; i++ {
+				added := false
+				for addr, port := range peerAddressMap {
+					if _, exists := existing[addr]; !exists && c.dispatcher.isAddressStringAcceptable(addr) {
+						c.logger.Infof("AdjustPeers: Attempting to connect to new peer: %s", addr)
+						go c.connectToPeer(addr, port)
+						existing[addr] = true
+						added = true
+						break
+					}
+				}
+				if !added {
+					c.logger.Warnf("Unable to add new peer due to lack of unconnected peers (checked %d)", len(peerAddressMap))
 					break
 				}
 			}
 		}
 	}
 	sort.Slice(pd, func(i, j int) bool {
+		if pd[i].state.amInterested && !pd[j].state.amInterested {
+			return true
+		}
+		if pd[i].state.downloading && !pd[j].state.downloading {
+			return true
+		}
+		if !pd[i].state.peerChoking && pd[j].state.peerChoking {
+			return true
+		}
 		if pd[i].state.peerInterested && !pd[j].state.peerInterested {
+			return true
+		}
+		if now.Sub(pd[i].state.lastReceived) <= maxWaitForChunkDownload && now.Sub(pd[j].state.lastReceived) > maxWaitForChunkDownload {
 			return true
 		}
 		if pd[i].state.bytesRead > pd[j].state.bytesRead {
@@ -539,6 +575,7 @@ func (c *Client) dropPeerIfPossible() bool {
 			return pd[i].peer.created.After(pd[j].peer.created)
 		})
 	}
+	c.logger.Infof("dropPeerIfPossible: Disconnecting peer to make room: %s", pd[0].peer.conn.RemoteAddr().String())
 	c.disconnect(pd[0].peer.conn)
 	return true
 }
