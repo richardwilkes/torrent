@@ -341,14 +341,18 @@ func (p *peer) receivedChunk(index, begin int, buffer []byte) error {
 	bailIfNotFinish := one.timeout.Before(now)
 	one.timeout = now.Add(downloadReadDeadline)
 	copy(one.buffer[begin:last], buffer)
-	var hadOverlap bool
-	one.ranges, hadOverlap = span{start: begin, length: len(buffer)}.insertInto(one.ranges)
-	if hadOverlap {
-		// Shouldn't happen... don't trust this peer
-		one.lock.Unlock()
-		p.client.dispatcher.rejectAddress(p.conn.RemoteAddr())
-		return errs.New("Chunk data would overlap existing data -- don't trust this peer")
-	}
+	// Replacing the commented block below with this line on the theory that
+	// overlaps really only cause a delay if the overlapped data is wrong, but
+	// the validation on a finished block will will catch it.
+	one.ranges, _ = span{start: begin, length: len(buffer)}.insertInto(one.ranges)
+	// var hadOverlap bool
+	// one.ranges, hadOverlap = span{start: begin, length: len(buffer)}.insertInto(one.ranges)
+	// if hadOverlap {
+	// 	// Shouldn't happen... don't trust this peer
+	// 	one.lock.Unlock()
+	// 	p.client.dispatcher.rejectAddress(p.conn.RemoteAddr())
+	// 	return errs.New("Chunk data would overlap existing data -- don't trust this peer")
+	// }
 	p.lock.Lock()
 	p.lastReceived = now
 	p.lock.Unlock()
