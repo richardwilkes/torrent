@@ -16,6 +16,7 @@ import (
 	"github.com/richardwilkes/errs"
 	"github.com/richardwilkes/fileutil"
 	"github.com/richardwilkes/natpmp"
+	"github.com/richardwilkes/torrent/container/bits"
 	"github.com/zeebo/bencode"
 )
 
@@ -45,8 +46,8 @@ type tracker struct {
 	leechers         int
 	seeders          int
 	peerAddresses    map[string]int
-	have             *bits
-	downloading      *bits
+	have             *bits.Bits
+	downloading      *bits.Bits
 	who              map[int]*peer
 	seedExpires      time.Time
 	progress         float64
@@ -70,8 +71,8 @@ func newTracker(client *Client) *tracker {
 		stopAnnounceChan: make(chan bool),
 		totalBytes:       totalBytes,
 		remainingBytes:   totalBytes,
-		have:             newBits(totalPieces),
-		downloading:      newBits(totalPieces),
+		have:             bits.New(totalPieces),
+		downloading:      bits.New(totalPieces),
 		who:              make(map[int]*peer),
 	}
 }
@@ -348,27 +349,20 @@ func (t *tracker) clearDownload(index int) {
 	t.lock.Unlock()
 }
 
-func (t *tracker) isInteresting(has *bits) bool {
+func (t *tracker) isInteresting(has *bits.Bits) bool {
 	t.lock.RLock()
-	avail := newBits(t.have.size)
-	for i := range avail.data {
-		avail.data[i] = has.data[i] & ^t.downloading.data[i] & ^t.have.data[i]
-	}
+	i := bits.FirstAvailable(has, t.downloading, t.have)
 	t.lock.RUnlock()
-	return avail.NextSet(0) != -1
+	return i != -1
 }
 
-func (t *tracker) selectForDownloading(who *peer, has *bits) int {
+func (t *tracker) selectForDownloading(who *peer, has *bits.Bits) int {
 	t.lock.Lock()
-	avail := newBits(t.have.size)
-	for i := range avail.data {
-		avail.data[i] = has.data[i] & ^t.downloading.data[i] & ^t.have.data[i]
-	}
-	index := avail.NextSet(0)
-	if index != -1 {
-		t.who[index] = who
-		t.downloading.Set(index)
+	i := bits.FirstAvailable(has, t.downloading, t.have)
+	if i != -1 {
+		t.who[i] = who
+		t.downloading.Set(i)
 	}
 	t.lock.Unlock()
-	return index
+	return i
 }

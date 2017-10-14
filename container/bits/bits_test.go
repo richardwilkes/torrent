@@ -1,4 +1,4 @@
-package torrent
+package bits
 
 import (
 	"testing"
@@ -7,7 +7,7 @@ import (
 )
 
 func TestBits(t *testing.T) {
-	bm := newBits(8)
+	bm := New(8)
 	assert.Equal(t, 1, len(bm.data))
 	bm.Set(7)
 	assert.True(t, bm.IsSet(7))
@@ -16,7 +16,7 @@ func TestBits(t *testing.T) {
 	assert.Equal(t, uint8(1), bm.data[0])
 	bm.Set(0)
 	assert.Equal(t, uint8(129), bm.data[0])
-	bm = newBits(22)
+	bm = New(22)
 	assert.Equal(t, 3, len(bm.data))
 	bm.Set(22)
 	for _, b := range bm.data {

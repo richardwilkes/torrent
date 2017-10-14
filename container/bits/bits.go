@@ -1,11 +1,17 @@
-package torrent
+package bits
 
-type bits struct {
+import (
+	"github.com/richardwilkes/xmath"
+)
+
+// Bits holds a fixed-size collection of bits.
+type Bits struct {
 	data []byte
 	size int
 }
 
-func newBits(numberOfBits int) *bits {
+// New creates a new set of bits, all unset.
+func New(numberOfBits int) *Bits {
 	if numberOfBits < 0 {
 		numberOfBits = 0
 	}
@@ -13,14 +19,26 @@ func newBits(numberOfBits int) *bits {
 	if numberOfBits%8 != 0 {
 		size++
 	}
-	return &bits{
+	return &Bits{
 		data: make([]byte, size),
 		size: numberOfBits,
 	}
 }
 
-func (b *bits) Clone() *bits {
-	c := &bits{
+// FirstAvailable returns the first index set in 'has' and is not set in both
+// 'downloading' and 'have', or -1 if no such index exists.
+func FirstAvailable(has, downloading, have *Bits) int {
+	max := xmath.MinInt(xmath.MinInt(len(has.data), len(downloading.data)), len(have.data))
+	avail := New(max * 8)
+	for i := range avail.data {
+		avail.data[i] = has.data[i] &^ downloading.data[i] &^ have.data[i]
+	}
+	return avail.NextSet(0)
+}
+
+// Clone the bits into a fresh copy.
+func (b *Bits) Clone() *Bits {
+	c := &Bits{
 		data: make([]byte, len(b.data)),
 		size: b.size,
 	}
@@ -28,7 +46,25 @@ func (b *bits) Clone() *bits {
 	return c
 }
 
-func (b *bits) AnySet() bool {
+// SetBytes sets the bytes in the buffer into the backing storage for this
+// bits object. If the buffer is shorter than the backing storage, the
+// remaining bytes will remain as-is.
+func (b *Bits) SetBytes(buffer []byte) {
+	copy(b.data, buffer)
+}
+
+// ByteLength returns the number of bytes required to hold the data.
+func (b *Bits) ByteLength() int {
+	return len(b.data)
+}
+
+// Length returns the number of bits contained.
+func (b *Bits) Length() int {
+	return b.size
+}
+
+// AnySet returns true if any bit is set.
+func (b *Bits) AnySet() bool {
 	for _, one := range b.data {
 		if one != 0 {
 			return true
@@ -37,26 +73,31 @@ func (b *bits) AnySet() bool {
 	return false
 }
 
-func (b *bits) IsSet(index int) bool {
+// IsSet returns true if the specified index is set.
+func (b *Bits) IsSet(index int) bool {
 	if index < 0 || index >= b.size {
 		return false
 	}
 	return b.data[index/8]&(1<<uint(7-(index%8))) != 0
 }
 
-func (b *bits) Set(index int) {
+// Set the specified index.
+func (b *Bits) Set(index int) {
 	if index >= 0 && index < b.size {
 		b.data[index/8] |= 1 << uint(7-(index%8))
 	}
 }
 
-func (b *bits) Unset(index int) {
+// Unset the specified index.
+func (b *Bits) Unset(index int) {
 	if index >= 0 && index < b.size {
 		b.data[index/8] &^= 1 << uint(7-(index%8))
 	}
 }
 
-func (b *bits) NextSet(from int) int {
+// NextSet returns the index of the next set bit, starting at 'from'. Returns
+// -1 if no bits are set from 'from' through the end of the bits.
+func (b *Bits) NextSet(from int) int {
 	if from >= 0 && from < b.size {
 		i := from / 8
 		one := b.data[i]
@@ -103,7 +144,9 @@ func (b *bits) NextSet(from int) int {
 	return -1
 }
 
-func (b *bits) NextUnset(from int) int {
+// NextUnset returns the index of the next unset bit, starting at 'from'.
+// Returns -1 if no bits are unset from 'from' through the end of the bits.
+func (b *Bits) NextUnset(from int) int {
 	if from >= 0 && from < b.size {
 		i := from / 8
 		one := b.data[i]

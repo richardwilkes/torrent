@@ -9,6 +9,8 @@ import (
 
 	"github.com/richardwilkes/errs"
 	"github.com/richardwilkes/logadapter"
+	"github.com/richardwilkes/torrent/container/bits"
+	"github.com/richardwilkes/torrent/container/spanlist"
 )
 
 const (
@@ -38,7 +40,7 @@ type peer struct {
 	logger         logadapter.Logger
 	conn           net.Conn
 	created        time.Time
-	has            *bits
+	has            *bits.Bits
 	requestChan    chan *pieceRequest
 	writeQueue     chan []byte
 	lock           sync.RWMutex
@@ -71,7 +73,7 @@ func newPieceRequest(buffer []byte, cancel bool) *pieceRequest {
 
 type piece struct {
 	lock    sync.RWMutex
-	ranges  []span
+	spans   spanlist.SpanList
 	buffer  []byte
 	timeout time.Time
 }
@@ -82,7 +84,7 @@ func newPeer(client *Client, conn net.Conn, log logadapter.Logger) *peer {
 		logger:      log,
 		conn:        conn,
 		created:     time.Now(),
-		has:         newBits(client.torrentFile.PieceCount()),
+		has:         bits.New(client.torrentFile.PieceCount()),
 		requestChan: make(chan *pieceRequest),
 		writeQueue:  make(chan []byte, 32),
 		amChoking:   true,
@@ -238,12 +240,12 @@ func (p *peer) processIncomingMessages() {
 				p.startDownloadIfNeeded()
 			case bitFieldID:
 				p.lock.Lock()
-				if length != uint32(1+len(p.has.data)) {
+				if length != uint32(1+p.has.ByteLength()) {
 					p.lock.Unlock()
-					p.logger.Warnf("Expected bit field to be %d bytes long, but was %d bytes long", len(p.has.data), length-1)
+					p.logger.Warnf("Expected bit field to be %d bytes long, but was %d bytes long", p.has.ByteLength(), length-1)
 					return
 				}
-				p.has.data = buffer[1:]
+				p.has.SetBytes(buffer[1:])
 				p.lock.Unlock()
 				p.updateInterest()
 			case requestID:
@@ -281,7 +283,7 @@ func (p *peer) processIncomingMessages() {
 }
 
 func (p *peer) startDownloadIfNeeded() {
-	var has *bits
+	var has *bits.Bits
 	p.lock.RLock()
 	if !p.bail && !p.peerChoking && len(p.pieces) == 0 {
 		has = p.has.Clone()
@@ -302,7 +304,6 @@ func (p *peer) queuePieceDownload(index int) {
 	_, ok := p.pieces[index]
 	if !ok {
 		p.pieces[index] = &piece{
-			ranges:  make([]span, 0),
 			buffer:  make([]byte, length),
 			timeout: time.Now().Add(downloadReadDeadline),
 		}
@@ -342,22 +343,11 @@ func (p *peer) receivedChunk(index, begin int, buffer []byte) error {
 	bailIfNotFinish := one.timeout.Before(now)
 	one.timeout = now.Add(downloadReadDeadline)
 	copy(one.buffer[begin:last], buffer)
-	// Replacing the commented block below with this line on the theory that
-	// overlaps really only cause a delay if the overlapped data is wrong, but
-	// the validation on a finished block will will catch it.
-	one.ranges, _ = span{start: begin, length: len(buffer)}.insertInto(one.ranges)
-	// var hadOverlap bool
-	// one.ranges, hadOverlap = span{start: begin, length: len(buffer)}.insertInto(one.ranges)
-	// if hadOverlap {
-	// 	// Shouldn't happen... don't trust this peer
-	// 	one.lock.Unlock()
-	// 	p.client.dispatcher.rejectAddress(p.conn.RemoteAddr())
-	// 	return errs.New("Chunk data would overlap existing data -- don't trust this peer")
-	// }
+	one.spans.Insert(&spanlist.Span{Start: begin, Length: len(buffer)})
 	p.lock.Lock()
 	p.lastReceived = now
 	p.lock.Unlock()
-	if len(one.ranges) == 1 && one.ranges[0].start == 0 && one.ranges[0].length == len(one.buffer) {
+	if len(one.spans.Spans) == 1 && one.spans.Spans[0].Start == 0 && one.spans.Spans[0].Length == len(one.buffer) {
 		if p.client.torrentFile.Validate(index, one.buffer) {
 			n, err := p.client.file.WriteAt(one.buffer, p.client.torrentFile.OffsetOf(index))
 			one.lock.Unlock()
