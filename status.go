@@ -3,6 +3,8 @@ package torrent
 import (
 	"fmt"
 	"time"
+
+	"github.com/richardwilkes/strutil"
 )
 
 // Possible states.
@@ -47,7 +49,7 @@ func (s Status) String() string {
 	case Seeding:
 		return fmt.Sprintf("Seeding: Up %.2f KB/s   %s remaining   Peers %dC/%dL/%dP",
 			float64(s.UploadBytesPerSecond)/1024,
-			FormatDuration(time.Until(s.SeedingStopsAt), false),
+			strutil.FormatDuration(time.Until(s.SeedingStopsAt), false),
 			s.PeersConnected,
 			s.Leechers,
 			s.Seeders)
