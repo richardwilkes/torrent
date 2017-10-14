@@ -81,7 +81,7 @@ func newPeer(client *Client, conn net.Conn, log Logger) *peer {
 		logger:      log,
 		conn:        conn,
 		created:     time.Now(),
-		has:         newBits(client.torrentFile.pieceCount()),
+		has:         newBits(client.torrentFile.PieceCount()),
 		requestChan: make(chan *pieceRequest),
 		writeQueue:  make(chan []byte, 32),
 		amChoking:   true,
@@ -296,7 +296,7 @@ func (p *peer) startDownloadIfNeeded() {
 func (p *peer) queuePieceDownload(index int) {
 	// Likely need to mark when this was requested and if it goes for too long,
 	// remove from the list of downloading pieces.
-	length := p.client.torrentFile.lengthOf(index)
+	length := p.client.torrentFile.LengthOf(index)
 	p.lock.Lock()
 	_, ok := p.pieces[index]
 	if !ok {
@@ -357,8 +357,8 @@ func (p *peer) receivedChunk(index, begin int, buffer []byte) error {
 	p.lastReceived = now
 	p.lock.Unlock()
 	if len(one.ranges) == 1 && one.ranges[0].start == 0 && one.ranges[0].length == len(one.buffer) {
-		if p.client.torrentFile.validate(index, one.buffer) {
-			n, err := p.client.file.WriteAt(one.buffer, p.client.torrentFile.offsetOf(index))
+		if p.client.torrentFile.Validate(index, one.buffer) {
+			n, err := p.client.file.WriteAt(one.buffer, p.client.torrentFile.OffsetOf(index))
 			one.lock.Unlock()
 			p.lock.Lock()
 			delete(p.pieces, index)
@@ -452,7 +452,7 @@ func (p *peer) processPieceRequests(in chan *pieceRequest) {
 		buffer[4] = pieceID
 		binary.BigEndian.PutUint32(buffer[5:9], uint32(req.index))
 		binary.BigEndian.PutUint32(buffer[9:13], uint32(req.begin))
-		if _, err := p.client.file.ReadAt(buffer[13:], p.client.torrentFile.offsetOf(req.index)+int64(req.begin)); err != nil {
+		if _, err := p.client.file.ReadAt(buffer[13:], p.client.torrentFile.OffsetOf(req.index)+int64(req.begin)); err != nil {
 			p.logger.Error(errs.NewfWithCause(err, "Unable to read piece %d (begin=%d, length=%d)", req.index, req.begin, req.length))
 			p.client.disconnect(p.conn)
 			return

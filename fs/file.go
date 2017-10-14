@@ -1,4 +1,4 @@
-package torrent
+package fs
 
 import (
 	"bytes"
@@ -39,8 +39,8 @@ type File struct {
 	} `bencode:"info"`
 	InfoHash [sha1.Size]byte `bencode:"-"`
 	lock     sync.Mutex
-	root     *vfile
-	fs       map[string]*vfile
+	root     *vfs
+	fs       map[string]*vfs
 }
 
 // NewFileFromPath creates a torrent file structure from the raw torrent file data.
@@ -87,23 +87,28 @@ func NewFileFromBytes(data []byte) (*File, error) {
 	return &f, nil
 }
 
-func (f *File) offsetOf(index int) int64 {
+// OffsetOf returns the offset into the data for the piece at the specified
+// index.
+func (f *File) OffsetOf(index int) int64 {
 	return int64(index) * int64(f.Info.PieceLength)
 }
 
-func (f *File) lengthOf(index int) int {
-	last := f.pieceCount() - 1
+// LengthOf returns the length of the piece at the specified index.
+func (f *File) LengthOf(index int) int {
+	last := f.PieceCount() - 1
 	if index >= last {
-		return int(f.size() - int64(last)*int64(f.Info.PieceLength))
+		return int(f.Size() - int64(last)*int64(f.Info.PieceLength))
 	}
 	return f.Info.PieceLength
 }
 
-func (f *File) pieceCount() int {
+// PieceCount returns the number of pieces.
+func (f *File) PieceCount() int {
 	return len(f.Info.Pieces) / sha1.Size
 }
 
-func (f *File) size() int64 {
+// Size returns the size of the complete data.
+func (f *File) Size() int64 {
 	if f.Info.Length != 0 {
 		return f.Info.Length
 	}
@@ -125,7 +130,9 @@ func (f *File) StoragePath() string {
 	return filepath.Join(dir, filename+DownloadExt)
 }
 
-func (f *File) validate(index int, buffer []byte) bool {
+// Validate checks the supplied buffer to determine if it contains the data
+// for the piece at the specified index.
+func (f *File) Validate(index int, buffer []byte) bool {
 	s := sha1.Sum(buffer)
 	return bytes.Equal(s[:], f.Info.Pieces[index*sha1.Size:(index+1)*sha1.Size])
 }
@@ -167,10 +174,10 @@ func (f *File) buildFS() {
 	f.lock.Lock()
 	defer f.lock.Unlock()
 	if f.root == nil {
-		f.fs = make(map[string]*vfile)
+		f.fs = make(map[string]*vfs)
 		storage := f.StoragePath()
 		modTime := time.Now()
-		f.root = &vfile{
+		f.root = &vfs{
 			storage: storage,
 			name:    "/",
 			mode:    os.ModeDir | 0775,
@@ -178,21 +185,21 @@ func (f *File) buildFS() {
 		}
 		f.fs[f.root.name] = f.root
 		if f.Info.Length != 0 {
-			child := &vfile{
+			child := &vfs{
 				storage: storage,
 				name:    f.root.name + f.Info.Name,
 				length:  f.Info.Length,
 				mode:    0664,
 				modTime: modTime,
 			}
-			f.root.children = []*vfile{child}
+			f.root.children = []*vfs{child}
 			f.fs[child.name] = child
 		} else {
 			var offset int64
 			for _, one := range f.Info.Files {
 				path := filepath.Clean("/" + filepath.Join(one.Path...))
 				dir := f.mkdirs(filepath.Dir(path))
-				child := &vfile{
+				child := &vfs{
 					storage: storage,
 					name:    path,
 					offset:  offset,
@@ -209,7 +216,7 @@ func (f *File) buildFS() {
 	}
 }
 
-func (f *File) mkdirs(path string) *vfile {
+func (f *File) mkdirs(path string) *vfs {
 	if !filepath.IsAbs(path) {
 		path = "/" + path
 	}
@@ -228,7 +235,7 @@ func (f *File) mkdirs(path string) *vfile {
 				}
 			}
 			if !found {
-				d := &vfile{
+				d := &vfs{
 					storage: dir.storage,
 					name:    cur,
 					mode:    os.ModeDir | 0775,
@@ -243,7 +250,7 @@ func (f *File) mkdirs(path string) *vfile {
 	return dir
 }
 
-func sortDirs(dir *vfile) {
+func sortDirs(dir *vfs) {
 	if dir.IsDir() {
 		sort.Slice(dir.children, func(i, j int) bool {
 			iDir := dir.children[i].IsDir()

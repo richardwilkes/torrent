@@ -63,8 +63,8 @@ type trackerWire struct {
 }
 
 func newTracker(client *Client) *tracker {
-	totalBytes := client.torrentFile.size()
-	totalPieces := client.torrentFile.pieceCount()
+	totalBytes := client.torrentFile.Size()
+	totalPieces := client.torrentFile.PieceCount()
 	return &tracker{
 		client:           client,
 		stopAnnounceChan: make(chan bool),
@@ -83,7 +83,7 @@ func (t *tracker) markBlockValid(index int) {
 		t.have.Set(index)
 		t.downloading.Unset(index)
 		delete(t.who, index)
-		t.remainingBytes -= int64(t.client.torrentFile.lengthOf(index))
+		t.remainingBytes -= int64(t.client.torrentFile.LengthOf(index))
 		if t.remainingBytes == 0 {
 			t.seedExpires = time.Now().Add(t.client.seedDuration)
 			announce = true

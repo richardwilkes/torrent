@@ -19,6 +19,7 @@ import (
 	"github.com/richardwilkes/errs"
 	"github.com/richardwilkes/fileutil"
 	"github.com/richardwilkes/rate"
+	"github.com/richardwilkes/torrent/fs"
 )
 
 const (
@@ -35,7 +36,7 @@ type Client struct {
 	InRate                   rate.Limiter
 	OutRate                  rate.Limiter
 	dispatcher               *Dispatcher
-	torrentFile              *File
+	torrentFile              *fs.File
 	downloadCompleteNotifier chan *Client
 	stoppedNotifier          chan *Client
 	logger                   *Prefixer
@@ -117,7 +118,7 @@ func NotifyWhenStopped(notifier chan *Client) func(*Client) error {
 }
 
 // NewClient creates and starts a new client for a torrent.
-func NewClient(dispatcher *Dispatcher, torrentFile *File, options ...func(*Client) error) (*Client, error) {
+func NewClient(dispatcher *Dispatcher, torrentFile *fs.File, options ...func(*Client) error) (*Client, error) {
 	if dispatcher == nil {
 		return nil, errs.New("dispatcher may not be nil")
 	}
@@ -163,7 +164,7 @@ func (c *Client) Logger() Logger {
 }
 
 // TorrentFile returns the client's torrent file.
-func (c *Client) TorrentFile() *File {
+func (c *Client) TorrentFile() *fs.File {
 	return c.torrentFile
 }
 
@@ -260,7 +261,7 @@ func (c *Client) prepareFile() error {
 	if fi.IsDir() {
 		return errs.Newf("%s may not be a directory", c.torrentFile.StoragePath())
 	}
-	length := c.torrentFile.size()
+	length := c.torrentFile.Size()
 	original := fi.Size()
 	if original == 0 {
 		if err = c.file.Truncate(length); err != nil {
@@ -276,7 +277,7 @@ func (c *Client) prepareFile() error {
 			}
 		}
 		buffer := make([]byte, c.torrentFile.Info.PieceLength)
-		count := c.torrentFile.pieceCount()
+		count := c.torrentFile.PieceCount()
 		lastPieceLength := int(length - int64(count-1)*int64(c.torrentFile.Info.PieceLength))
 		for i := 0; i < count; i++ {
 			pos := int64(i) * int64(c.torrentFile.Info.PieceLength)
@@ -292,7 +293,7 @@ func (c *Client) prepareFile() error {
 					return errs.New("Unable to read file: " + c.torrentFile.StoragePath())
 				}
 			}
-			if c.torrentFile.validate(i, buffer[:n]) {
+			if c.torrentFile.Validate(i, buffer[:n]) {
 				c.tracker.markBlockValid(i)
 			}
 			c.tracker.setProgress(float64(i+1) * 100 / float64(count))
