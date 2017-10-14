@@ -19,7 +19,7 @@ import (
 	"github.com/richardwilkes/errs"
 	"github.com/richardwilkes/fileutil"
 	"github.com/richardwilkes/rate"
-	"github.com/richardwilkes/torrent/fs"
+	"github.com/richardwilkes/torrent/tfs"
 )
 
 const (
@@ -36,7 +36,7 @@ type Client struct {
 	InRate                   rate.Limiter
 	OutRate                  rate.Limiter
 	dispatcher               *Dispatcher
-	torrentFile              *fs.File
+	torrentFile              *tfs.File
 	downloadCompleteNotifier chan *Client
 	stoppedNotifier          chan *Client
 	logger                   *Prefixer
@@ -118,7 +118,7 @@ func NotifyWhenStopped(notifier chan *Client) func(*Client) error {
 }
 
 // NewClient creates and starts a new client for a torrent.
-func NewClient(dispatcher *Dispatcher, torrentFile *fs.File, options ...func(*Client) error) (*Client, error) {
+func NewClient(dispatcher *Dispatcher, torrentFile *tfs.File, options ...func(*Client) error) (*Client, error) {
 	if dispatcher == nil {
 		return nil, errs.New("dispatcher may not be nil")
 	}
@@ -164,7 +164,7 @@ func (c *Client) Logger() Logger {
 }
 
 // TorrentFile returns the client's torrent file.
-func (c *Client) TorrentFile() *fs.File {
+func (c *Client) TorrentFile() *tfs.File {
 	return c.torrentFile
 }
 
