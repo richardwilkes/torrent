@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/richardwilkes/errs"
+	"github.com/richardwilkes/logadapter"
 )
 
 const (
@@ -34,7 +35,7 @@ const (
 
 type peer struct {
 	client         *Client
-	logger         Logger
+	logger         logadapter.Logger
 	conn           net.Conn
 	created        time.Time
 	has            *bits
@@ -75,7 +76,7 @@ type piece struct {
 	timeout time.Time
 }
 
-func newPeer(client *Client, conn net.Conn, log Logger) *peer {
+func newPeer(client *Client, conn net.Conn, log logadapter.Logger) *peer {
 	return &peer{
 		client:      client,
 		logger:      log,

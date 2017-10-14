@@ -18,6 +18,7 @@ import (
 
 	"github.com/richardwilkes/errs"
 	"github.com/richardwilkes/fileutil"
+	"github.com/richardwilkes/logadapter"
 	"github.com/richardwilkes/rate"
 	"github.com/richardwilkes/torrent/tfs"
 )
@@ -39,7 +40,7 @@ type Client struct {
 	torrentFile              *tfs.File
 	downloadCompleteNotifier chan *Client
 	stoppedNotifier          chan *Client
-	logger                   *Prefixer
+	logger                   *logadapter.Prefixer
 	id                       [peerIDSize]byte
 	tracker                  *tracker
 	peersWanted              int
@@ -132,7 +133,7 @@ func NewClient(dispatcher *Dispatcher, torrentFile *tfs.File, options ...func(*C
 		OutRate:       dispatcher.OutRate.New(math.MaxInt32),
 		dispatcher:    dispatcher,
 		torrentFile:   torrentFile,
-		logger:        &Prefixer{Logger: dispatcher.logger, Prefix: prefix},
+		logger:        &logadapter.Prefixer{Logger: dispatcher.logger, Prefix: prefix},
 		peersWanted:   16,
 		peerWaitGroup: &sync.WaitGroup{},
 		peerMgmtStop:  make(chan bool),
@@ -159,7 +160,7 @@ func NewClient(dispatcher *Dispatcher, torrentFile *tfs.File, options ...func(*C
 }
 
 // Logger returns the client's logger.
-func (c *Client) Logger() Logger {
+func (c *Client) Logger() logadapter.Logger {
 	return c.logger
 }
 
@@ -306,8 +307,8 @@ func (c *Client) prepareFile() error {
 	return nil
 }
 
-func (c *Client) handleConnection(conn net.Conn, log Logger, extensions [extensionsSize]byte, infoHash [sha1.Size]byte, sendHandshake bool) {
-	log = &Prefixer{Logger: log, Prefix: c.logger.Prefix}
+func (c *Client) handleConnection(conn net.Conn, log logadapter.Logger, extensions [extensionsSize]byte, infoHash [sha1.Size]byte, sendHandshake bool) {
+	log = &logadapter.Prefixer{Logger: log, Prefix: c.logger.Prefix}
 	if !bytes.Equal(infoHash[:], c.torrentFile.InfoHash[:]) {
 		log.Warn("Rejecting due to InfoHash mis-match")
 		return
@@ -371,7 +372,7 @@ func (c *Client) connectToPeer(addr string, port int) {
 		}
 		return
 	}
-	log := &Prefixer{Logger: c.dispatcher.logger, Prefix: conn.RemoteAddr().String() + " | "}
+	log := &logadapter.Prefixer{Logger: c.dispatcher.logger, Prefix: conn.RemoteAddr().String() + " | "}
 	defer fileutil.CloseIgnoringErrors(conn)
 	var myExtensions [extensionsSize]byte
 	if err = sendTorrentHandshake(conn, myExtensions, c.torrentFile.InfoHash, c.id); err != nil {

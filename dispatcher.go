@@ -13,6 +13,7 @@ import (
 
 	"github.com/richardwilkes/errs"
 	"github.com/richardwilkes/fileutil"
+	"github.com/richardwilkes/logadapter"
 	"github.com/richardwilkes/natpmp"
 	"github.com/richardwilkes/rate"
 )
@@ -37,7 +38,7 @@ type Dispatcher struct {
 	InRate          rate.Limiter
 	OutRate         rate.Limiter
 	listener        net.Listener
-	logger          Logger
+	logger          logadapter.Logger
 	natpmpChan      chan interface{}
 	portLock        sync.RWMutex
 	internalPort    int
@@ -74,7 +75,7 @@ func GlobalUploadCap(bytesPerSecond int) func(*Dispatcher) error {
 }
 
 // LogTo sets the logger the dispatcher should use. Default discards logs.
-func LogTo(logger Logger) func(*Dispatcher) error {
+func LogTo(logger logadapter.Logger) func(*Dispatcher) error {
 	return func(d *Dispatcher) error {
 		d.logger = logger
 		return nil
@@ -112,7 +113,7 @@ func NewDispatcher(options ...func(*Dispatcher) error) (*Dispatcher, error) {
 	d := &Dispatcher{
 		InRate:          rate.New(math.MaxInt32, time.Second),
 		OutRate:         rate.New(math.MaxInt32, time.Second),
-		logger:          &discard{},
+		logger:          &logadapter.Discarder{},
 		clients:         make(map[[sha1.Size]byte]*Client),
 		rejectAddresses: make(map[string]time.Time),
 	}
@@ -270,7 +271,7 @@ func (d *Dispatcher) listen() {
 }
 
 func (d *Dispatcher) dispatch(conn net.Conn) {
-	log := &Prefixer{Logger: d.logger, Prefix: conn.RemoteAddr().String() + " | "}
+	log := &logadapter.Prefixer{Logger: d.logger, Prefix: conn.RemoteAddr().String() + " | "}
 	defer fileutil.CloseIgnoringErrors(conn)
 	if !d.isAddressAcceptable(conn.RemoteAddr()) {
 		return
