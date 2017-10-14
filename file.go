@@ -50,10 +50,12 @@ func NewFileFromPath(path string) (*File, error) {
 		return nil, errs.Wrap(err)
 	}
 	f, err := NewFileFromReader(file)
+	if err == nil {
+		f.Path = path
+	}
 	if closeErr := file.Close(); closeErr != nil && err == nil {
 		err = errs.Wrap(closeErr)
 	}
-	f.Path = path
 	return f, err
 }
 
