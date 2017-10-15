@@ -25,13 +25,11 @@ import (
 )
 
 const (
-	version                    = "-RW0001-"
-	desiredConcurrentDownloads = 4
+	version           = "-RW0001-"
+	urlQuerySafeBytes = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_.~"
 )
 
-var (
-	errStopRequested = errors.New("Stop requested")
-)
+var errStopRequested = errors.New("Stop requested")
 
 // Client provides the ability to download and/or seed a torrent.
 type Client struct {
@@ -44,6 +42,7 @@ type Client struct {
 	logger                   *logadapter.Prefixer
 	id                       [dispatcher.PeerIDSize]byte
 	tracker                  *tracker
+	concurrentDownloads      int
 	peersWanted              int
 	peerWaitGroup            *sync.WaitGroup
 	peerMgmtStop             chan bool
@@ -54,69 +53,6 @@ type Client struct {
 	stoppedChan              chan bool
 	stopRequested            bool
 	stopped                  bool
-}
-
-// DownloadCap sets the maximum download speed of the client, subject to the
-// dispatcher's overall limit. Default is no limit.
-func DownloadCap(bytesPerSecond int) func(*Client) error {
-	return func(c *Client) error {
-		if bytesPerSecond < 1 {
-			return errs.New("DownloadCap must be at least 1")
-		}
-		c.InRate.SetCap(bytesPerSecond)
-		return nil
-	}
-}
-
-// UploadCap sets the maximum upload speed of the client, subject to the
-// dispatcher's overall limit. Default is no limit.
-func UploadCap(bytesPerSecond int) func(*Client) error {
-	return func(c *Client) error {
-		if bytesPerSecond < 1 {
-			return errs.New("UploadCap must be at least 1")
-		}
-		c.OutRate.SetCap(bytesPerSecond)
-		return nil
-	}
-}
-
-// PeersWanted sets the number of peers to ask the tracker for. Default is 30.
-func PeersWanted(wanted int) func(*Client) error {
-	return func(c *Client) error {
-		if wanted < 1 {
-			return errs.New("PeersWanted must be at least 1")
-		}
-		c.peersWanted = wanted
-		return nil
-	}
-}
-
-// SeedDuration sets the maximum amount of time to seed. Default is 4 days.
-func SeedDuration(duration time.Duration) func(*Client) error {
-	return func(c *Client) error {
-		if duration < 0 {
-			return errs.New("duration must be at least 0")
-		}
-		c.seedDuration = duration
-		return nil
-	}
-}
-
-// NotifyWhenDownloadComplete sets a channel to notify when the download is
-// verified and completes.
-func NotifyWhenDownloadComplete(notifier chan *Client) func(*Client) error {
-	return func(c *Client) error {
-		c.downloadCompleteNotifier = notifier
-		return nil
-	}
-}
-
-// NotifyWhenStopped sets a channel to notify when the client is stopped.
-func NotifyWhenStopped(notifier chan *Client) func(*Client) error {
-	return func(c *Client) error {
-		c.stoppedNotifier = notifier
-		return nil
-	}
 }
 
 // NewClient creates and starts a new client for a torrent.
@@ -130,19 +66,19 @@ func NewClient(d *dispatcher.Dispatcher, torrentFile *tfs.File, options ...func(
 	_, prefix := filepath.Split(torrentFile.StoragePath())
 	prefix = prefix[:len(prefix)-len(filepath.Ext(prefix))] + " | "
 	c := &Client{
-		InRate:        d.InRate.New(math.MaxInt32),
-		OutRate:       d.OutRate.New(math.MaxInt32),
-		dispatcher:    d,
-		torrentFile:   torrentFile,
-		logger:        &logadapter.Prefixer{Logger: d.Logger(), Prefix: prefix},
-		peersWanted:   16,
-		peerWaitGroup: &sync.WaitGroup{},
-		peerMgmtStop:  make(chan bool),
-		seedDuration:  96 * time.Hour,
-		peers:         make(map[net.Conn]*peer),
-		stoppedChan:   make(chan bool, 1),
+		InRate:              d.InRate.New(math.MaxInt32),
+		OutRate:             d.OutRate.New(math.MaxInt32),
+		dispatcher:          d,
+		torrentFile:         torrentFile,
+		logger:              &logadapter.Prefixer{Logger: d.Logger(), Prefix: prefix},
+		concurrentDownloads: 4,
+		peersWanted:         16,
+		peerWaitGroup:       &sync.WaitGroup{},
+		peerMgmtStop:        make(chan bool),
+		seedDuration:        96 * time.Hour,
+		peers:               make(map[net.Conn]*peer),
+		stoppedChan:         make(chan bool, 1),
 	}
-	const urlQuerySafeBytes = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_.~"
 	for i := range version {
 		c.id[i] = version[i]
 	}
@@ -471,7 +407,7 @@ func (c *Client) adjustPeers() {
 		}
 		pd = append(pd, data)
 	}
-	if downloadCount < desiredConcurrentDownloads && !c.tracker.isSeedingComplete() {
+	if downloadCount < c.concurrentDownloads && !c.tracker.isSeedingComplete() {
 		existing := make(map[string]bool)
 		for _, one := range pd {
 			if host, _, err := net.SplitHostPort(one.peer.conn.RemoteAddr().String()); err != nil {
