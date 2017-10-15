@@ -25,14 +25,7 @@ const (
 	peerIDSize        = 20
 )
 
-var protocolIdentifier []byte
-
-func init() {
-	const id = "BitTorrent protocol"
-	protocolIdentifier = make([]byte, 1+len(id))
-	protocolIdentifier[0] = byte(len(id))
-	copy(protocolIdentifier[1:], []byte(id))
-}
+var protocolIdentifier = []byte{19, 'B', 'i', 't', 'T', 'o', 'r', 'r', 'e', 'n', 't', ' ', 'p', 'r', 'o', 't', 'o', 'c', 'o', 'l'}
 
 // Dispatcher holds a dispatcher for bit torrent connections.
 type Dispatcher struct {
