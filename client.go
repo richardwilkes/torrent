@@ -3,7 +3,6 @@ package torrent
 import (
 	"bytes"
 	"crypto/rand"
-	"crypto/sha1"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -310,7 +309,7 @@ func (c *Client) prepareFile() error {
 }
 
 // HandleConnection is called by the dispatcher for new connections.
-func (c *Client) HandleConnection(conn net.Conn, log logadapter.Logger, extensions [dispatcher.ExtensionsSize]byte, infoHash [sha1.Size]byte, sendHandshake bool) {
+func (c *Client) HandleConnection(conn net.Conn, log logadapter.Logger, extensions [dispatcher.ExtensionsSize]byte, infoHash tfs.InfoHash, sendHandshake bool) {
 	log = &logadapter.Prefixer{Logger: log, Prefix: c.logger.Prefix}
 	if !bytes.Equal(infoHash[:], c.torrentFile.InfoHash[:]) {
 		log.Warn("Rejecting due to InfoHash mis-match")

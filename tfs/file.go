@@ -22,6 +22,9 @@ import (
 // DownloadExt is the extension used for the torrent download data file.
 const DownloadExt = ".tordata"
 
+// InfoHash holds the hash of the torrent info.
+type InfoHash [sha1.Size]byte
+
 // File holds the contents of a .torrent file.
 type File struct {
 	Path     string `bencode:"-"`
@@ -37,7 +40,7 @@ type File struct {
 		} `bencode:"files,omitempty"`
 		Private bool `bencode:"private"`
 	} `bencode:"info"`
-	InfoHash [sha1.Size]byte `bencode:"-"`
+	InfoHash InfoHash `bencode:"-"`
 	lock     sync.Mutex
 	root     *vfs
 	fs       map[string]*vfs
