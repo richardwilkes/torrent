@@ -1,4 +1,4 @@
-package torrent
+package tio
 
 import (
 	"io"
@@ -9,7 +9,8 @@ import (
 	"github.com/richardwilkes/errs"
 )
 
-func readWithDeadline(conn net.Conn, buffer []byte, deadline time.Duration) error {
+// ReadWithDeadline reads a buffer from a connection with a deadline.
+func ReadWithDeadline(conn net.Conn, buffer []byte, deadline time.Duration) error {
 	if deadline > 0 {
 		if err := conn.SetReadDeadline(time.Now().Add(deadline)); err != nil {
 			return errs.Wrap(err)
@@ -19,7 +20,8 @@ func readWithDeadline(conn net.Conn, buffer []byte, deadline time.Duration) erro
 	return errs.Wrap(err)
 }
 
-func writeWithDeadline(conn net.Conn, buffer []byte, deadline time.Duration) error {
+// WriteWithDeadline writes a buffer to a connection with a deadline.
+func WriteWithDeadline(conn net.Conn, buffer []byte, deadline time.Duration) error {
 	if deadline > 0 {
 		if err := conn.SetWriteDeadline(time.Now().Add(deadline)); err != nil {
 			return errs.Wrap(err)
@@ -41,12 +43,13 @@ var (
 	}
 )
 
-func shouldLogIOError(err error) bool {
+// ShouldLogIOError returns true if the error should be logged.
+func ShouldLogIOError(err error) bool {
 	if err == nil || err == io.EOF || err == io.ErrUnexpectedEOF {
 		return false
 	}
 	if c, ok := err.(errs.Causer); ok {
-		return shouldLogIOError(c.Cause())
+		return ShouldLogIOError(c.Cause())
 	}
 	if e, ok := err.(*errs.Error); ok {
 		msg := e.Message()
@@ -54,7 +57,7 @@ func shouldLogIOError(err error) bool {
 			return false
 		}
 		for _, w := range e.WrappedErrors() {
-			if shouldLogIOError(w) {
+			if ShouldLogIOError(w) {
 				return false
 			}
 		}

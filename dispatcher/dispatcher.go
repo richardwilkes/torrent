@@ -1,4 +1,4 @@
-package torrent
+package dispatcher
 
 import (
 	"bytes"
@@ -16,32 +16,39 @@ import (
 	"github.com/richardwilkes/logadapter"
 	"github.com/richardwilkes/natpmp"
 	"github.com/richardwilkes/rate"
+	"github.com/richardwilkes/torrent/tio"
 )
 
 const (
-	handshakeDeadline = 5 * time.Second
-	rejectDuration    = 15 * time.Minute
-	extensionsSize    = 8
-	peerIDSize        = 20
+	// HandshakeDeadline is the maximum amount of time allowed for a handshake
+	// read or write.
+	HandshakeDeadline = 5 * time.Second
+	// ExtensionsSize is the number of bytes comprising the extension data.
+	ExtensionsSize = 8
+	// PeerIDSize is the number of bytes comprising a peer ID.
+	PeerIDSize = 20
 )
 
 var protocolIdentifier = []byte{19, 'B', 'i', 't', 'T', 'o', 'r', 'r', 'e', 'n', 't', ' ', 'p', 'r', 'o', 't', 'o', 'c', 'o', 'l'}
 
+// ConnectionHandler defines the interface for handling torrent connections.
+type ConnectionHandler interface {
+	HandleConnection(conn net.Conn, log logadapter.Logger, extensions [ExtensionsSize]byte, infoHash [sha1.Size]byte, sendHandshake bool)
+}
+
 // Dispatcher holds a dispatcher for bit torrent connections.
 type Dispatcher struct {
-	InRate          rate.Limiter
-	OutRate         rate.Limiter
-	listener        net.Listener
-	logger          logadapter.Logger
-	natpmpChan      chan interface{}
-	portLock        sync.RWMutex
-	internalPort    int
-	externalPort    int
-	routerLock      sync.RWMutex
-	clients         map[[sha1.Size]byte]*Client
-	rejectLock      sync.RWMutex
-	rejectAddresses map[string]time.Time
-	rejectDone      chan bool
+	InRate       rate.Limiter
+	OutRate      rate.Limiter
+	listener     net.Listener
+	logger       logadapter.Logger
+	natpmpChan   chan interface{}
+	portLock     sync.RWMutex
+	internalPort int
+	externalPort int
+	routerLock   sync.RWMutex
+	clients      map[[sha1.Size]byte]ConnectionHandler
+	gatekeeper   *GateKeeper
 }
 
 // GlobalDownloadCap sets the maximum download speed of the dispatcher.
@@ -105,11 +112,11 @@ func PortRange(from, to int) func(*Dispatcher) error {
 // connections.
 func NewDispatcher(options ...func(*Dispatcher) error) (*Dispatcher, error) {
 	d := &Dispatcher{
-		InRate:          rate.New(math.MaxInt32, time.Second),
-		OutRate:         rate.New(math.MaxInt32, time.Second),
-		logger:          &logadapter.Discarder{},
-		clients:         make(map[[sha1.Size]byte]*Client),
-		rejectAddresses: make(map[string]time.Time),
+		InRate:     rate.New(math.MaxInt32, time.Second),
+		OutRate:    rate.New(math.MaxInt32, time.Second),
+		logger:     &logadapter.Discarder{},
+		clients:    make(map[[sha1.Size]byte]ConnectionHandler),
+		gatekeeper: NewGateKeeper(),
 	}
 	var err error
 	for _, option := range options {
@@ -164,50 +171,14 @@ func NewDispatcher(options ...func(*Dispatcher) error) (*Dispatcher, error) {
 	return d, nil
 }
 
-func (d *Dispatcher) rejectAddress(addr net.Addr) {
-	host, _, err := net.SplitHostPort(addr.String())
-	if err != nil {
-		return
-	}
-	d.rejectLock.Lock()
-	d.rejectAddresses[host] = time.Now().Add(rejectDuration)
-	if d.rejectDone == nil {
-		d.rejectDone = make(chan bool)
-		go d.pruneRejectedAddresses()
-	}
-	d.rejectLock.Unlock()
+// Logger returns the logger being used by this dispatcher.
+func (d *Dispatcher) Logger() logadapter.Logger {
+	return d.logger
 }
 
-func (d *Dispatcher) isAddressAcceptable(addr net.Addr) bool {
-	host, _, err := net.SplitHostPort(addr.String())
-	if err != nil {
-		return false
-	}
-	return d.isAddressStringAcceptable(host)
-}
-
-func (d *Dispatcher) isAddressStringAcceptable(addr string) bool {
-	d.rejectLock.RLock()
-	defer d.rejectLock.RUnlock()
-	expires, ok := d.rejectAddresses[addr]
-	return !ok || expires.Before(time.Now())
-}
-
-func (d *Dispatcher) pruneRejectedAddresses() {
-	for {
-		select {
-		case <-time.After(rejectDuration):
-			d.rejectLock.Lock()
-			for addr, expires := range d.rejectAddresses {
-				if expires.Before(time.Now()) {
-					delete(d.rejectAddresses, addr)
-				}
-			}
-			d.rejectLock.Unlock()
-		case <-d.rejectDone:
-			return
-		}
-	}
+// GateKeeper returns the GateKeeper being used by this dispatcher.
+func (d *Dispatcher) GateKeeper() *GateKeeper {
+	return d.gatekeeper
 }
 
 // Ports returns the internal and external ports that we're listening on.
@@ -220,23 +191,21 @@ func (d *Dispatcher) Ports() (internal int, external int) {
 // Stop terminates all connections made through this dispatcher and shuts it
 // down.
 func (d *Dispatcher) Stop() {
-	d.rejectLock.Lock()
-	if d.rejectDone != nil {
-		d.rejectDone <- true
-	}
-	d.rejectLock.Unlock()
+	d.gatekeeper.Close()
 	if err := d.listener.Close(); err != nil {
 		d.logger.Warn(err)
 	}
 }
 
-func (d *Dispatcher) register(infoHash [sha1.Size]byte, client *Client) {
+// Register a connection handler with this dispatcher.
+func (d *Dispatcher) Register(infoHash [sha1.Size]byte, handler ConnectionHandler) {
 	d.routerLock.Lock()
-	d.clients[infoHash] = client
+	d.clients[infoHash] = handler
 	d.routerLock.Unlock()
 }
 
-func (d *Dispatcher) deregister(infoHash [sha1.Size]byte) {
+// Deregister a connection handler from this dispatcher.
+func (d *Dispatcher) Deregister(infoHash [sha1.Size]byte) {
 	d.routerLock.Lock()
 	delete(d.clients, infoHash)
 	d.routerLock.Unlock()
@@ -267,12 +236,12 @@ func (d *Dispatcher) listen() {
 func (d *Dispatcher) dispatch(conn net.Conn) {
 	log := &logadapter.Prefixer{Logger: d.logger, Prefix: conn.RemoteAddr().String() + " | "}
 	defer fileutil.CloseIgnoringErrors(conn)
-	if !d.isAddressAcceptable(conn.RemoteAddr()) {
+	if d.gatekeeper.IsAddressBlocked(conn.RemoteAddr()) {
 		return
 	}
-	extensions, infoHash, err := receiveTorrentHandshake(conn)
+	extensions, infoHash, err := ReceiveTorrentHandshake(conn)
 	if err != nil {
-		if shouldLogIOError(err) {
+		if tio.ShouldLogIOError(err) {
 			log.Warn(err)
 		}
 		return
@@ -281,7 +250,7 @@ func (d *Dispatcher) dispatch(conn net.Conn) {
 	client, ok := d.clients[infoHash]
 	d.routerLock.RUnlock()
 	if ok {
-		client.handleConnection(conn, log, extensions, infoHash, true)
+		client.HandleConnection(conn, log, extensions, infoHash, true)
 	}
 }
 
@@ -302,27 +271,29 @@ func (d *Dispatcher) monitorNatPMP() {
 	}
 }
 
-func receiveTorrentHandshake(conn net.Conn) (extensions [extensionsSize]byte, infoHash [sha1.Size]byte, err error) {
+// ReceiveTorrentHandshake reads the torrent protocol handshake.
+func ReceiveTorrentHandshake(conn net.Conn) (extensions [ExtensionsSize]byte, infoHash [sha1.Size]byte, err error) {
 	buffer := make([]byte, len(protocolIdentifier))
-	if err = readWithDeadline(conn, buffer, handshakeDeadline); err != nil {
+	if err = tio.ReadWithDeadline(conn, buffer, HandshakeDeadline); err != nil {
 		return
 	}
 	if !bytes.Equal(buffer, protocolIdentifier) {
 		err = io.EOF // Invalid protocol identifier; just return EOF to indicate failure.
 		return
 	}
-	if err = readWithDeadline(conn, extensions[:], handshakeDeadline); err != nil {
+	if err = tio.ReadWithDeadline(conn, extensions[:], HandshakeDeadline); err != nil {
 		return
 	}
-	err = readWithDeadline(conn, infoHash[:], handshakeDeadline)
+	err = tio.ReadWithDeadline(conn, infoHash[:], HandshakeDeadline)
 	return
 }
 
-func sendTorrentHandshake(conn net.Conn, extensions [extensionsSize]byte, infoHash [sha1.Size]byte, clientID [peerIDSize]byte) error {
-	buffer := make([]byte, len(protocolIdentifier)+extensionsSize+sha1.Size+peerIDSize)
+// SendTorrentHandshake sends the torrent protocol handshake.
+func SendTorrentHandshake(conn net.Conn, extensions [ExtensionsSize]byte, infoHash [sha1.Size]byte, clientID [PeerIDSize]byte) error {
+	buffer := make([]byte, len(protocolIdentifier)+ExtensionsSize+sha1.Size+PeerIDSize)
 	copy(buffer[:len(protocolIdentifier)], protocolIdentifier)
-	copy(buffer[len(protocolIdentifier):len(protocolIdentifier)+extensionsSize], extensions[:])
-	copy(buffer[len(protocolIdentifier)+extensionsSize:len(protocolIdentifier)+extensionsSize+sha1.Size], infoHash[:])
-	copy(buffer[len(protocolIdentifier)+extensionsSize+sha1.Size:], clientID[:])
-	return writeWithDeadline(conn, buffer, handshakeDeadline)
+	copy(buffer[len(protocolIdentifier):len(protocolIdentifier)+ExtensionsSize], extensions[:])
+	copy(buffer[len(protocolIdentifier)+ExtensionsSize:len(protocolIdentifier)+ExtensionsSize+sha1.Size], infoHash[:])
+	copy(buffer[len(protocolIdentifier)+ExtensionsSize+sha1.Size:], clientID[:])
+	return tio.WriteWithDeadline(conn, buffer, HandshakeDeadline)
 }

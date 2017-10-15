@@ -17,6 +17,7 @@ import (
 	"github.com/richardwilkes/fileutil"
 	"github.com/richardwilkes/natpmp"
 	"github.com/richardwilkes/torrent/container/bits"
+	"github.com/richardwilkes/torrent/tio"
 	"github.com/zeebo/bencode"
 )
 
@@ -207,7 +208,7 @@ func (t *tracker) periodicAnnounce() {
 		timer := time.After(time.Duration(seconds) * time.Second)
 		select {
 		case <-timer:
-			if err := t.announce(""); shouldLogIOError(err) {
+			if err := t.announce(""); tio.ShouldLogIOError(err) {
 				t.client.logger.Warn(err)
 			}
 		case <-t.stopAnnounceChan:

@@ -20,7 +20,9 @@ import (
 	"github.com/richardwilkes/fileutil"
 	"github.com/richardwilkes/logadapter"
 	"github.com/richardwilkes/rate"
+	"github.com/richardwilkes/torrent/dispatcher"
 	"github.com/richardwilkes/torrent/tfs"
+	"github.com/richardwilkes/torrent/tio"
 )
 
 const (
@@ -36,12 +38,12 @@ var (
 type Client struct {
 	InRate                   rate.Limiter
 	OutRate                  rate.Limiter
-	dispatcher               *Dispatcher
+	dispatcher               *dispatcher.Dispatcher
 	torrentFile              *tfs.File
 	downloadCompleteNotifier chan *Client
 	stoppedNotifier          chan *Client
 	logger                   *logadapter.Prefixer
-	id                       [peerIDSize]byte
+	id                       [dispatcher.PeerIDSize]byte
 	tracker                  *tracker
 	peersWanted              int
 	peerWaitGroup            *sync.WaitGroup
@@ -119,8 +121,8 @@ func NotifyWhenStopped(notifier chan *Client) func(*Client) error {
 }
 
 // NewClient creates and starts a new client for a torrent.
-func NewClient(dispatcher *Dispatcher, torrentFile *tfs.File, options ...func(*Client) error) (*Client, error) {
-	if dispatcher == nil {
+func NewClient(d *dispatcher.Dispatcher, torrentFile *tfs.File, options ...func(*Client) error) (*Client, error) {
+	if d == nil {
 		return nil, errs.New("dispatcher may not be nil")
 	}
 	if torrentFile == nil {
@@ -129,11 +131,11 @@ func NewClient(dispatcher *Dispatcher, torrentFile *tfs.File, options ...func(*C
 	_, prefix := filepath.Split(torrentFile.StoragePath())
 	prefix = prefix[:len(prefix)-len(filepath.Ext(prefix))] + " | "
 	c := &Client{
-		InRate:        dispatcher.InRate.New(math.MaxInt32),
-		OutRate:       dispatcher.OutRate.New(math.MaxInt32),
-		dispatcher:    dispatcher,
+		InRate:        d.InRate.New(math.MaxInt32),
+		OutRate:       d.OutRate.New(math.MaxInt32),
+		dispatcher:    d,
 		torrentFile:   torrentFile,
-		logger:        &logadapter.Prefixer{Logger: dispatcher.logger, Prefix: prefix},
+		logger:        &logadapter.Prefixer{Logger: d.Logger(), Prefix: prefix},
 		peersWanted:   16,
 		peerWaitGroup: &sync.WaitGroup{},
 		peerMgmtStop:  make(chan bool),
@@ -229,8 +231,8 @@ func (c *Client) run() {
 		c.finish(errStopRequested)
 		return
 	}
-	c.dispatcher.register(c.torrentFile.InfoHash, c)
-	defer c.dispatcher.deregister(c.torrentFile.InfoHash)
+	c.dispatcher.Register(c.torrentFile.InfoHash, c)
+	defer c.dispatcher.Deregister(c.torrentFile.InfoHash)
 	if err = c.tracker.announceStart(); err != nil {
 		c.finish(err)
 		return
@@ -307,24 +309,25 @@ func (c *Client) prepareFile() error {
 	return nil
 }
 
-func (c *Client) handleConnection(conn net.Conn, log logadapter.Logger, extensions [extensionsSize]byte, infoHash [sha1.Size]byte, sendHandshake bool) {
+// HandleConnection is called by the dispatcher for new connections.
+func (c *Client) HandleConnection(conn net.Conn, log logadapter.Logger, extensions [dispatcher.ExtensionsSize]byte, infoHash [sha1.Size]byte, sendHandshake bool) {
 	log = &logadapter.Prefixer{Logger: log, Prefix: c.logger.Prefix}
 	if !bytes.Equal(infoHash[:], c.torrentFile.InfoHash[:]) {
 		log.Warn("Rejecting due to InfoHash mis-match")
 		return
 	}
 	if sendHandshake {
-		var myExtensions [extensionsSize]byte
-		if err := sendTorrentHandshake(conn, myExtensions, c.torrentFile.InfoHash, c.id); err != nil {
-			if shouldLogIOError(err) {
+		var myExtensions [dispatcher.ExtensionsSize]byte
+		if err := dispatcher.SendTorrentHandshake(conn, myExtensions, c.torrentFile.InfoHash, c.id); err != nil {
+			if tio.ShouldLogIOError(err) {
 				log.Warn(err)
 			}
 			return
 		}
 	}
-	var peerID [peerIDSize]byte
-	if err := readWithDeadline(conn, peerID[:], handshakeDeadline); err != nil {
-		if shouldLogIOError(err) {
+	var peerID [dispatcher.PeerIDSize]byte
+	if err := tio.ReadWithDeadline(conn, peerID[:], dispatcher.HandshakeDeadline); err != nil {
+		if tio.ShouldLogIOError(err) {
 			log.Warn(err)
 		}
 		return
@@ -360,35 +363,35 @@ func (c *Client) disconnect(conn net.Conn) {
 func (c *Client) connectToPeer(addr string, port int) {
 	raddr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf("%s:%d", addr, port))
 	if err != nil {
-		if shouldLogIOError(err) {
+		if tio.ShouldLogIOError(err) {
 			c.logger.Warn(errs.Wrap(err))
 		}
 		return
 	}
 	conn, err := net.DialTCP("tcp", nil, raddr)
 	if err != nil {
-		if shouldLogIOError(err) {
+		if tio.ShouldLogIOError(err) {
 			c.logger.Warn(errs.Wrap(err))
 		}
 		return
 	}
-	log := &logadapter.Prefixer{Logger: c.dispatcher.logger, Prefix: conn.RemoteAddr().String() + " | "}
+	log := &logadapter.Prefixer{Logger: c.dispatcher.Logger(), Prefix: conn.RemoteAddr().String() + " | "}
 	defer fileutil.CloseIgnoringErrors(conn)
-	var myExtensions [extensionsSize]byte
-	if err = sendTorrentHandshake(conn, myExtensions, c.torrentFile.InfoHash, c.id); err != nil {
-		if shouldLogIOError(err) {
+	var myExtensions [dispatcher.ExtensionsSize]byte
+	if err = dispatcher.SendTorrentHandshake(conn, myExtensions, c.torrentFile.InfoHash, c.id); err != nil {
+		if tio.ShouldLogIOError(err) {
 			log.Warn(err)
 		}
 		return
 	}
-	extensions, infoHash, err := receiveTorrentHandshake(conn)
+	extensions, infoHash, err := dispatcher.ReceiveTorrentHandshake(conn)
 	if err != nil {
-		if shouldLogIOError(err) {
+		if tio.ShouldLogIOError(err) {
 			log.Warn(err)
 		}
 		return
 	}
-	c.handleConnection(conn, log, extensions, infoHash, false)
+	c.HandleConnection(conn, log, extensions, infoHash, false)
 }
 
 func (c *Client) finish(err error) {
@@ -402,7 +405,7 @@ func (c *Client) finish(err error) {
 	if err != nil {
 		if err == errStopRequested {
 			c.logger.Info(err)
-		} else if shouldLogIOError(err) {
+		} else if tio.ShouldLogIOError(err) {
 			c.logger.Warn(err)
 		}
 	}
@@ -459,7 +462,7 @@ func (c *Client) adjustPeers() {
 		if data.state.downloading {
 			if data.state.peerChoking || now.Sub(data.state.lastReceived) > maxWaitForChunkDownload {
 				c.logger.Infof("AdjustPeers: Disconnecting peer due to lack of progress: %s", data.peer.conn.RemoteAddr().String())
-				c.dispatcher.rejectAddress(data.peer.conn.RemoteAddr())
+				c.dispatcher.GateKeeper().BlockAddress(data.peer.conn.RemoteAddr())
 				c.disconnect(data.peer.conn)
 				continue
 			}
@@ -510,7 +513,7 @@ func (c *Client) adjustPeers() {
 			for i := 0; i < count; i++ {
 				added := false
 				for addr, port := range peerAddressMap {
-					if _, exists := existing[addr]; !exists && c.dispatcher.isAddressStringAcceptable(addr) {
+					if _, exists := existing[addr]; !exists && !c.dispatcher.GateKeeper().IsAddressStringBlocked(addr) {
 						c.logger.Infof("AdjustPeers: Attempting to connect to new peer: %s", addr)
 						go c.connectToPeer(addr, port)
 						existing[addr] = true

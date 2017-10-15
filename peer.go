@@ -11,6 +11,7 @@ import (
 	"github.com/richardwilkes/logadapter"
 	"github.com/richardwilkes/torrent/container/bits"
 	"github.com/richardwilkes/torrent/container/spanlist"
+	"github.com/richardwilkes/torrent/tio"
 )
 
 const (
@@ -198,8 +199,8 @@ func (p *peer) processIncomingMessages() {
 			p.logger.Warn("Piece download taking too long, closing connection to peer")
 			return
 		}
-		if err := readWithDeadline(p.conn, lengthBuffer, msgReadDeadline); err != nil {
-			if shouldLogIOError(err) {
+		if err := tio.ReadWithDeadline(p.conn, lengthBuffer, msgReadDeadline); err != nil {
+			if tio.ShouldLogIOError(err) {
 				p.logger.Warn(err)
 			}
 			return
@@ -207,8 +208,8 @@ func (p *peer) processIncomingMessages() {
 		length := binary.BigEndian.Uint32(lengthBuffer)
 		if length > 0 { // Not a keep-alive message
 			buffer := make([]byte, length)
-			if err := readWithDeadline(p.conn, buffer, msgReadDeadline); err != nil {
-				if shouldLogIOError(err) {
+			if err := tio.ReadWithDeadline(p.conn, buffer, msgReadDeadline); err != nil {
+				if tio.ShouldLogIOError(err) {
 					p.logger.Warn(err)
 				}
 				return
@@ -257,7 +258,7 @@ func (p *peer) processIncomingMessages() {
 				}
 			case pieceID:
 				if err := p.receivedChunk(int(binary.BigEndian.Uint32(buffer[1:5])), int(binary.BigEndian.Uint32(buffer[5:9])), buffer[9:]); err != nil {
-					if shouldLogIOError(err) {
+					if tio.ShouldLogIOError(err) {
 						p.logger.Warn(err)
 					}
 					return
@@ -274,7 +275,7 @@ func (p *peer) processIncomingMessages() {
 		p.bytesRead += int64(length + 4)
 		p.lock.Unlock()
 		if err := <-p.client.InRate.Use(int(length + 4)); err != nil {
-			if shouldLogIOError(err) {
+			if tio.ShouldLogIOError(err) {
 				p.logger.Warn(err)
 			}
 			return
@@ -335,7 +336,7 @@ func (p *peer) receivedChunk(index, begin int, buffer []byte) error {
 	}
 	last := begin + len(buffer)
 	if last > len(one.buffer) {
-		p.client.dispatcher.rejectAddress(p.conn.RemoteAddr())
+		p.client.dispatcher.GateKeeper().BlockAddress(p.conn.RemoteAddr())
 		return errs.New("Chunk data would overrun buffer")
 	}
 	one.lock.Lock()
@@ -368,7 +369,7 @@ func (p *peer) receivedChunk(index, begin int, buffer []byte) error {
 			p.startDownloadIfNeeded()
 		} else {
 			one.lock.Unlock()
-			p.client.dispatcher.rejectAddress(p.conn.RemoteAddr())
+			p.client.dispatcher.GateKeeper().BlockAddress(p.conn.RemoteAddr())
 			return errs.Newf("Received invalid piece %d", index)
 		}
 	} else {
@@ -469,11 +470,11 @@ func (p *peer) processWriteQueue() {
 			}
 			if err == nil {
 				lastWriteTime = time.Now()
-				err = writeWithDeadline(p.conn, buffer, msgWriteDeadline)
+				err = tio.WriteWithDeadline(p.conn, buffer, msgWriteDeadline)
 			}
 		}
 		if err != nil || buffer == nil {
-			if shouldLogIOError(err) {
+			if tio.ShouldLogIOError(err) {
 				p.logger.Warn(err)
 			}
 			p.client.disconnect(p.conn)
