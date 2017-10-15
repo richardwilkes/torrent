@@ -20,6 +20,7 @@ import (
 
 const (
 	handshakeDeadline = 5 * time.Second
+	rejectDuration    = 15 * time.Minute
 	extensionsSize    = 8
 	peerIDSize        = 20
 )
@@ -176,7 +177,7 @@ func (d *Dispatcher) rejectAddress(addr net.Addr) {
 		return
 	}
 	d.rejectLock.Lock()
-	d.rejectAddresses[host] = time.Now().Add(15 * time.Minute)
+	d.rejectAddresses[host] = time.Now().Add(rejectDuration)
 	if d.rejectDone == nil {
 		d.rejectDone = make(chan bool)
 		go d.pruneRejectedAddresses()
@@ -202,11 +203,11 @@ func (d *Dispatcher) isAddressStringAcceptable(addr string) bool {
 func (d *Dispatcher) pruneRejectedAddresses() {
 	for {
 		select {
-		case <-time.After(15 * time.Minute):
+		case <-time.After(rejectDuration):
 			d.rejectLock.Lock()
-			for k, v := range d.rejectAddresses {
-				if v.Before(time.Now()) {
-					delete(d.rejectAddresses, k)
+			for addr, expires := range d.rejectAddresses {
+				if expires.Before(time.Now()) {
+					delete(d.rejectAddresses, addr)
 				}
 			}
 			d.rejectLock.Unlock()
