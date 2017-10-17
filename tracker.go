@@ -349,6 +349,20 @@ func (t *tracker) clearDownload(index int) {
 	t.lock.Unlock()
 }
 
+// RAW: This should not be necessary. Eliminate once it is determined that it
+// never does anything useful.
+func (t *tracker) clearDownloadsFromPeer(who *peer) {
+	t.lock.Lock()
+	for k, v := range t.who {
+		if v == who {
+			t.client.Logger().Debugf("Found download for peer that should have been cleared already")
+			delete(t.who, k)
+			t.downloading.Unset(k)
+		}
+	}
+	t.lock.Unlock()
+}
+
 func (t *tracker) isInteresting(has *bits.Bits) bool {
 	t.lock.RLock()
 	i := bits.FirstAvailable(has, t.downloading, t.have)

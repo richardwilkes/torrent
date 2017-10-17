@@ -40,7 +40,7 @@ type Client struct {
 	downloadCompleteNotifier chan *Client
 	stoppedNotifier          chan *Client
 	logger                   *logadapter.Prefixer
-	id                       [dispatcher.PeerIDSize]byte
+	id                       dispatcher.PeerID
 	tracker                  *tracker
 	concurrentDownloads      int
 	peersWanted              int
@@ -79,9 +79,7 @@ func NewClient(d *dispatcher.Dispatcher, torrentFile *tfs.File, options ...func(
 		peers:               make(map[net.Conn]*peer),
 		stoppedChan:         make(chan bool, 1),
 	}
-	for i := range version {
-		c.id[i] = version[i]
-	}
+	copy(c.id[:], version)
 	rand.Read(c.id[len(version):])
 	for i := len(version); i < len(c.id); i++ {
 		c.id[i] = urlQuerySafeBytes[int(c.id[i])%len(urlQuerySafeBytes)]
@@ -245,26 +243,29 @@ func (c *Client) prepareFile() error {
 }
 
 // HandleConnection is called by the dispatcher for new connections.
-func (c *Client) HandleConnection(conn net.Conn, log logadapter.Logger, extensions [dispatcher.ExtensionsSize]byte, infoHash tfs.InfoHash, sendHandshake bool) {
+func (c *Client) HandleConnection(conn net.Conn, log logadapter.Logger, extensions dispatcher.ProtocolExtensions, infoHash tfs.InfoHash, sendHandshake bool) {
 	log = &logadapter.Prefixer{Logger: log, Prefix: c.logger.Prefix}
 	if !bytes.Equal(infoHash[:], c.torrentFile.InfoHash[:]) {
 		log.Warn("Rejecting due to InfoHash mis-match")
+		c.dispatcher.GateKeeper().BlockAddress(conn.RemoteAddr())
 		return
 	}
 	if sendHandshake {
-		var myExtensions [dispatcher.ExtensionsSize]byte
+		var myExtensions dispatcher.ProtocolExtensions
 		if err := dispatcher.SendTorrentHandshake(conn, myExtensions, c.torrentFile.InfoHash, c.id); err != nil {
 			if tio.ShouldLogIOError(err) {
 				log.Warn(err)
 			}
+			c.dispatcher.GateKeeper().BlockAddress(conn.RemoteAddr())
 			return
 		}
 	}
-	var peerID [dispatcher.PeerIDSize]byte
+	var peerID dispatcher.PeerID
 	if err := tio.ReadWithDeadline(conn, peerID[:], dispatcher.HandshakeDeadline); err != nil {
 		if tio.ShouldLogIOError(err) {
 			log.Warn(err)
 		}
+		c.dispatcher.GateKeeper().BlockAddress(conn.RemoteAddr())
 		return
 	}
 	p := newPeer(c, conn, log)
@@ -286,6 +287,9 @@ func (c *Client) HandleConnection(conn net.Conn, log logadapter.Logger, extensio
 	defer c.peerWaitGroup.Done()
 	p.processIncomingMessages()
 	c.disconnect(conn)
+
+	// Here for debugging...
+	c.tracker.clearDownloadsFromPeer(p)
 }
 
 func (c *Client) disconnect(conn net.Conn) {
@@ -301,6 +305,7 @@ func (c *Client) connectToPeer(addr string, port int) {
 		if tio.ShouldLogIOError(err) {
 			c.logger.Warn(errs.Wrap(err))
 		}
+		c.dispatcher.GateKeeper().BlockAddressString(addr)
 		return
 	}
 	conn, err := net.DialTCP("tcp", nil, raddr)
@@ -308,15 +313,17 @@ func (c *Client) connectToPeer(addr string, port int) {
 		if tio.ShouldLogIOError(err) {
 			c.logger.Warn(errs.Wrap(err))
 		}
+		c.dispatcher.GateKeeper().BlockAddressString(addr)
 		return
 	}
 	log := &logadapter.Prefixer{Logger: c.dispatcher.Logger(), Prefix: conn.RemoteAddr().String() + " | "}
 	defer fileutil.CloseIgnoringErrors(conn)
-	var myExtensions [dispatcher.ExtensionsSize]byte
+	var myExtensions dispatcher.ProtocolExtensions
 	if err = dispatcher.SendTorrentHandshake(conn, myExtensions, c.torrentFile.InfoHash, c.id); err != nil {
 		if tio.ShouldLogIOError(err) {
 			log.Warn(err)
 		}
+		c.dispatcher.GateKeeper().BlockAddressString(addr)
 		return
 	}
 	extensions, infoHash, err := dispatcher.ReceiveTorrentHandshake(conn)
@@ -324,6 +331,7 @@ func (c *Client) connectToPeer(addr string, port int) {
 		if tio.ShouldLogIOError(err) {
 			log.Warn(err)
 		}
+		c.dispatcher.GateKeeper().BlockAddressString(addr)
 		return
 	}
 	c.HandleConnection(conn, log, extensions, infoHash, false)
@@ -457,7 +465,6 @@ func (c *Client) adjustPeers() {
 					}
 				}
 				if !added {
-					c.logger.Warnf("Unable to add new peer due to lack of unconnected peers (checked %d)", len(peerAddressMap))
 					break
 				}
 			}

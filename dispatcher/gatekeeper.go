@@ -27,7 +27,12 @@ func (r *GateKeeper) BlockAddress(addr net.Addr) {
 	if err != nil {
 		return
 	}
-	r.addresses.Store(host, time.Now().Add(blockDuration))
+	r.BlockAddressString(host)
+}
+
+// BlockAddressString adds the specified address to the incoming blocked list.
+func (r *GateKeeper) BlockAddressString(addr string) {
+	r.addresses.Store(addr, time.Now().Add(blockDuration))
 }
 
 // IsAddressBlocked returns true if the address is blocked.

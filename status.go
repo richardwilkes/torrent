@@ -17,6 +17,8 @@ const (
 	Errored
 )
 
+const toMegaBitsPerSecond = 1024 * 1024 / 8
+
 // State holds the enumeration of possible states.
 type State int
 
@@ -38,17 +40,17 @@ func (s Status) String() string {
 	case Initializing:
 		return fmt.Sprintf("Initializing: %0.1f%%", s.PercentComplete)
 	case Downloading:
-		return fmt.Sprintf("Downloading: %.2f%%   Dn %.2f KB/s   Up %.2f KB/s   Peers %dD/%dC/%dL/%dP",
+		return fmt.Sprintf("Downloading: %.2f%% - Dn %.2f Mbps - Up %.2f Mbps - Peers %dD/%dC/%dL/%dP",
 			s.PercentComplete,
-			float64(s.DownloadBytesPerSecond)/1024,
-			float64(s.UploadBytesPerSecond)/1024,
+			float64(s.DownloadBytesPerSecond)/toMegaBitsPerSecond,
+			float64(s.UploadBytesPerSecond)/toMegaBitsPerSecond,
 			s.PeersDownloading,
 			s.PeersConnected,
 			s.Leechers,
 			s.Seeders)
 	case Seeding:
-		return fmt.Sprintf("Seeding: Up %.2f KB/s   %s remaining   Peers %dC/%dL/%dP",
-			float64(s.UploadBytesPerSecond)/1024,
+		return fmt.Sprintf("Seeding: Up %.2f Mbps - %s remaining - Peers %dC/%dL/%dP",
+			float64(s.UploadBytesPerSecond)/toMegaBitsPerSecond,
 			strutil.FormatDuration(time.Until(s.SeedingStopsAt), false),
 			s.PeersConnected,
 			s.Leechers,

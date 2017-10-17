@@ -20,7 +20,7 @@ import (
 
 // ConnectionHandler defines the interface for handling torrent connections.
 type ConnectionHandler interface {
-	HandleConnection(conn net.Conn, log logadapter.Logger, extensions [ExtensionsSize]byte, infoHash tfs.InfoHash, sendHandshake bool)
+	HandleConnection(conn net.Conn, log logadapter.Logger, extensions ProtocolExtensions, infoHash tfs.InfoHash, sendHandshake bool)
 }
 
 // Dispatcher holds a dispatcher for bit torrent connections.
