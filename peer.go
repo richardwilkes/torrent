@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/richardwilkes/errs"
+	"github.com/richardwilkes/fileutil"
 	"github.com/richardwilkes/logadapter"
 	"github.com/richardwilkes/torrent/container/bits"
 	"github.com/richardwilkes/torrent/container/spanlist"
@@ -446,7 +447,7 @@ func (p *peer) processPieceRequests(in chan *pieceRequest) {
 		binary.BigEndian.PutUint32(buffer[9:13], uint32(req.begin))
 		if _, err := p.client.file.ReadAt(buffer[13:], p.client.torrentFile.OffsetOf(req.index)+int64(req.begin)); err != nil {
 			p.logger.Error(errs.NewfWithCause(err, "Unable to read piece %d (begin=%d, length=%d)", req.index, req.begin, req.length))
-			p.client.disconnect(p.conn)
+			fileutil.CloseIgnoringErrors(p.conn)
 			return
 		}
 		p.writeQueue <- buffer
@@ -477,7 +478,7 @@ func (p *peer) processWriteQueue() {
 			if tio.ShouldLogIOError(err) {
 				p.logger.Warn(err)
 			}
-			p.client.disconnect(p.conn)
+			fileutil.CloseIgnoringErrors(p.conn)
 			// Drain any remaining entries in the queue
 			for {
 				select {

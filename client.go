@@ -114,6 +114,7 @@ func (c *Client) Stop(timeout time.Duration) {
 	}
 	c.stopRequested = true
 	c.lock.Unlock()
+	c.closeAllPeers()
 	select {
 	case <-time.After(timeout):
 		if c.stoppedNotifier != nil {
@@ -151,29 +152,15 @@ func (c *Client) run() {
 			c.stoppedNotifier <- c
 		}
 	}()
-	var err error
-	if c.file, err = os.OpenFile(c.torrentFile.StoragePath(), os.O_CREATE|os.O_RDWR, 0644); err != nil {
-		c.finish(errs.Wrap(err))
-		return
-	}
-	if err = c.prepareFile(); err != nil {
+	if err := c.prepareFile(); err != nil {
 		c.finish(err)
-		return
-	}
-	if c.shouldStop() {
-		c.finish(errStopRequested)
 		return
 	}
 	c.dispatcher.Register(c.torrentFile.InfoHash, c)
 	defer c.dispatcher.Deregister(c.torrentFile.InfoHash)
-	if err = c.tracker.announceStart(); err != nil {
+	if err := c.tracker.announceStart(); err != nil {
 		c.finish(err)
 		return
-	}
-	if !c.tracker.isDownloadComplete() {
-		c.tracker.setStateAndProgress(Downloading, -1)
-	} else {
-		c.tracker.setState(Seeding)
 	}
 	go c.managePeers()
 	for {
@@ -190,7 +177,12 @@ func (c *Client) run() {
 }
 
 func (c *Client) prepareFile() error {
-	fi, err := c.file.Stat()
+	f, err := os.OpenFile(c.torrentFile.StoragePath(), os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return errs.Wrap(err)
+	}
+	c.file = f
+	fi, err := f.Stat()
 	if err != nil {
 		return errs.Wrap(err)
 	}
@@ -200,12 +192,12 @@ func (c *Client) prepareFile() error {
 	length := c.torrentFile.Size()
 	original := fi.Size()
 	if original == 0 {
-		if err = c.file.Truncate(length); err != nil {
+		if err = f.Truncate(length); err != nil {
 			return errs.Wrap(err)
 		}
 	} else {
 		if original != length {
-			if err = c.file.Truncate(length); err != nil {
+			if err = f.Truncate(length); err != nil {
 				return errs.Wrap(err)
 			}
 			if c.shouldStop() {
@@ -221,7 +213,7 @@ func (c *Client) prepareFile() error {
 				break
 			}
 			var n int
-			if n, err = c.file.ReadAt(buffer, pos); err != nil && err != io.EOF {
+			if n, err = f.ReadAt(buffer, pos); err != nil && err != io.EOF {
 				return errs.Wrap(err)
 			}
 			if n != c.torrentFile.Info.PieceLength {
@@ -239,6 +231,9 @@ func (c *Client) prepareFile() error {
 		}
 	}
 	c.tracker.setProgress(100)
+	if c.shouldStop() {
+		return errStopRequested
+	}
 	return nil
 }
 
@@ -246,7 +241,6 @@ func (c *Client) prepareFile() error {
 func (c *Client) HandleConnection(conn net.Conn, log logadapter.Logger, extensions dispatcher.ProtocolExtensions, infoHash tfs.InfoHash, sendHandshake bool) {
 	log = &logadapter.Prefixer{Logger: log, Prefix: c.logger.Prefix}
 	if !bytes.Equal(infoHash[:], c.torrentFile.InfoHash[:]) {
-		log.Warn("Rejecting due to InfoHash mis-match")
 		c.dispatcher.GateKeeper().BlockAddress(conn.RemoteAddr())
 		return
 	}
@@ -284,19 +278,14 @@ func (c *Client) HandleConnection(conn net.Conn, log logadapter.Logger, extensio
 	c.peers[conn] = p
 	c.lock.Unlock()
 	c.peerWaitGroup.Add(1)
-	defer c.peerWaitGroup.Done()
+	defer func() {
+		fileutil.CloseIgnoringErrors(conn)
+		c.lock.Lock()
+		delete(c.peers, conn)
+		c.lock.Unlock()
+		c.peerWaitGroup.Done()
+	}()
 	p.processIncomingMessages()
-	c.disconnect(conn)
-
-	// Here for debugging...
-	c.tracker.clearDownloadsFromPeer(p)
-}
-
-func (c *Client) disconnect(conn net.Conn) {
-	fileutil.CloseIgnoringErrors(conn)
-	c.lock.Lock()
-	delete(c.peers, conn)
-	c.lock.Unlock()
 }
 
 func (c *Client) connectToPeer(addr string, port int) {
@@ -371,10 +360,23 @@ func (c *Client) finish(err error) {
 	c.tracker.setState(state)
 }
 
+func (c *Client) closeAllPeers() {
+	for _, p := range c.currentPeers() {
+		fileutil.CloseIgnoringErrors(p.conn)
+	}
+}
+
 func (c *Client) managePeers() {
 	c.adjustPeers()
 	for {
 		select {
+		case <-time.After(10 * time.Minute):
+			// This is here because we sometimes get into a state where one
+			// or more peers latch on that actually make zero progress, but
+			// somehow manage to hide this fact from me. This effectively
+			// resets everything every 10 minutes, ensuring that we eventually
+			// finish.
+			c.closeAllPeers()
 		case <-time.After(time.Minute):
 			for _, p := range c.currentPeers() {
 				p.clearExpiredDownloads()
@@ -404,9 +406,8 @@ func (c *Client) adjustPeers() {
 		}
 		if data.state.downloading {
 			if data.state.peerChoking || now.Sub(data.state.lastReceived) > maxWaitForChunkDownload {
-				c.logger.Infof("AdjustPeers: Disconnecting peer due to lack of progress: %s", data.peer.conn.RemoteAddr().String())
 				c.dispatcher.GateKeeper().BlockAddress(data.peer.conn.RemoteAddr())
-				c.disconnect(data.peer.conn)
+				fileutil.CloseIgnoringErrors(data.peer.conn)
 				continue
 			}
 			if !data.state.peerChoking && now.Sub(data.state.lastReceived) <= maxWaitForChunkDownload {
@@ -443,8 +444,7 @@ func (c *Client) adjustPeers() {
 				}
 				return pd[i].peer.created.After(pd[j].peer.created)
 			})
-			c.logger.Infof("AdjustPeers: Disconnecting peer to make room: %s", pd[0].peer.conn.RemoteAddr().String())
-			c.disconnect(pd[0].peer.conn)
+			fileutil.CloseIgnoringErrors(pd[0].peer.conn)
 			pd = pd[1:]
 			count = 1
 		}
@@ -457,7 +457,6 @@ func (c *Client) adjustPeers() {
 				added := false
 				for addr, port := range peerAddressMap {
 					if _, exists := existing[addr]; !exists && !c.dispatcher.GateKeeper().IsAddressStringBlocked(addr) {
-						c.logger.Infof("AdjustPeers: Attempting to connect to new peer: %s", addr)
 						go c.connectToPeer(addr, port)
 						existing[addr] = true
 						added = true
@@ -523,8 +522,7 @@ func (c *Client) dropPeerIfPossible() bool {
 			return pd[i].peer.created.After(pd[j].peer.created)
 		})
 	}
-	c.logger.Infof("dropPeerIfPossible: Disconnecting peer to make room: %s", pd[0].peer.conn.RemoteAddr().String())
-	c.disconnect(pd[0].peer.conn)
+	fileutil.CloseIgnoringErrors(pd[0].peer.conn)
 	return true
 }
 
