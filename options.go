@@ -30,7 +30,7 @@ func UploadCap(bytesPerSecond int) func(*Client) error {
 	}
 }
 
-// PeersWanted sets the number of peers to ask the tracker for. Default is 16.
+// PeersWanted sets the number of peers to ask the tracker for. Default is 32.
 func PeersWanted(wanted int) func(*Client) error {
 	return func(c *Client) error {
 		if wanted < 1 {

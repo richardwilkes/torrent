@@ -72,7 +72,7 @@ func NewClient(d *dispatcher.Dispatcher, torrentFile *tfs.File, options ...func(
 		torrentFile:         torrentFile,
 		logger:              &logadapter.Prefixer{Logger: d.Logger(), Prefix: prefix},
 		concurrentDownloads: 4,
-		peersWanted:         16,
+		peersWanted:         32,
 		peerWaitGroup:       &sync.WaitGroup{},
 		peerMgmtStop:        make(chan bool),
 		seedDuration:        96 * time.Hour,
