@@ -342,11 +342,7 @@ func (c *Client) finish(err error) {
 		}
 	}
 	close(c.peerMgmtStop)
-	c.lock.Lock()
-	for conn := range c.peers {
-		fileutil.CloseIgnoringErrors(conn)
-	}
-	c.lock.Unlock()
+	c.closeAllPeers()
 	c.peerWaitGroup.Wait()
 	if err = c.tracker.announceStopped(); err != nil {
 		c.logger.Warn(err)
