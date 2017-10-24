@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-const blockDuration = 15 * time.Minute
+const blockDuration = 5 * time.Minute
 
 // GateKeeper controls whether peers with a given address may connect with us.
 type GateKeeper struct {
