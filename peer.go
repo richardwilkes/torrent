@@ -439,18 +439,22 @@ func (p *peer) pieceRequestQueue() {
 }
 
 func (p *peer) processPieceRequests(in chan *pieceRequest) {
+	process := true
 	for req := range in {
-		buffer := make([]byte, 13+req.length)
-		binary.BigEndian.PutUint32(buffer[:4], uint32(9+req.length))
-		buffer[4] = pieceID
-		binary.BigEndian.PutUint32(buffer[5:9], uint32(req.index))
-		binary.BigEndian.PutUint32(buffer[9:13], uint32(req.begin))
-		if _, err := p.client.file.ReadAt(buffer[13:], p.client.torrentFile.OffsetOf(req.index)+int64(req.begin)); err != nil {
-			p.logger.Error(errs.NewfWithCause(err, "Unable to read piece %d (begin=%d, length=%d)", req.index, req.begin, req.length))
-			fileutil.CloseIgnoringErrors(p.conn)
-			return
+		if process {
+			buffer := make([]byte, 13+req.length)
+			binary.BigEndian.PutUint32(buffer[:4], uint32(9+req.length))
+			buffer[4] = pieceID
+			binary.BigEndian.PutUint32(buffer[5:9], uint32(req.index))
+			binary.BigEndian.PutUint32(buffer[9:13], uint32(req.begin))
+			if _, err := p.client.file.ReadAt(buffer[13:], p.client.torrentFile.OffsetOf(req.index)+int64(req.begin)); err != nil {
+				p.logger.Error(errs.NewfWithCause(err, "Unable to read piece %d (begin=%d, length=%d)", req.index, req.begin, req.length))
+				fileutil.CloseIgnoringErrors(p.conn)
+				process = false
+				continue
+			}
+			p.writeQueue <- buffer
 		}
-		p.writeQueue <- buffer
 	}
 }
 
@@ -458,7 +462,6 @@ func (p *peer) processWriteQueue() {
 	var lastWriteTime time.Time
 	done := make(chan bool)
 	go p.keepAlive(done)
-	defer close(done)
 	for buffer := range p.writeQueue {
 		var err error
 		if buffer != nil {
@@ -478,12 +481,15 @@ func (p *peer) processWriteQueue() {
 			if tio.ShouldLogIOError(err) {
 				p.logger.Warn(err)
 			}
+			close(done)
 			fileutil.CloseIgnoringErrors(p.conn)
-			// Drain any remaining entries in the queue
+			// Drain any remaining entries in the queue, terminating after a
+			// significant delay to allow all writers time to stop posting to
+			// the queue.
 			for {
 				select {
 				case <-p.writeQueue:
-				default:
+				case <-time.After(5 * time.Minute):
 					return
 				}
 			}
@@ -492,6 +498,7 @@ func (p *peer) processWriteQueue() {
 		p.bytesWritten += int64(len(buffer))
 		p.lock.Unlock()
 	}
+	close(done)
 }
 
 func (p *peer) keepAlive(done chan bool) {
