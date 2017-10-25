@@ -305,8 +305,8 @@ func (c *Client) connectToPeer(addr string, port int) {
 		c.dispatcher.GateKeeper().BlockAddressString(addr)
 		return
 	}
-	log := &logadapter.Prefixer{Logger: c.dispatcher.Logger(), Prefix: conn.RemoteAddr().String() + " | "}
 	defer fileutil.CloseIgnoringErrors(conn)
+	log := &logadapter.Prefixer{Logger: c.dispatcher.Logger(), Prefix: conn.RemoteAddr().String() + " | "}
 	var myExtensions dispatcher.ProtocolExtensions
 	if err = dispatcher.SendTorrentHandshake(conn, myExtensions, c.torrentFile.InfoHash, c.id); err != nil {
 		if tio.ShouldLogIOError(err) {
@@ -366,13 +366,6 @@ func (c *Client) managePeers() {
 	c.adjustPeers()
 	for {
 		select {
-		case <-time.After(10 * time.Minute):
-			// This is here because we sometimes get into a state where one
-			// or more peers latch on that actually make zero progress, but
-			// somehow manage to hide this fact from me. This effectively
-			// resets everything every 10 minutes, ensuring that we eventually
-			// finish.
-			c.closeAllPeers()
 		case <-time.After(time.Minute):
 			for _, p := range c.currentPeers() {
 				p.clearExpiredDownloads()
