@@ -9,11 +9,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/richardwilkes/errs"
-	"github.com/richardwilkes/fileutil"
-	"github.com/richardwilkes/logadapter"
-	"github.com/richardwilkes/natpmp"
-	"github.com/richardwilkes/rate"
+	"github.com/richardwilkes/toolbox/errs"
+	"github.com/richardwilkes/toolbox/log/logadapter"
+	"github.com/richardwilkes/toolbox/rate"
+	"github.com/richardwilkes/toolbox/xio"
+	"github.com/richardwilkes/toolbox/xio/network/natpmp"
 	"github.com/richardwilkes/torrent/tfs"
 	"github.com/richardwilkes/torrent/tio"
 )
@@ -164,7 +164,7 @@ func (d *Dispatcher) listen() {
 
 func (d *Dispatcher) dispatch(conn net.Conn) {
 	log := &logadapter.Prefixer{Logger: d.logger, Prefix: conn.RemoteAddr().String() + " | "}
-	defer fileutil.CloseIgnoringErrors(conn)
+	defer xio.CloseIgnoringErrors(conn)
 	if d.gatekeeper.IsAddressBlocked(conn.RemoteAddr()) {
 		return
 	}

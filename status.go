@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/richardwilkes/strutil"
+	"github.com/richardwilkes/toolbox/txt"
 )
 
 // Possible states.
@@ -51,7 +51,7 @@ func (s Status) String() string {
 	case Seeding:
 		return fmt.Sprintf("Seeding: Up %.2f Mbps - %s remaining - Peers %dC/%dL/%dP",
 			float64(s.UploadBytesPerSecond)/toMegaBitsPerSecond,
-			strutil.FormatDuration(time.Until(s.SeedingStopsAt), false),
+			txt.FormatDuration(time.Until(s.SeedingStopsAt), false),
 			s.PeersConnected,
 			s.Leechers,
 			s.Seeders)

@@ -13,9 +13,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/richardwilkes/errs"
-	"github.com/richardwilkes/fileutil"
-	"github.com/richardwilkes/strutil"
+	"github.com/richardwilkes/toolbox/errs"
+	"github.com/richardwilkes/toolbox/txt"
+	"github.com/richardwilkes/toolbox/xio/fs"
 	"github.com/zeebo/bencode"
 )
 
@@ -86,7 +86,7 @@ func NewFileFromBytes(data []byte) (*File, error) {
 		return nil, errs.Wrap(err)
 	}
 	f.InfoHash = sha1.Sum(data)
-	f.Path = fileutil.SanitizeName(f.Info.Name)
+	f.Path = fs.SanitizeName(f.Info.Name)
 	return &f, nil
 }
 
@@ -151,7 +151,7 @@ func (f *File) EmbeddedFiles() []os.FileInfo {
 		}
 	}
 	sort.Slice(files, func(i, j int) bool {
-		return strutil.NaturalLess(files[i].Name(), files[j].Name(), true)
+		return txt.NaturalLess(files[i].Name(), files[j].Name(), true)
 	})
 	return files
 }
@@ -259,7 +259,7 @@ func sortDirs(dir *vfs) {
 			iDir := dir.children[i].IsDir()
 			jDir := dir.children[j].IsDir()
 			if iDir == jDir {
-				return strutil.NaturalLess(dir.children[i].name, dir.children[j].name, true)
+				return txt.NaturalLess(dir.children[i].name, dir.children[j].name, true)
 			}
 			return iDir
 		})

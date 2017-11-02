@@ -1,7 +1,7 @@
 package bits
 
 import (
-	"github.com/richardwilkes/xmath"
+	"github.com/richardwilkes/toolbox/xmath"
 )
 
 // Bits holds a fixed-size collection of bits.

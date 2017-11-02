@@ -1,8 +1,8 @@
 package dispatcher
 
 import (
-	"github.com/richardwilkes/errs"
-	"github.com/richardwilkes/logadapter"
+	"github.com/richardwilkes/toolbox/errs"
+	"github.com/richardwilkes/toolbox/log/logadapter"
 )
 
 // GlobalDownloadCap sets the maximum download speed of the dispatcher.

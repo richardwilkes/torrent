@@ -15,10 +15,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/richardwilkes/errs"
-	"github.com/richardwilkes/fileutil"
-	"github.com/richardwilkes/logadapter"
-	"github.com/richardwilkes/rate"
+	"github.com/richardwilkes/toolbox/errs"
+	"github.com/richardwilkes/toolbox/log/logadapter"
+	"github.com/richardwilkes/toolbox/rate"
+	"github.com/richardwilkes/toolbox/xio"
 	"github.com/richardwilkes/torrent/dispatcher"
 	"github.com/richardwilkes/torrent/tfs"
 	"github.com/richardwilkes/torrent/tio"
@@ -279,7 +279,7 @@ func (c *Client) HandleConnection(conn net.Conn, log logadapter.Logger, extensio
 	c.lock.Unlock()
 	c.peerWaitGroup.Add(1)
 	defer func() {
-		fileutil.CloseIgnoringErrors(conn)
+		xio.CloseIgnoringErrors(conn)
 		c.lock.Lock()
 		delete(c.peers, conn)
 		c.lock.Unlock()
@@ -305,7 +305,7 @@ func (c *Client) connectToPeer(addr string, port int) {
 		c.dispatcher.GateKeeper().BlockAddressString(addr)
 		return
 	}
-	defer fileutil.CloseIgnoringErrors(conn)
+	defer xio.CloseIgnoringErrors(conn)
 	log := &logadapter.Prefixer{Logger: c.dispatcher.Logger(), Prefix: conn.RemoteAddr().String() + " | "}
 	var myExtensions dispatcher.ProtocolExtensions
 	if err = dispatcher.SendTorrentHandshake(conn, myExtensions, c.torrentFile.InfoHash, c.id); err != nil {
@@ -358,7 +358,7 @@ func (c *Client) finish(err error) {
 
 func (c *Client) closeAllPeers() {
 	for _, p := range c.currentPeers() {
-		fileutil.CloseIgnoringErrors(p.conn)
+		xio.CloseIgnoringErrors(p.conn)
 	}
 }
 
@@ -396,7 +396,7 @@ func (c *Client) adjustPeers() {
 		if data.state.downloading {
 			if data.state.peerChoking || now.Sub(data.state.lastReceived) > maxWaitForChunkDownload {
 				c.dispatcher.GateKeeper().BlockAddress(data.peer.conn.RemoteAddr())
-				fileutil.CloseIgnoringErrors(data.peer.conn)
+				xio.CloseIgnoringErrors(data.peer.conn)
 				continue
 			}
 			if !data.state.peerChoking && now.Sub(data.state.lastReceived) <= maxWaitForChunkDownload {
@@ -433,7 +433,7 @@ func (c *Client) adjustPeers() {
 				}
 				return pd[i].peer.created.After(pd[j].peer.created)
 			})
-			fileutil.CloseIgnoringErrors(pd[0].peer.conn)
+			xio.CloseIgnoringErrors(pd[0].peer.conn)
 			pd = pd[1:]
 			count = 1
 		}
@@ -511,7 +511,7 @@ func (c *Client) dropPeerIfPossible() bool {
 			return pd[i].peer.created.After(pd[j].peer.created)
 		})
 	}
-	fileutil.CloseIgnoringErrors(pd[0].peer.conn)
+	xio.CloseIgnoringErrors(pd[0].peer.conn)
 	return true
 }
 

@@ -7,9 +7,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/richardwilkes/errs"
-	"github.com/richardwilkes/fileutil"
-	"github.com/richardwilkes/logadapter"
+	"github.com/richardwilkes/toolbox/errs"
+	"github.com/richardwilkes/toolbox/log/logadapter"
+	"github.com/richardwilkes/toolbox/xio"
 	"github.com/richardwilkes/torrent/container/bits"
 	"github.com/richardwilkes/torrent/container/spanlist"
 	"github.com/richardwilkes/torrent/tio"
@@ -449,7 +449,7 @@ func (p *peer) processPieceRequests(in chan *pieceRequest) {
 			binary.BigEndian.PutUint32(buffer[9:13], uint32(req.begin))
 			if _, err := p.client.file.ReadAt(buffer[13:], p.client.torrentFile.OffsetOf(req.index)+int64(req.begin)); err != nil {
 				p.logger.Error(errs.NewfWithCause(err, "Unable to read piece %d (begin=%d, length=%d)", req.index, req.begin, req.length))
-				fileutil.CloseIgnoringErrors(p.conn)
+				xio.CloseIgnoringErrors(p.conn)
 				process = false
 				continue
 			}
@@ -482,7 +482,7 @@ func (p *peer) processWriteQueue() {
 				p.logger.Warn(err)
 			}
 			close(done)
-			fileutil.CloseIgnoringErrors(p.conn)
+			xio.CloseIgnoringErrors(p.conn)
 			// Drain any remaining entries in the queue, terminating after a
 			// significant delay to allow all writers time to stop posting to
 			// the queue.

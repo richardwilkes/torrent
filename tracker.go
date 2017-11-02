@@ -13,9 +13,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/richardwilkes/errs"
-	"github.com/richardwilkes/fileutil"
-	"github.com/richardwilkes/natpmp"
+	"github.com/richardwilkes/toolbox/errs"
+	"github.com/richardwilkes/toolbox/xio"
+	"github.com/richardwilkes/toolbox/xio/network/natpmp"
 	"github.com/richardwilkes/torrent/container/bits"
 	"github.com/richardwilkes/torrent/tio"
 	"github.com/zeebo/bencode"
@@ -335,7 +335,7 @@ func (t *tracker) get(url string) (*trackerWire, error) {
 		if _, closeErr := io.Copy(ioutil.Discard, resp.Body); closeErr != nil {
 			t.client.logger.Warn(errs.Wrap(closeErr))
 		}
-		fileutil.CloseIgnoringErrors(resp.Body)
+		xio.CloseIgnoringErrors(resp.Body)
 	}()
 	if resp.StatusCode != http.StatusOK {
 		return nil, errs.New("Unexpected status: " + resp.Status)

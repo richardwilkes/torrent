@@ -6,7 +6,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/richardwilkes/errs"
+	"github.com/richardwilkes/toolbox/errs"
 )
 
 type vfs struct {
