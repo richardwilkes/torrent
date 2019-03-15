@@ -48,7 +48,7 @@ func UseNATPMP(d *Dispatcher) error {
 // Default is to let the system choose a random port.
 func PortRange(from, to uint32) func(*Dispatcher) error {
 	return func(d *Dispatcher) error {
-		if from < 1 || from > 65536 || to < 1 || to > 65536 {
+		if from < 1 || from > 65535 || to < 1 || to > 65535 {
 			return errs.New("Ports must be in the range 1 to 65535")
 		}
 		if from > to {
