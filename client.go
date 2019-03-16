@@ -32,7 +32,7 @@ const (
 var errStopRequested = errors.New("Stop requested")
 
 // Client provides the ability to download and/or seed a torrent.
-type Client struct {
+type Client struct { //nolint:maligned
 	InRate                   rate.Limiter
 	OutRate                  rate.Limiter
 	dispatcher               *dispatcher.Dispatcher
@@ -80,7 +80,7 @@ func NewClient(d *dispatcher.Dispatcher, torrentFile *tfs.File, options ...func(
 		stoppedChan:         make(chan bool, 1),
 	}
 	copy(c.id[:], version)
-	rand.Read(c.id[len(version):])
+	rand.Read(c.id[len(version):]) //nolint:errcheck
 	for i := len(version); i < len(c.id); i++ {
 		c.id[i] = urlQuerySafeBytes[int(c.id[i])%len(urlQuerySafeBytes)]
 	}
@@ -92,6 +92,11 @@ func NewClient(d *dispatcher.Dispatcher, torrentFile *tfs.File, options ...func(
 	c.tracker = newTracker(c)
 	go c.run()
 	return c, nil
+}
+
+// ExternalIP returns our external IP address.
+func (c *Client) ExternalIP() string {
+	return c.dispatcher.ExternalIP()
 }
 
 // Logger returns the client's logger.

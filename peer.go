@@ -441,20 +441,21 @@ func (p *peer) pieceRequestQueue() {
 func (p *peer) processPieceRequests(in chan *pieceRequest) {
 	process := true
 	for req := range in {
-		if process {
-			buffer := make([]byte, 13+req.length)
-			binary.BigEndian.PutUint32(buffer[:4], uint32(9+req.length))
-			buffer[4] = pieceID
-			binary.BigEndian.PutUint32(buffer[5:9], uint32(req.index))
-			binary.BigEndian.PutUint32(buffer[9:13], uint32(req.begin))
-			if _, err := p.client.file.ReadAt(buffer[13:], p.client.torrentFile.OffsetOf(req.index)+int64(req.begin)); err != nil {
-				p.logger.Error(errs.NewfWithCause(err, "Unable to read piece %d (begin=%d, length=%d)", req.index, req.begin, req.length))
-				xio.CloseIgnoringErrors(p.conn)
-				process = false
-				continue
-			}
-			p.writeQueue <- buffer
+		if !process {
+			continue
 		}
+		buffer := make([]byte, 13+req.length)
+		binary.BigEndian.PutUint32(buffer[:4], uint32(9+req.length))
+		buffer[4] = pieceID
+		binary.BigEndian.PutUint32(buffer[5:9], uint32(req.index))
+		binary.BigEndian.PutUint32(buffer[9:13], uint32(req.begin))
+		if _, err := p.client.file.ReadAt(buffer[13:], p.client.torrentFile.OffsetOf(req.index)+int64(req.begin)); err != nil {
+			p.logger.Error(errs.NewfWithCause(err, "Unable to read piece %d (begin=%d, length=%d)", req.index, req.begin, req.length))
+			xio.CloseIgnoringErrors(p.conn)
+			process = false
+			continue
+		}
+		p.writeQueue <- buffer
 	}
 }
 

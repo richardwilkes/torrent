@@ -15,7 +15,6 @@ import (
 
 	"github.com/richardwilkes/toolbox/errs"
 	"github.com/richardwilkes/toolbox/xio"
-	"github.com/richardwilkes/toolbox/xio/network/natpmp"
 	"github.com/richardwilkes/torrent/container/bits"
 	"github.com/richardwilkes/torrent/tio"
 	"github.com/zeebo/bencode"
@@ -233,11 +232,7 @@ func (t *tracker) announce(event string) error {
 	if in.Interval < 1 {
 		return errs.New("Invalid interval")
 	}
-	external, err := natpmp.ExternalAddress()
-	if err != nil {
-		return err
-	}
-	externalAddr := external.String()
+	externalAddr := t.client.ExternalIP()
 	peerAddresses := make(map[string]int)
 	switch value := in.PeerAddresses.(type) {
 	case string:
@@ -317,8 +312,8 @@ func (t *tracker) announceURL(event string) string {
 	return buffer.String()
 }
 
-func (t *tracker) get(url string) (*trackerWire, error) {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+func (t *tracker) get(urlStr string) (*trackerWire, error) {
+	req, err := http.NewRequest(http.MethodGet, urlStr, nil)
 	if err != nil {
 		return nil, errs.Wrap(err)
 	}

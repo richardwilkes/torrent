@@ -13,6 +13,7 @@ import (
 	"github.com/richardwilkes/toolbox/log/logadapter"
 	"github.com/richardwilkes/toolbox/rate"
 	"github.com/richardwilkes/toolbox/xio"
+	"github.com/richardwilkes/toolbox/xio/network"
 	"github.com/richardwilkes/toolbox/xio/network/natpmp"
 	"github.com/richardwilkes/torrent/tfs"
 	"github.com/richardwilkes/torrent/tio"
@@ -25,15 +26,18 @@ type ConnectionHandler interface {
 
 // Dispatcher holds a dispatcher for bit torrent connections.
 type Dispatcher struct {
-	InRate       rate.Limiter
-	OutRate      rate.Limiter
-	listener     net.Listener
-	logger       logadapter.Logger
-	natpmpChan   chan interface{}
-	handlers     sync.Map
-	gatekeeper   *GateKeeper
-	internalPort uint32
-	externalPort uint32
+	InRate              rate.Limiter
+	OutRate             rate.Limiter
+	listener            net.Listener
+	logger              logadapter.Logger
+	natpmpChan          chan interface{}
+	handlers            sync.Map
+	gatekeeper          *GateKeeper
+	internalPort        uint32
+	externalPort        uint32
+	lock                sync.Mutex
+	externalIP          string
+	lastExternalIPCheck time.Time
 }
 
 // NewDispatcher creates a new dispatcher and starts listening for
@@ -52,7 +56,7 @@ func NewDispatcher(options ...func(*Dispatcher) error) (*Dispatcher, error) {
 		}
 	}
 	if d.internalPort == 0 {
-		if d.listener, err = net.Listen("tcp", ":0"); err != nil {
+		if d.listener, err = net.Listen("tcp", ":0"); err != nil { //nolint:gosec
 			return nil, errs.Wrap(err)
 		}
 		_, portStr, lerr := net.SplitHostPort(d.listener.Addr().String())
@@ -140,22 +144,38 @@ func (d *Dispatcher) Deregister(infoHash tfs.InfoHash) {
 	d.handlers.Delete(infoHash)
 }
 
-func (d *Dispatcher) listen() {
-	externalPort := d.ExternalPort()
-	var ipStr string
-	if ip, err := natpmp.ExternalAddress(); err != nil {
-		ipStr = "<unknown>"
-	} else {
-		ipStr = ip.String()
+// ExternalIP returns our external IP address.
+func (d *Dispatcher) ExternalIP() string {
+	const unknownIP = "<unknown>"
+	d.lock.Lock()
+	defer d.lock.Unlock()
+	if time.Since(d.lastExternalIPCheck) < time.Hour && d.externalIP != "" && d.externalIP != unknownIP {
+		return d.externalIP
 	}
-	d.logger.Infof("Listening on port %d (external: %s:%d)", d.internalPort, ipStr, externalPort)
+	d.externalIP = ""
+	if d.natpmpChan != nil {
+		if ip, err := natpmp.ExternalAddress(); err == nil {
+			d.externalIP = ip.String()
+		}
+	} else {
+		d.externalIP = network.ExternalIP(5 * time.Second)
+	}
+	if d.externalIP == "" {
+		d.externalIP = unknownIP
+	}
+	d.lastExternalIPCheck = time.Now()
+	return d.externalIP
+}
+
+func (d *Dispatcher) listen() {
+	d.logger.Infof("Listening on port %d (external: %s:%d)", d.InternalPort(), d.ExternalIP(), d.ExternalPort())
 	for {
 		conn, err := d.listener.Accept()
 		if err != nil {
 			if d.natpmpChan != nil {
 				d.natpmpChan <- nil
 			}
-			d.logger.Infof("Stopped listening on port %d", d.internalPort)
+			d.logger.Infof("Stopped listening on port %d", d.InternalPort())
 			return
 		}
 		go d.dispatch(conn)

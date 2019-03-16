@@ -2,7 +2,7 @@ package dispatcher
 
 import (
 	"bytes"
-	"crypto/sha1"
+	"crypto/sha1" //nolint:gosec
 	"io"
 	"net"
 	"time"

@@ -2,7 +2,7 @@ package tfs
 
 import (
 	"bytes"
-	"crypto/sha1"
+	"crypto/sha1" //nolint:gosec
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -85,7 +85,7 @@ func NewFileFromBytes(data []byte) (*File, error) {
 	if err != nil {
 		return nil, errs.Wrap(err)
 	}
-	f.InfoHash = sha1.Sum(data)
+	f.InfoHash = sha1.Sum(data) //nolint:gosec
 	f.Path = fs.SanitizeName(f.Info.Name)
 	return &f, nil
 }
@@ -136,7 +136,7 @@ func (f *File) StoragePath() string {
 // Validate checks the supplied buffer to determine if it contains the data
 // for the piece at the specified index.
 func (f *File) Validate(index int, buffer []byte) bool {
-	s := sha1.Sum(buffer)
+	s := sha1.Sum(buffer) //nolint:gosec
 	return bytes.Equal(s[:], f.Info.Pieces[index*sha1.Size:(index+1)*sha1.Size])
 }
 

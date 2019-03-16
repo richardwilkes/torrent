@@ -35,7 +35,7 @@ type Status struct {
 	SeedingStopsAt         time.Time
 }
 
-func (s Status) String() string {
+func (s *Status) String() string {
 	switch s.State {
 	case Initializing:
 		return fmt.Sprintf("Initializing: %0.1f%%", s.PercentComplete)
