@@ -29,7 +29,7 @@ const (
 	urlQuerySafeBytes = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_.~"
 )
 
-var errStopRequested = errors.New("Stop requested")
+var errStopRequested = errors.New("stop requested")
 
 // Client provides the ability to download and/or seed a torrent.
 type Client struct { //nolint:maligned

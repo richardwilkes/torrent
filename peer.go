@@ -358,7 +358,7 @@ func (p *peer) receivedChunk(index, begin int, buffer []byte) error {
 			p.lock.Unlock()
 			if err != nil && (err != io.EOF || n != len(one.buffer)) {
 				p.client.tracker.clearDownload(index)
-				p.logger.Error(errs.NewfWithCause(err, "Unable to write piece %d", index))
+				p.logger.Error(errs.NewWithCausef(err, "Unable to write piece %d", index))
 			} else {
 				p.client.tracker.markBlockValid(index)
 				p.client.tracker.setProgress(-1)
@@ -450,7 +450,7 @@ func (p *peer) processPieceRequests(in chan *pieceRequest) {
 		binary.BigEndian.PutUint32(buffer[5:9], uint32(req.index))
 		binary.BigEndian.PutUint32(buffer[9:13], uint32(req.begin))
 		if _, err := p.client.file.ReadAt(buffer[13:], p.client.torrentFile.OffsetOf(req.index)+int64(req.begin)); err != nil {
-			p.logger.Error(errs.NewfWithCause(err, "Unable to read piece %d (begin=%d, length=%d)", req.index, req.begin, req.length))
+			p.logger.Error(errs.NewWithCausef(err, "Unable to read piece %d (begin=%d, length=%d)", req.index, req.begin, req.length))
 			xio.CloseIgnoringErrors(p.conn)
 			process = false
 			continue
