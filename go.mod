@@ -1,6 +1,6 @@
 module github.com/richardwilkes/torrent
 
-go 1.13
+go 1.14
 
 require (
 	github.com/richardwilkes/toolbox v1.24.2
