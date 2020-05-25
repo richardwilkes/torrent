@@ -2,7 +2,7 @@ package dispatcher
 
 import (
 	"bytes"
-	"crypto/sha1" //nolint:gosec
+	"crypto/sha1" //nolint:gosec // The spec requires sha1
 	"io"
 	"net"
 	"time"

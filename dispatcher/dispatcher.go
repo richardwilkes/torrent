@@ -56,7 +56,7 @@ func NewDispatcher(options ...func(*Dispatcher) error) (*Dispatcher, error) {
 		}
 	}
 	if d.internalPort == 0 {
-		if d.listener, err = net.Listen("tcp", ":0"); err != nil { //nolint:gosec
+		if d.listener, err = net.Listen("tcp", ":0"); err != nil { //nolint:gosec // We intentionally want all network interfaces
 			return nil, errs.Wrap(err)
 		}
 		_, portStr, lerr := net.SplitHostPort(d.listener.Addr().String())

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	mrand "math/rand"
 	"net"
 	"os"
 	"path/filepath"
@@ -32,7 +33,7 @@ const (
 var errStopRequested = errors.New("stop requested")
 
 // Client provides the ability to download and/or seed a torrent.
-type Client struct { //nolint:maligned
+type Client struct {
 	InRate                   rate.Limiter
 	OutRate                  rate.Limiter
 	dispatcher               *dispatcher.Dispatcher
@@ -41,6 +42,7 @@ type Client struct { //nolint:maligned
 	stoppedNotifier          chan *Client
 	logger                   *logadapter.Prefixer
 	id                       dispatcher.PeerID
+	_                        int32 // for 8-byte alignment, since id is 20 bytes
 	tracker                  *tracker
 	concurrentDownloads      int
 	peersWanted              int
@@ -80,7 +82,9 @@ func NewClient(d *dispatcher.Dispatcher, torrentFile *tfs.File, options ...func(
 		stoppedChan:         make(chan bool, 1),
 	}
 	copy(c.id[:], version)
-	rand.Read(c.id[len(version):]) //nolint:errcheck
+	if _, err := rand.Read(c.id[len(version):]); err != nil {
+		mrand.Read(c.id[len(version):]) //nolint:gosec // This is only a fallback should crypto/rand fail
+	}
 	for i := len(version); i < len(c.id); i++ {
 		c.id[i] = urlQuerySafeBytes[int(c.id[i])%len(urlQuerySafeBytes)]
 	}
