@@ -186,7 +186,7 @@ func (c *Client) run() {
 }
 
 func (c *Client) prepareFile() error {
-	f, err := os.OpenFile(c.torrentFile.StoragePath(), os.O_CREATE|os.O_RDWR, 0644)
+	f, err := os.OpenFile(c.torrentFile.StoragePath(), os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return errs.Wrap(err)
 	}
@@ -222,7 +222,7 @@ func (c *Client) prepareFile() error {
 				break
 			}
 			var n int
-			if n, err = f.ReadAt(buffer, pos); err != nil && err != io.EOF {
+			if n, err = f.ReadAt(buffer, pos); err != nil && !errors.Is(err, io.EOF) {
 				return errs.Wrap(err)
 			}
 			if n != c.torrentFile.Info.PieceLength {
@@ -338,13 +338,13 @@ func (c *Client) connectToPeer(addr string, port int) {
 func (c *Client) finish(err error) {
 	c.tracker.setState(Stopping)
 	var state State
-	if err != nil && err != errStopRequested {
+	if err != nil && !errors.Is(err, errStopRequested) {
 		state = Errored
 	} else {
 		state = Done
 	}
 	if err != nil {
-		if err == errStopRequested {
+		if errors.Is(err, errStopRequested) {
 			c.logger.Info(err)
 		} else if tio.ShouldLogIOError(err) {
 			c.logger.Warn(err)

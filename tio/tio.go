@@ -1,6 +1,7 @@
 package tio
 
 import (
+	"errors"
 	"io"
 	"net"
 	"strings"
@@ -45,13 +46,15 @@ var (
 
 // ShouldLogIOError returns true if the error should be logged.
 func ShouldLogIOError(err error) bool {
-	if err == nil || err == io.EOF || err == io.ErrUnexpectedEOF {
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return false
 	}
-	if c, ok := err.(errs.Causer); ok {
-		return ShouldLogIOError(c.Cause())
+	var cause errs.Causer
+	if errors.As(err, &cause) {
+		return ShouldLogIOError(cause.Cause())
 	}
-	if e, ok := err.(*errs.Error); ok {
+	var e *errs.Error
+	if errors.As(err, &e) {
 		msg := e.Message()
 		if msg == eofMsg1 || msg == eofMsg2 {
 			return false

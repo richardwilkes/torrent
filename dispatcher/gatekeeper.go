@@ -54,7 +54,7 @@ func (r *GateKeeper) prune() {
 	for {
 		select {
 		case <-time.After(blockDuration):
-			r.addresses.Range(func(addr interface{}, expires interface{}) bool {
+			r.addresses.Range(func(addr, expires any) bool {
 				if expires.(time.Time).Before(time.Now()) {
 					r.addresses.Delete(addr)
 				}

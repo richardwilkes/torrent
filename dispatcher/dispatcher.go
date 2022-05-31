@@ -30,7 +30,7 @@ type Dispatcher struct {
 	OutRate             rate.Limiter
 	listener            net.Listener
 	logger              logadapter.Logger
-	natpmpChan          chan interface{}
+	natpmpChan          chan any
 	handlers            sync.Map
 	gatekeeper          *GateKeeper
 	internalPort        uint32

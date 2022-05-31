@@ -77,7 +77,7 @@ func NewFileFromBytes(data []byte) (*File, error) {
 	if err := bencode.DecodeBytes(data, &f); err != nil {
 		return nil, errs.Wrap(err)
 	}
-	var m map[string]interface{}
+	var m map[string]any
 	if err := bencode.DecodeBytes(data, &m); err != nil {
 		return nil, errs.Wrap(err)
 	}
@@ -98,8 +98,7 @@ func (f *File) OffsetOf(index int) int64 {
 
 // LengthOf returns the length of the piece at the specified index.
 func (f *File) LengthOf(index int) int {
-	last := f.PieceCount() - 1
-	if index >= last {
+	if last := f.PieceCount() - 1; index >= last {
 		return int(f.Size() - int64(last)*int64(f.Info.PieceLength))
 	}
 	return f.Info.PieceLength
@@ -183,7 +182,7 @@ func (f *File) buildFS() {
 		f.root = &vfs{
 			storage: storage,
 			name:    "/",
-			mode:    os.ModeDir | 0775,
+			mode:    os.ModeDir | 0o775,
 			modTime: modTime,
 		}
 		f.fs[f.root.name] = f.root
@@ -192,7 +191,7 @@ func (f *File) buildFS() {
 				storage: storage,
 				name:    f.root.name + f.Info.Name,
 				length:  f.Info.Length,
-				mode:    0664,
+				mode:    0o664,
 				modTime: modTime,
 			}
 			f.root.children = []*vfs{child}
@@ -207,7 +206,7 @@ func (f *File) buildFS() {
 					name:    path,
 					offset:  offset,
 					length:  one.Length,
-					mode:    0664,
+					mode:    0o664,
 					modTime: modTime,
 				}
 				dir.children = append(dir.children, child)
@@ -241,7 +240,7 @@ func (f *File) mkdirs(path string) *vfs {
 				d := &vfs{
 					storage: dir.storage,
 					name:    cur,
-					mode:    os.ModeDir | 0775,
+					mode:    os.ModeDir | 0o775,
 					modTime: dir.modTime,
 				}
 				dir.children = append(dir.children, d)

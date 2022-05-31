@@ -55,12 +55,12 @@ type tracker struct {
 }
 
 type trackerWire struct {
-	Interval      int         `bencode:"interval"`
-	PeerAddresses interface{} `bencode:"peers"`
-	Seeders       int         `bencode:"complete"`
-	Leechers      int         `bencode:"incomplete"`
-	TrackerID     string      `bencode:"tracker id"`
-	Failure       string      `bencode:"failure reason"`
+	Interval      int    `bencode:"interval"`
+	PeerAddresses any    `bencode:"peers"`
+	Seeders       int    `bencode:"complete"`
+	Leechers      int    `bencode:"incomplete"`
+	TrackerID     string `bencode:"tracker id"`
+	Failure       string `bencode:"failure reason"`
 }
 
 func newTracker(client *Client) *tracker {
@@ -245,7 +245,7 @@ func (t *tracker) announce(event string) error {
 				}
 			}
 		}
-	case []map[string]interface{}:
+	case []map[string]any:
 		var inPeerAddresses []struct {
 			ID   string `bencode:"peer id"`
 			IP   string `bencode:"ip"`

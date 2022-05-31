@@ -2,6 +2,7 @@ package torrent
 
 import (
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -141,7 +142,7 @@ func (p *peer) updateInterest() peerState {
 
 func (p *peer) setChoked(choked bool) {
 	p.lock.Lock()
-	send := p.amChoking != choked
+	send := p.amChoking != choked //nolint:ifshort // incorrect assumption that send isn't used later
 	if send {
 		p.amChoking = choked
 	}
@@ -356,7 +357,7 @@ func (p *peer) receivedChunk(index, begin int, buffer []byte) error {
 			p.lock.Lock()
 			delete(p.pieces, index)
 			p.lock.Unlock()
-			if err != nil && (err != io.EOF || n != len(one.buffer)) {
+			if err != nil && (!errors.Is(err, io.EOF) || n != len(one.buffer)) {
 				p.client.tracker.clearDownload(index)
 				p.logger.Error(errs.NewWithCausef(err, "Unable to write piece %d", index))
 			} else {

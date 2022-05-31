@@ -39,7 +39,7 @@ func (v *vfs) IsDir() bool {
 	return (v.mode & os.ModeDir) == os.ModeDir
 }
 
-func (v *vfs) Sys() interface{} {
+func (v *vfs) Sys() any {
 	return nil
 }
 

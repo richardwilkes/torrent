@@ -40,7 +40,7 @@ func LogTo(logger logadapter.Logger) func(*Dispatcher) error {
 // UseNATPMP sets the dispatcher to use NatPMP to route traffic through the
 // external gateway.
 func UseNATPMP(d *Dispatcher) error {
-	d.natpmpChan = make(chan interface{}, 1)
+	d.natpmpChan = make(chan any, 1)
 	return nil
 }
 
