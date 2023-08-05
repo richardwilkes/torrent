@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"crypto/sha1" //nolint:gosec // The spec requires sha1
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -64,7 +63,7 @@ func NewFileFromPath(path string) (*File, error) {
 
 // NewFileFromReader creates a torrent file structure from the raw torrent file data.
 func NewFileFromReader(r io.Reader) (*File, error) {
-	data, err := ioutil.ReadAll(r)
+	data, err := io.ReadAll(r)
 	if err != nil {
 		return nil, errs.Wrap(err)
 	}

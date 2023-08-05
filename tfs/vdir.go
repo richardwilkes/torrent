@@ -16,15 +16,15 @@ func (v *vdir) Stat() (os.FileInfo, error) {
 	return v.owner, nil
 }
 
-func (v *vdir) Seek(offset int64, whence int) (int64, error) {
+func (v *vdir) Seek(_ int64, _ int) (int64, error) {
 	return 0, os.ErrInvalid
 }
 
-func (v *vdir) Read(p []byte) (n int, err error) {
+func (v *vdir) Read(_ []byte) (int, error) {
 	return 0, os.ErrInvalid
 }
 
-func (v *vdir) ReadAt(p []byte, offset int64) (n int, err error) {
+func (v *vdir) ReadAt(_ []byte, _ int64) (int, error) {
 	return 0, os.ErrInvalid
 }
 

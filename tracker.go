@@ -2,10 +2,10 @@ package torrent
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/url"
@@ -251,8 +251,8 @@ func (t *tracker) announce(event string) error {
 			IP   string `bencode:"ip"`
 			Port int    `bencode:"port"`
 		}
-		data, err := bencode.EncodeBytes(in.PeerAddresses)
-		if err != nil {
+		var data []byte
+		if data, err = bencode.EncodeBytes(in.PeerAddresses); err != nil {
 			return errs.Wrap(err)
 		}
 		if err = bencode.DecodeBytes(data, &inPeerAddresses); err != nil {
@@ -313,7 +313,9 @@ func (t *tracker) announceURL(event string) string {
 }
 
 func (t *tracker) get(urlStr string) (*trackerWire, error) {
-	req, err := http.NewRequest(http.MethodGet, urlStr, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
 	if err != nil {
 		return nil, errs.Wrap(err)
 	}
@@ -328,7 +330,7 @@ func (t *tracker) get(urlStr string) (*trackerWire, error) {
 	defer func() {
 		// Read any lingering bytes that the decoder might have left behind since
 		// failure to do so may prevent connection reuse.
-		if _, closeErr := io.Copy(ioutil.Discard, resp.Body); closeErr != nil {
+		if _, closeErr := io.Copy(io.Discard, resp.Body); closeErr != nil {
 			t.client.logger.Warn(errs.Wrap(closeErr))
 		}
 		xio.CloseIgnoringErrors(resp.Body)

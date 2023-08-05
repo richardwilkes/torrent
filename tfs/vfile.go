@@ -22,21 +22,21 @@ func (v *vfile) Seek(offset int64, whence int) (int64, error) {
 	return v.sr.Seek(offset, whence)
 }
 
-func (v *vfile) Read(p []byte) (n int, err error) {
+func (v *vfile) Read(p []byte) (int, error) {
 	if v.file == nil {
 		return 0, os.ErrClosed
 	}
 	return v.sr.Read(p)
 }
 
-func (v *vfile) ReadAt(p []byte, offset int64) (n int, err error) {
+func (v *vfile) ReadAt(p []byte, offset int64) (int, error) {
 	if v.file == nil {
 		return 0, os.ErrClosed
 	}
 	return v.sr.ReadAt(p, offset)
 }
 
-func (v *vfile) Readdir(count int) ([]os.FileInfo, error) {
+func (v *vfile) Readdir(_ int) ([]os.FileInfo, error) {
 	return nil, os.ErrInvalid
 }
 

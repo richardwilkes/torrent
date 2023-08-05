@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	mrand "math/rand"
 	"net"
 	"os"
 	"path/filepath"
@@ -47,7 +46,8 @@ type Client struct {
 	concurrentDownloads      int
 	peersWanted              int
 	peerWaitGroup            *sync.WaitGroup
-	peerMgmtStop             chan bool
+	peerMgmtLock             sync.Mutex
+	peerMgmtStop             chan chan bool
 	file                     *os.File
 	seedDuration             time.Duration
 	lock                     sync.RWMutex
@@ -76,14 +76,14 @@ func NewClient(d *dispatcher.Dispatcher, torrentFile *tfs.File, options ...func(
 		concurrentDownloads: 4,
 		peersWanted:         32,
 		peerWaitGroup:       &sync.WaitGroup{},
-		peerMgmtStop:        make(chan bool),
+		peerMgmtStop:        make(chan chan bool),
 		seedDuration:        96 * time.Hour,
 		peers:               make(map[net.Conn]*peer),
 		stoppedChan:         make(chan bool, 1),
 	}
 	copy(c.id[:], version)
 	if _, err := rand.Read(c.id[len(version):]); err != nil {
-		mrand.Read(c.id[len(version):]) //nolint:gosec // This is only a fallback should crypto/rand fail
+		return nil, errs.Wrap(err)
 	}
 	for i := len(version); i < len(c.id); i++ {
 		c.id[i] = urlQuerySafeBytes[int(c.id[i])%len(urlQuerySafeBytes)]
@@ -247,7 +247,7 @@ func (c *Client) prepareFile() error {
 }
 
 // HandleConnection is called by the dispatcher for new connections.
-func (c *Client) HandleConnection(conn net.Conn, log logadapter.Logger, extensions dispatcher.ProtocolExtensions, infoHash tfs.InfoHash, sendHandshake bool) {
+func (c *Client) HandleConnection(conn net.Conn, log logadapter.Logger, _ dispatcher.ProtocolExtensions, infoHash tfs.InfoHash, sendHandshake bool) {
 	log = &logadapter.Prefixer{Logger: log, Prefix: c.logger.Prefix}
 	if !bytes.Equal(infoHash[:], c.torrentFile.InfoHash[:]) {
 		c.dispatcher.GateKeeper().BlockAddress(conn.RemoteAddr())
@@ -306,8 +306,8 @@ func (c *Client) connectToPeer(addr string, port int) {
 		c.dispatcher.GateKeeper().BlockAddressString(addr)
 		return
 	}
-	conn, err := net.DialTCP("tcp", nil, raddr)
-	if err != nil {
+	var conn *net.TCPConn
+	if conn, err = net.DialTCP("tcp", nil, raddr); err != nil {
 		if tio.ShouldLogIOError(err) {
 			c.logger.Warn(errs.Wrap(err))
 		}
@@ -324,8 +324,9 @@ func (c *Client) connectToPeer(addr string, port int) {
 		c.dispatcher.GateKeeper().BlockAddressString(addr)
 		return
 	}
-	extensions, infoHash, err := dispatcher.ReceiveTorrentHandshake(conn)
-	if err != nil {
+	var extensions dispatcher.ProtocolExtensions
+	var infoHash tfs.InfoHash
+	if extensions, infoHash, err = dispatcher.ReceiveTorrentHandshake(conn); err != nil {
 		if tio.ShouldLogIOError(err) {
 			log.Warn(err)
 		}
@@ -350,14 +351,13 @@ func (c *Client) finish(err error) {
 			c.logger.Warn(err)
 		}
 	}
-	close(c.peerMgmtStop)
 	c.closeAllPeers()
 	c.peerWaitGroup.Wait()
 	if err = c.tracker.announceStopped(); err != nil {
 		c.logger.Warn(err)
 	}
 	if c.file != nil {
-		if err := c.file.Close(); err != nil {
+		if err = c.file.Close(); err != nil {
 			c.logger.Warn(errs.Wrap(err))
 		}
 		c.file = nil
@@ -366,6 +366,14 @@ func (c *Client) finish(err error) {
 }
 
 func (c *Client) closeAllPeers() {
+	c.peerMgmtLock.Lock()
+	if c.peerMgmtStop != nil {
+		ch := make(chan bool)
+		c.peerMgmtStop <- ch
+		<-ch
+		c.peerMgmtStop = nil
+	}
+	c.peerMgmtLock.Unlock()
 	for _, p := range c.currentPeers() {
 		xio.CloseIgnoringErrors(p.conn)
 	}
@@ -381,7 +389,8 @@ func (c *Client) managePeers() {
 			}
 		case <-time.After(10 * time.Second):
 			c.adjustPeers()
-		case <-c.peerMgmtStop:
+		case ch := <-c.peerMgmtStop:
+			ch <- true
 			return
 		}
 	}
