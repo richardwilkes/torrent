@@ -298,16 +298,8 @@ func (c *Client) HandleConnection(conn net.Conn, log logadapter.Logger, _ dispat
 }
 
 func (c *Client) connectToPeer(addr string, port int) {
-	raddr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf("%s:%d", addr, port))
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", addr, port), 5*time.Second)
 	if err != nil {
-		if tio.ShouldLogIOError(err) {
-			c.logger.Warn(errs.Wrap(err))
-		}
-		c.dispatcher.GateKeeper().BlockAddressString(addr)
-		return
-	}
-	var conn *net.TCPConn
-	if conn, err = net.DialTCP("tcp", nil, raddr); err != nil {
 		if tio.ShouldLogIOError(err) {
 			c.logger.Warn(errs.Wrap(err))
 		}
