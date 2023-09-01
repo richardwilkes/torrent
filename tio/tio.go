@@ -33,8 +33,6 @@ func WriteWithDeadline(conn net.Conn, buffer []byte, deadline time.Duration) err
 }
 
 var (
-	eofMsg1    = io.EOF.Error()
-	eofMsg2    = io.ErrUnexpectedEOF.Error()
 	ignoreMsgs = []string{
 		"use of closed network connection",
 		"operation timed out",
@@ -48,18 +46,6 @@ var (
 func ShouldLogIOError(err error) bool {
 	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return false
-	}
-	var e *errs.Error
-	if errors.As(err, &e) {
-		msg := e.Message()
-		if msg == eofMsg1 || msg == eofMsg2 {
-			return false
-		}
-		for _, w := range e.WrappedErrors() {
-			if ShouldLogIOError(w) {
-				return false
-			}
-		}
 	}
 	msg := err.Error()
 	for _, ignore := range ignoreMsgs {
