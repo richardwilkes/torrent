@@ -32,23 +32,19 @@ func WriteWithDeadline(conn net.Conn, buffer []byte, deadline time.Duration) err
 	return errs.Wrap(err)
 }
 
-var (
-	ignoreMsgs = []string{
-		"use of closed network connection",
-		"operation timed out",
-		"connection reset by peer",
-		"i/o timeout",
-		"connection refused",
-	}
-)
-
 // ShouldLogIOError returns true if the error should be logged.
 func ShouldLogIOError(err error) bool {
 	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return false
 	}
 	msg := err.Error()
-	for _, ignore := range ignoreMsgs {
+	for _, ignore := range []string{
+		"use of closed network connection",
+		"operation timed out",
+		"connection reset by peer",
+		"i/o timeout",
+		"connection refused",
+	} {
 		if strings.Contains(msg, ignore) {
 			return false
 		}
