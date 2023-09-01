@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"crypto/sha1" //nolint:gosec // The spec requires sha1
 	"io"
-	"net/http"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -14,9 +14,11 @@ import (
 
 	"github.com/richardwilkes/toolbox/errs"
 	"github.com/richardwilkes/toolbox/txt"
-	"github.com/richardwilkes/toolbox/xio/fs"
+	xfs "github.com/richardwilkes/toolbox/xio/fs"
 	"github.com/zeebo/bencode"
 )
+
+var _ fs.FS = &File{}
 
 // DownloadExt is the extension used for the torrent download data file.
 const DownloadExt = ".tordata"
@@ -85,7 +87,7 @@ func NewFileFromBytes(data []byte) (*File, error) {
 		return nil, errs.Wrap(err)
 	}
 	f.InfoHash = sha1.Sum(data) //nolint:gosec // The spec requires sha1
-	f.Path = fs.SanitizeName(f.Info.Name)
+	f.Path = xfs.SanitizeName(f.Info.Name)
 	return &f, nil
 }
 
@@ -154,8 +156,8 @@ func (f *File) EmbeddedFiles() []os.FileInfo {
 	return files
 }
 
-// Open implements the http.FileSystem interface.
-func (f *File) Open(name string) (http.File, error) {
+// Open implements the fs.FS interface.
+func (f *File) Open(name string) (fs.File, error) {
 	if name == "" {
 		return nil, os.ErrInvalid
 	}

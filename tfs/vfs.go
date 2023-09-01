@@ -2,12 +2,14 @@ package tfs
 
 import (
 	"io"
-	"net/http"
+	"io/fs"
 	"os"
 	"time"
 
 	"github.com/richardwilkes/toolbox/errs"
 )
+
+var _ fs.File = &vfile{}
 
 type vfs struct {
 	storage  string
@@ -43,7 +45,7 @@ func (v *vfs) Sys() any {
 	return nil
 }
 
-func (v *vfs) open() (http.File, error) {
+func (v *vfs) open() (fs.File, error) {
 	if v.IsDir() {
 		return &vdir{owner: v}, nil
 	}
