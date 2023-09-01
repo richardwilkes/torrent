@@ -49,10 +49,6 @@ func ShouldLogIOError(err error) bool {
 	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return false
 	}
-	var cause errs.Causer
-	if errors.As(err, &cause) {
-		return ShouldLogIOError(cause.Cause())
-	}
 	var e *errs.Error
 	if errors.As(err, &e) {
 		msg := e.Message()

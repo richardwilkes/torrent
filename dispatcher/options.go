@@ -1,8 +1,9 @@
 package dispatcher
 
 import (
+	"log/slog"
+
 	"github.com/richardwilkes/toolbox/errs"
-	"github.com/richardwilkes/toolbox/log/logadapter"
 )
 
 // GlobalDownloadCap sets the maximum download speed of the dispatcher.
@@ -30,7 +31,7 @@ func GlobalUploadCap(bytesPerSecond int) func(*Dispatcher) error {
 }
 
 // LogTo sets the logger the dispatcher should use. Default discards logs.
-func LogTo(logger logadapter.Logger) func(*Dispatcher) error {
+func LogTo(logger *slog.Logger) func(*Dispatcher) error {
 	return func(d *Dispatcher) error {
 		d.logger = logger
 		return nil

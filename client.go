@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net"
 	"os"
@@ -16,7 +17,6 @@ import (
 	"time"
 
 	"github.com/richardwilkes/toolbox/errs"
-	"github.com/richardwilkes/toolbox/log/logadapter"
 	"github.com/richardwilkes/toolbox/rate"
 	"github.com/richardwilkes/toolbox/xio"
 	"github.com/richardwilkes/torrent/dispatcher"
@@ -39,7 +39,7 @@ type Client struct {
 	torrentFile              *tfs.File
 	downloadCompleteNotifier chan *Client
 	stoppedNotifier          chan *Client
-	logger                   *logadapter.Prefixer
+	logger                   *slog.Logger
 	id                       dispatcher.PeerID
 	_                        int32 // for 8-byte alignment, since id is 20 bytes
 	tracker                  *tracker
@@ -65,14 +65,13 @@ func NewClient(d *dispatcher.Dispatcher, torrentFile *tfs.File, options ...func(
 	if torrentFile == nil {
 		return nil, errs.New("torrentFile may not be nil")
 	}
-	_, prefix := filepath.Split(torrentFile.StoragePath())
-	prefix = prefix[:len(prefix)-len(filepath.Ext(prefix))] + " | "
+	_, storagePath := filepath.Split(torrentFile.StoragePath())
 	c := &Client{
 		InRate:              d.InRate.New(math.MaxInt32),
 		OutRate:             d.OutRate.New(math.MaxInt32),
 		dispatcher:          d,
 		torrentFile:         torrentFile,
-		logger:              &logadapter.Prefixer{Logger: d.Logger(), Prefix: prefix},
+		logger:              d.Logger().With("torrent_file", storagePath[:len(storagePath)-len(filepath.Ext(storagePath))]),
 		concurrentDownloads: 4,
 		peersWanted:         32,
 		peerWaitGroup:       &sync.WaitGroup{},
@@ -104,7 +103,7 @@ func (c *Client) ExternalIP() string {
 }
 
 // Logger returns the client's logger.
-func (c *Client) Logger() logadapter.Logger {
+func (c *Client) Logger() *slog.Logger {
 	return c.logger
 }
 
@@ -247,8 +246,9 @@ func (c *Client) prepareFile() error {
 }
 
 // HandleConnection is called by the dispatcher for new connections.
-func (c *Client) HandleConnection(conn net.Conn, log logadapter.Logger, _ dispatcher.ProtocolExtensions, infoHash tfs.InfoHash, sendHandshake bool) {
-	log = &logadapter.Prefixer{Logger: log, Prefix: c.logger.Prefix}
+func (c *Client) HandleConnection(conn net.Conn, logger *slog.Logger, _ dispatcher.ProtocolExtensions, infoHash tfs.InfoHash, sendHandshake bool) {
+	_, storagePath := filepath.Split(c.torrentFile.StoragePath())
+	logger = logger.With("torrent_file", storagePath[:len(storagePath)-len(filepath.Ext(storagePath))])
 	if !bytes.Equal(infoHash[:], c.torrentFile.InfoHash[:]) {
 		c.dispatcher.GateKeeper().BlockAddress(conn.RemoteAddr())
 		return
@@ -257,7 +257,7 @@ func (c *Client) HandleConnection(conn net.Conn, log logadapter.Logger, _ dispat
 		var myExtensions dispatcher.ProtocolExtensions
 		if err := dispatcher.SendTorrentHandshake(conn, myExtensions, c.torrentFile.InfoHash, c.id); err != nil {
 			if tio.ShouldLogIOError(err) {
-				log.Warn(err)
+				errs.LogTo(logger, err)
 			}
 			c.dispatcher.GateKeeper().BlockAddress(conn.RemoteAddr())
 			return
@@ -266,12 +266,12 @@ func (c *Client) HandleConnection(conn net.Conn, log logadapter.Logger, _ dispat
 	var peerID dispatcher.PeerID
 	if err := tio.ReadWithDeadline(conn, peerID[:], dispatcher.HandshakeDeadline); err != nil {
 		if tio.ShouldLogIOError(err) {
-			log.Warn(err)
+			errs.LogTo(logger, err)
 		}
 		c.dispatcher.GateKeeper().BlockAddress(conn.RemoteAddr())
 		return
 	}
-	p := newPeer(c, conn, log)
+	p := newPeer(c, conn, logger)
 	if c.shouldStop() {
 		return
 	}
@@ -301,17 +301,17 @@ func (c *Client) connectToPeer(addr string, port int) {
 	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", addr, port), 5*time.Second)
 	if err != nil {
 		if tio.ShouldLogIOError(err) {
-			c.logger.Warn(errs.Wrap(err))
+			errs.LogTo(c.logger, err)
 		}
 		c.dispatcher.GateKeeper().BlockAddressString(addr)
 		return
 	}
 	defer xio.CloseIgnoringErrors(conn)
-	log := &logadapter.Prefixer{Logger: c.dispatcher.Logger(), Prefix: conn.RemoteAddr().String() + " | "}
+	logger := c.dispatcher.Logger().With("remote_addr", conn.RemoteAddr().String())
 	var myExtensions dispatcher.ProtocolExtensions
 	if err = dispatcher.SendTorrentHandshake(conn, myExtensions, c.torrentFile.InfoHash, c.id); err != nil {
 		if tio.ShouldLogIOError(err) {
-			log.Warn(err)
+			errs.LogTo(logger, err)
 		}
 		c.dispatcher.GateKeeper().BlockAddressString(addr)
 		return
@@ -320,12 +320,12 @@ func (c *Client) connectToPeer(addr string, port int) {
 	var infoHash tfs.InfoHash
 	if extensions, infoHash, err = dispatcher.ReceiveTorrentHandshake(conn); err != nil {
 		if tio.ShouldLogIOError(err) {
-			log.Warn(err)
+			errs.LogTo(logger, err)
 		}
 		c.dispatcher.GateKeeper().BlockAddressString(addr)
 		return
 	}
-	c.HandleConnection(conn, log, extensions, infoHash, false)
+	c.HandleConnection(conn, logger, extensions, infoHash, false)
 }
 
 func (c *Client) finish(err error) {
@@ -338,19 +338,19 @@ func (c *Client) finish(err error) {
 	}
 	if err != nil {
 		if errors.Is(err, errStopRequested) {
-			c.logger.Info(err)
+			c.logger.Info("stop requested")
 		} else if tio.ShouldLogIOError(err) {
-			c.logger.Warn(err)
+			errs.LogTo(c.logger, err)
 		}
 	}
 	c.closeAllPeers()
 	c.peerWaitGroup.Wait()
 	if err = c.tracker.announceStopped(); err != nil {
-		c.logger.Warn(err)
+		errs.LogTo(c.logger, err)
 	}
 	if c.file != nil {
 		if err = c.file.Close(); err != nil {
-			c.logger.Warn(errs.Wrap(err))
+			errs.LogTo(c.logger, err)
 		}
 		c.file = nil
 	}

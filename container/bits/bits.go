@@ -1,9 +1,5 @@
 package bits
 
-import (
-	"github.com/richardwilkes/toolbox/xmath"
-)
-
 // Bits holds a fixed-size collection of bits.
 type Bits struct {
 	data []byte
@@ -28,8 +24,7 @@ func New(numberOfBits int) *Bits {
 // FirstAvailable returns the first index set in 'has' and is not set in both
 // 'downloading' and 'have', or -1 if no such index exists.
 func FirstAvailable(has, downloading, have *Bits) int {
-	max := xmath.Min(xmath.Min(len(has.data), len(downloading.data)), len(have.data))
-	avail := New(max * 8)
+	avail := New(min(len(has.data), len(downloading.data), len(have.data)) * 8)
 	for i := range avail.data {
 		avail.data[i] = has.data[i] &^ downloading.data[i] &^ have.data[i]
 	}

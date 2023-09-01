@@ -4,12 +4,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/richardwilkes/toolbox/errs"
-	"github.com/richardwilkes/toolbox/log/logadapter"
 	"github.com/richardwilkes/toolbox/xio"
 	"github.com/richardwilkes/torrent/container/bits"
 	"github.com/richardwilkes/torrent/container/spanlist"
@@ -40,7 +40,7 @@ const (
 
 type peer struct {
 	client         *Client
-	logger         logadapter.Logger
+	logger         *slog.Logger
 	conn           net.Conn
 	created        time.Time
 	has            *bits.Bits
@@ -81,10 +81,10 @@ type piece struct {
 	timeout time.Time
 }
 
-func newPeer(client *Client, conn net.Conn, log logadapter.Logger) *peer {
+func newPeer(client *Client, conn net.Conn, logger *slog.Logger) *peer {
 	return &peer{
 		client:      client,
-		logger:      log,
+		logger:      logger,
 		conn:        conn,
 		created:     time.Now(),
 		has:         bits.New(client.torrentFile.PieceCount()),
@@ -203,7 +203,7 @@ func (p *peer) processIncomingMessages() {
 		}
 		if err := tio.ReadWithDeadline(p.conn, lengthBuffer, msgReadDeadline); err != nil {
 			if tio.ShouldLogIOError(err) {
-				p.logger.Warn(err)
+				errs.LogTo(p.logger, err)
 			}
 			return
 		}
@@ -212,7 +212,7 @@ func (p *peer) processIncomingMessages() {
 			buffer := make([]byte, length)
 			if err := tio.ReadWithDeadline(p.conn, buffer, msgReadDeadline); err != nil {
 				if tio.ShouldLogIOError(err) {
-					p.logger.Warn(err)
+					errs.LogTo(p.logger, err)
 				}
 				return
 			}
@@ -245,7 +245,7 @@ func (p *peer) processIncomingMessages() {
 				p.lock.Lock()
 				if length != uint32(1+p.has.ByteLength()) {
 					p.lock.Unlock()
-					p.logger.Warnf("Expected bit field to be %d bytes long, but was %d bytes long", p.has.ByteLength(), length-1)
+					p.logger.Warn("unexpected bit field length", "expected", p.has.ByteLength(), "actual", length-1)
 					return
 				}
 				p.has.SetBytes(buffer[1:])
@@ -261,7 +261,7 @@ func (p *peer) processIncomingMessages() {
 			case pieceID:
 				if err := p.receivedChunk(int(binary.BigEndian.Uint32(buffer[1:5])), int(binary.BigEndian.Uint32(buffer[5:9])), buffer[9:]); err != nil {
 					if tio.ShouldLogIOError(err) {
-						p.logger.Warn(err)
+						errs.LogTo(p.logger, err)
 					}
 					return
 				}
@@ -270,7 +270,7 @@ func (p *peer) processIncomingMessages() {
 			case portID:
 				// Ignore. DHT not implemented.
 			default:
-				p.logger.Warnf("Unknown ID %d", int(buffer[0]))
+				p.logger.Warn("unknown ID", "id", int(buffer[0]))
 			}
 		}
 		p.lock.Lock()
@@ -278,7 +278,7 @@ func (p *peer) processIncomingMessages() {
 		p.lock.Unlock()
 		if err := <-p.client.InRate.Use(int(length + 4)); err != nil {
 			if tio.ShouldLogIOError(err) {
-				p.logger.Warn(err)
+				errs.LogTo(p.logger, err)
 			}
 			return
 		}
@@ -359,7 +359,7 @@ func (p *peer) receivedChunk(index, begin int, buffer []byte) error {
 			p.lock.Unlock()
 			if err != nil && (!errors.Is(err, io.EOF) || n != len(one.buffer)) {
 				p.client.tracker.clearDownload(index)
-				p.logger.Error(errs.NewWithCausef(err, "Unable to write piece %d", index))
+				errs.LogTo(p.logger, errs.NewWithCause("unable to write piece", err), "index", index)
 			} else {
 				p.client.tracker.markBlockValid(index)
 				p.client.tracker.setProgress(-1)
@@ -372,7 +372,7 @@ func (p *peer) receivedChunk(index, begin int, buffer []byte) error {
 		} else {
 			one.lock.Unlock()
 			p.client.dispatcher.GateKeeper().BlockAddress(p.conn.RemoteAddr())
-			return errs.Newf("Received invalid piece %d", index)
+			return errs.Newf("received invalid piece %d", index)
 		}
 	} else {
 		one.lock.Unlock()
@@ -451,7 +451,7 @@ func (p *peer) processPieceRequests(in chan *pieceRequest) {
 		binary.BigEndian.PutUint32(buffer[5:9], uint32(req.index))
 		binary.BigEndian.PutUint32(buffer[9:13], uint32(req.begin))
 		if _, err := p.client.file.ReadAt(buffer[13:], p.client.torrentFile.OffsetOf(req.index)+int64(req.begin)); err != nil {
-			p.logger.Error(errs.NewWithCausef(err, "Unable to read piece %d (begin=%d, length=%d)", req.index, req.begin, req.length))
+			errs.LogTo(p.logger, errs.NewWithCause("unable to read piece", err), "index", req.index, "begin", req.begin, "length", req.length)
 			xio.CloseIgnoringErrors(p.conn)
 			process = false
 			continue
@@ -481,7 +481,7 @@ func (p *peer) processWriteQueue() {
 		}
 		if err != nil || buffer == nil {
 			if tio.ShouldLogIOError(err) {
-				p.logger.Warn(err)
+				errs.LogTo(p.logger, err)
 			}
 			close(done)
 			xio.CloseIgnoringErrors(p.conn)

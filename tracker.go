@@ -94,7 +94,7 @@ func (t *tracker) markBlockValid(index int) {
 	t.client.informPeersWeHavePiece(index)
 	if announce {
 		if err := t.announceComplete(); err != nil {
-			t.client.logger.Warn(err)
+			errs.LogTo(t.client.logger, err)
 		}
 	}
 }
@@ -213,7 +213,7 @@ func (t *tracker) periodicAnnounce() {
 		select {
 		case <-timer:
 			if err := t.announce(""); tio.ShouldLogIOError(err) {
-				t.client.logger.Warn(err)
+				errs.LogTo(t.client.logger, err)
 			}
 		case <-t.stopAnnounceChan:
 			return
@@ -279,7 +279,7 @@ func (t *tracker) announce(event string) error {
 	if event == "" {
 		event = "update"
 	}
-	t.client.logger.Infof("Announce %s | %d seeders | %d leechers | %d peers", event, in.Seeders, in.Leechers, len(peerAddresses))
+	t.client.logger.Info("announce", "event", event, "seeders", in.Seeders, "leechers", in.Leechers, "peers", len(peerAddresses))
 	return nil
 }
 
@@ -331,7 +331,7 @@ func (t *tracker) get(urlStr string) (*trackerWire, error) {
 		// Read any lingering bytes that the decoder might have left behind since
 		// failure to do so may prevent connection reuse.
 		if _, closeErr := io.Copy(io.Discard, resp.Body); closeErr != nil {
-			t.client.logger.Warn(errs.Wrap(closeErr))
+			errs.LogTo(t.client.logger, closeErr)
 		}
 		xio.CloseIgnoringErrors(resp.Body)
 	}()

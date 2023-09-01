@@ -2,6 +2,7 @@ package dispatcher
 
 import (
 	"fmt"
+	"log/slog"
 	"math"
 	"net"
 	"strconv"
@@ -10,7 +11,6 @@ import (
 	"time"
 
 	"github.com/richardwilkes/toolbox/errs"
-	"github.com/richardwilkes/toolbox/log/logadapter"
 	"github.com/richardwilkes/toolbox/rate"
 	"github.com/richardwilkes/toolbox/xio"
 	"github.com/richardwilkes/toolbox/xio/network"
@@ -21,7 +21,7 @@ import (
 
 // ConnectionHandler defines the interface for handling torrent connections.
 type ConnectionHandler interface {
-	HandleConnection(conn net.Conn, log logadapter.Logger, extensions ProtocolExtensions, infoHash tfs.InfoHash, sendHandshake bool)
+	HandleConnection(conn net.Conn, log *slog.Logger, extensions ProtocolExtensions, infoHash tfs.InfoHash, sendHandshake bool)
 }
 
 // Dispatcher holds a dispatcher for bit torrent connections.
@@ -29,7 +29,7 @@ type Dispatcher struct {
 	InRate              rate.Limiter
 	OutRate             rate.Limiter
 	listener            net.Listener
-	logger              logadapter.Logger
+	logger              *slog.Logger
 	natpmpChan          chan any
 	handlers            sync.Map
 	gatekeeper          *GateKeeper
@@ -46,7 +46,7 @@ func NewDispatcher(options ...func(*Dispatcher) error) (*Dispatcher, error) {
 	d := &Dispatcher{
 		InRate:     rate.New(math.MaxInt32, time.Second),
 		OutRate:    rate.New(math.MaxInt32, time.Second),
-		logger:     &logadapter.Discarder{},
+		logger:     slog.Default(),
 		gatekeeper: NewGateKeeper(),
 	}
 	var err error
@@ -107,7 +107,7 @@ func NewDispatcher(options ...func(*Dispatcher) error) (*Dispatcher, error) {
 }
 
 // Logger returns the logger being used by this dispatcher.
-func (d *Dispatcher) Logger() logadapter.Logger {
+func (d *Dispatcher) Logger() *slog.Logger {
 	return d.logger
 }
 
@@ -130,7 +130,7 @@ func (d *Dispatcher) ExternalPort() uint32 {
 func (d *Dispatcher) Stop() {
 	d.gatekeeper.Close()
 	if err := d.listener.Close(); err != nil {
-		d.logger.Warn(err)
+		errs.LogTo(d.logger, err)
 	}
 }
 
@@ -168,14 +168,14 @@ func (d *Dispatcher) ExternalIP() string {
 }
 
 func (d *Dispatcher) listen() {
-	d.logger.Infof("Listening on port %d (external: %s:%d)", d.InternalPort(), d.ExternalIP(), d.ExternalPort())
+	d.logger.Info("listening", "port", d.InternalPort(), "external_ip", d.ExternalIP(), "external_port", d.ExternalPort())
 	for {
 		conn, err := d.listener.Accept()
 		if err != nil {
 			if d.natpmpChan != nil {
 				d.natpmpChan <- nil
 			}
-			d.logger.Infof("Stopped listening on port %d", d.InternalPort())
+			d.logger.Info("stopped listening", "port", d.InternalPort())
 			return
 		}
 		go d.dispatch(conn)
@@ -183,7 +183,7 @@ func (d *Dispatcher) listen() {
 }
 
 func (d *Dispatcher) dispatch(conn net.Conn) {
-	log := &logadapter.Prefixer{Logger: d.logger, Prefix: conn.RemoteAddr().String() + " | "}
+	logger := d.logger.With("remote_addr", conn.RemoteAddr().String())
 	defer xio.CloseIgnoringErrors(conn)
 	if d.gatekeeper.IsAddressBlocked(conn.RemoteAddr()) {
 		return
@@ -191,12 +191,12 @@ func (d *Dispatcher) dispatch(conn net.Conn) {
 	extensions, infoHash, err := ReceiveTorrentHandshake(conn)
 	if err != nil {
 		if tio.ShouldLogIOError(err) {
-			log.Warn(err)
+			errs.LogTo(logger, err)
 		}
 		return
 	}
 	if handler, ok := d.handlers.Load(infoHash); ok {
-		handler.(ConnectionHandler).HandleConnection(conn, log, extensions, infoHash, true)
+		handler.(ConnectionHandler).HandleConnection(conn, logger, extensions, infoHash, true)
 	}
 }
 
@@ -206,9 +206,9 @@ func (d *Dispatcher) monitorNatPMP() {
 		case int:
 			old := d.ExternalPort()
 			atomic.StoreUint32(&d.externalPort, uint32(value))
-			d.logger.Infof("External port changed from %d to %d", old, value)
+			d.logger.Info("external port changed", "from", old, "to", value)
 		case error:
-			d.logger.Warn(value)
+			errs.LogTo(d.logger, value)
 		default:
 			return
 		}
