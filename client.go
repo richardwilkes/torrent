@@ -286,7 +286,13 @@ func (c *Client) HandleConnection(conn net.Conn, logger *slog.Logger, _ dispatch
 	c.lock.Lock()
 	c.peers[conn] = p
 	c.lock.Unlock()
+	c.peerMgmtLock.Lock()
+	if c.peerMgmtStop == nil {
+		c.peerMgmtLock.Unlock()
+		return
+	}
 	c.peerWaitGroup.Add(1)
+	c.peerMgmtLock.Unlock()
 	defer func() {
 		xio.CloseIgnoringErrors(conn)
 		c.lock.Lock()
