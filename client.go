@@ -364,20 +364,26 @@ func (c *Client) finish(err error) {
 }
 
 func (c *Client) closeAllPeers() {
+	var ch chan bool
 	c.peerMgmtLock.Lock()
 	if c.peerMgmtStop != nil {
-		ch := make(chan bool)
+		ch = make(chan bool)
 		c.peerMgmtStop <- ch
-		<-ch
 		c.peerMgmtStop = nil
 	}
 	c.peerMgmtLock.Unlock()
+	if ch != nil {
+		<-ch
+	}
 	for _, p := range c.currentPeers() {
 		xio.CloseIgnoringErrors(p.conn)
 	}
 }
 
 func (c *Client) managePeers() {
+	c.peerMgmtLock.Lock()
+	stopChan := c.peerMgmtStop
+	c.peerMgmtLock.Unlock()
 	c.adjustPeers()
 	for {
 		select {
@@ -387,7 +393,7 @@ func (c *Client) managePeers() {
 			}
 		case <-time.After(10 * time.Second):
 			c.adjustPeers()
-		case ch := <-c.peerMgmtStop:
+		case ch := <-stopChan:
 			ch <- true
 			return
 		}
