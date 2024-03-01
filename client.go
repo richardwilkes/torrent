@@ -75,7 +75,7 @@ func NewClient(d *dispatcher.Dispatcher, torrentFile *tfs.File, options ...func(
 		concurrentDownloads: 4,
 		peersWanted:         32,
 		peerWaitGroup:       &sync.WaitGroup{},
-		peerMgmtStop:        make(chan chan bool),
+		peerMgmtStop:        make(chan chan bool, 1),
 		seedDuration:        96 * time.Hour,
 		peers:               make(map[net.Conn]*peer),
 		stoppedChan:         make(chan bool, 1),
@@ -373,7 +373,10 @@ func (c *Client) closeAllPeers() {
 	}
 	c.peerMgmtLock.Unlock()
 	if ch != nil {
-		<-ch
+		select {
+		case <-time.After(time.Minute):
+		case <-ch:
+		}
 	}
 	for _, p := range c.currentPeers() {
 		xio.CloseIgnoringErrors(p.conn)
