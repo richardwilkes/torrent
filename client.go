@@ -24,10 +24,7 @@ import (
 	"github.com/richardwilkes/torrent/tio"
 )
 
-const (
-	version           = "-RW0001-"
-	urlQuerySafeBytes = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_.~"
-)
+const urlQuerySafeBytes = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_.~"
 
 var errStopRequested = errors.New("stop requested")
 
@@ -80,11 +77,10 @@ func NewClient(d *dispatcher.Dispatcher, torrentFile *tfs.File, options ...func(
 		peers:               make(map[net.Conn]*peer),
 		stoppedChan:         make(chan bool, 1),
 	}
-	copy(c.id[:], version)
-	if _, err := rand.Read(c.id[len(version):]); err != nil {
+	if _, err := rand.Read(c.id[:]); err != nil {
 		return nil, errs.Wrap(err)
 	}
-	for i := len(version); i < len(c.id); i++ {
+	for i := range c.id {
 		c.id[i] = urlQuerySafeBytes[int(c.id[i])%len(urlQuerySafeBytes)]
 	}
 	for _, option := range options {
