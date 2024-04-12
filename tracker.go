@@ -9,8 +9,10 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/richardwilkes/toolbox/errs"
@@ -337,12 +339,22 @@ func (t *tracker) get(urlStr string) (*trackerWire, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, errs.New("Unexpected status: " + resp.Status)
 	}
+	var data []byte
+	if data, err = io.ReadAll(resp.Body); err != nil {
+		return nil, errs.Wrap(err)
+	}
 	var in trackerWire
-	if err = bencode.NewDecoder(resp.Body).Decode(&in); err != nil {
+	if err = bencode.NewDecoder(bytes.NewReader(data)).Decode(&in); err != nil {
+		os.MkdirAll("/tmp/torrents", 0755)
+		v := myCounter.Add(1)
+		os.WriteFile(fmt.Sprintf("tmp/torrents/%d.url", v), []byte(urlStr+"\n"), 0640)
+		os.WriteFile(fmt.Sprintf("tmp/torrents/%d.data", v), data, 0640)
 		return nil, errs.Wrap(err)
 	}
 	return &in, nil
 }
+
+var myCounter atomic.Int32
 
 func (t *tracker) clearDownload(index int) {
 	t.lock.Lock()
