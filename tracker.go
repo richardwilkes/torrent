@@ -347,8 +347,8 @@ func (t *tracker) get(urlStr string) (*trackerWire, error) {
 	if err = bencode.NewDecoder(bytes.NewReader(data)).Decode(&in); err != nil {
 		os.MkdirAll("/tmp/torrents", 0755)
 		v := myCounter.Add(1)
-		os.WriteFile(fmt.Sprintf("tmp/torrents/%d.url", v), []byte(urlStr+"\n"), 0640)
-		os.WriteFile(fmt.Sprintf("tmp/torrents/%d.data", v), data, 0640)
+		os.WriteFile(fmt.Sprintf("/tmp/torrents/%d.url", v), []byte(urlStr+"\n"), 0640)
+		os.WriteFile(fmt.Sprintf("/tmp/torrents/%d.data", v), data, 0640)
 		return nil, errs.Wrap(err)
 	}
 	return &in, nil
