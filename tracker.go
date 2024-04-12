@@ -319,7 +319,6 @@ func (t *tracker) get(urlStr string) (*trackerWire, error) {
 	if err != nil {
 		return nil, errs.Wrap(err)
 	}
-	// noinspection GoBoolExpressions
 	if TrackerUserAgent != "" {
 		req.Header.Set("user-agent", TrackerUserAgent)
 	}
