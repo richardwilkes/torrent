@@ -13,6 +13,11 @@ linters-settings:
   errcheck:
     check-type-assertions: true
     check-blank: true
+    exclude-functions:
+      - fmt.Fprint
+      - fmt.Fprintf
+      - fmt.Fprintln
+      - (fmt.State).Write
   gofumpt:
     extra-rules: true
   govet:
@@ -36,8 +41,6 @@ linters-settings:
     locale: US
   staticcheck:
     checks: ["all", "-SA3000"]
-  unused:
-    check-exported: false
 linters:
   disable-all: true
   enable:
