@@ -39,23 +39,17 @@ const (
 )
 
 type peer struct {
-	client         *Client
-	logger         *slog.Logger
-	conn           net.Conn
-	created        time.Time
-	has            *bits.Bits
-	requestChan    chan *pieceRequest
-	writeQueue     chan []byte
-	lock           sync.RWMutex
-	pieces         map[int]*piece
-	bytesRead      int64
-	bytesWritten   int64
-	lastReceived   time.Time
-	amChoking      bool
-	amInterested   bool
-	peerChoking    bool
-	peerInterested bool
-	bail           bool
+	client      *Client
+	logger      *slog.Logger
+	conn        net.Conn
+	created     time.Time
+	has         *bits.Bits
+	requestChan chan *pieceRequest
+	writeQueue  chan []byte
+	pieces      map[int]*piece // protected by lock
+	peerState                  // protected by lock
+	bail        bool           // protected by lock
+	lock        sync.RWMutex
 }
 
 type pieceRequest struct {
@@ -75,10 +69,10 @@ func newPieceRequest(buffer []byte, cancel bool) *pieceRequest {
 }
 
 type piece struct {
-	lock    sync.RWMutex
 	spans   spanlist.SpanList
-	buffer  []byte
 	timeout time.Time
+	buffer  []byte
+	lock    sync.RWMutex
 }
 
 func newPeer(client *Client, conn net.Conn, logger *slog.Logger) *peer {
@@ -90,16 +84,18 @@ func newPeer(client *Client, conn net.Conn, logger *slog.Logger) *peer {
 		has:         bits.New(client.torrentFile.PieceCount()),
 		requestChan: make(chan *pieceRequest),
 		writeQueue:  make(chan []byte, 32),
-		amChoking:   true,
-		peerChoking: true,
 		pieces:      make(map[int]*piece),
+		peerState: peerState{
+			amChoking:   true,
+			peerChoking: true,
+		},
 	}
 }
 
 type peerState struct {
+	lastReceived   time.Time
 	bytesRead      int64
 	bytesWritten   int64
-	lastReceived   time.Time
 	amChoking      bool
 	amInterested   bool
 	peerChoking    bool
@@ -111,16 +107,8 @@ func (p *peer) updateInterest() peerState {
 	p.clearExpiredDownloads()
 	p.lock.RLock()
 	has := p.has.Clone()
-	ps := peerState{
-		bytesRead:      p.bytesRead,
-		bytesWritten:   p.bytesWritten,
-		lastReceived:   p.lastReceived,
-		amChoking:      p.amChoking,
-		amInterested:   p.amInterested,
-		peerChoking:    p.peerChoking,
-		peerInterested: p.peerInterested,
-		downloading:    len(p.pieces) > 0,
-	}
+	ps := p.peerState
+	ps.downloading = len(p.pieces) > 0
 	p.lock.RUnlock()
 	interested := ps.downloading || p.client.tracker.isInteresting(has)
 	if ps.amInterested != interested {

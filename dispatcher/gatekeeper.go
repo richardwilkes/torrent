@@ -10,8 +10,8 @@ const blockDuration = 5 * time.Minute
 
 // GateKeeper controls whether peers with a given address may connect with us.
 type GateKeeper struct {
-	addresses sync.Map
 	done      chan bool
+	addresses sync.Map
 }
 
 // NewGateKeeper creates a new GateKeeper.

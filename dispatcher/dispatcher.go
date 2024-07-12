@@ -31,13 +31,13 @@ type Dispatcher struct {
 	listener            net.Listener
 	logger              *slog.Logger
 	natpmpChan          chan any
-	handlers            sync.Map
 	gatekeeper          *GateKeeper
+	handlers            sync.Map
+	lastExternalIPCheck time.Time // protected by lock
+	externalIP          string    // protected by lock
 	internalPort        uint32
 	externalPort        uint32
 	lock                sync.Mutex
-	externalIP          string
-	lastExternalIPCheck time.Time
 }
 
 // NewDispatcher creates a new dispatcher and starts listening for

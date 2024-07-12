@@ -24,6 +24,7 @@ type State int
 
 // Status holds the status information for a torrent.
 type Status struct {
+	SeedingStopsAt         time.Time
 	State                  State
 	PercentComplete        float64
 	UploadBytesPerSecond   int
@@ -32,7 +33,6 @@ type Status struct {
 	PeersConnected         int
 	Leechers               int
 	Seeders                int
-	SeedingStopsAt         time.Time
 }
 
 func (s *Status) String() string {

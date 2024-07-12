@@ -37,21 +37,20 @@ type Client struct {
 	downloadCompleteNotifier chan *Client
 	stoppedNotifier          chan *Client
 	logger                   *slog.Logger
-	id                       dispatcher.PeerID
-	_                        int32 // for 8-byte alignment, since id is 20 bytes
 	tracker                  *tracker
+	peerWaitGroup            *sync.WaitGroup
+	file                     *os.File
+	peerMgmtStop             chan chan bool     // protected by peerMgmtLock
+	peers                    map[net.Conn]*peer // protected by lock
+	stoppedChan              chan bool          // protected by lock
 	concurrentDownloads      int
 	peersWanted              int
-	peerWaitGroup            *sync.WaitGroup
-	peerMgmtLock             sync.Mutex
-	peerMgmtStop             chan chan bool
-	file                     *os.File
 	seedDuration             time.Duration
+	peerMgmtLock             sync.Mutex
 	lock                     sync.RWMutex
-	peers                    map[net.Conn]*peer
-	stoppedChan              chan bool
-	stopRequested            bool
-	stopped                  bool
+	id                       dispatcher.PeerID
+	stopRequested            bool // protected by lock
+	stopped                  bool // protected by lock
 }
 
 // NewClient creates and starts a new client for a torrent.

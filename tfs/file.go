@@ -28,23 +28,23 @@ type InfoHash [sha1.Size]byte
 
 // File holds the contents of a .torrent file.
 type File struct {
-	Path     string `bencode:"-"`
-	Announce string `bencode:"announce"`
+	root     *vfs            // protected by lock
+	fs       map[string]*vfs // protected by lock
+	Path     string          `bencode:"-"`
+	Announce string          `bencode:"announce"`
 	Info     struct {
-		Name        string `bencode:"name"`
-		PieceLength int    `bencode:"piece length"`
-		Pieces      []byte `bencode:"pieces"`
-		Length      int64  `bencode:"length,omitempty"`
-		Files       []struct {
-			Length int64    `bencode:"length"`
+		Name   string `bencode:"name"`
+		Pieces []byte `bencode:"pieces"`
+		Files  []struct {
 			Path   []string `bencode:"path"`
+			Length int64    `bencode:"length"`
 		} `bencode:"files,omitempty"`
-		Private bool `bencode:"private"`
+		PieceLength int   `bencode:"piece length"`
+		Length      int64 `bencode:"length,omitempty"`
+		Private     bool  `bencode:"private"`
 	} `bencode:"info"`
 	InfoHash InfoHash `bencode:"-"`
 	lock     sync.Mutex
-	root     *vfs
-	fs       map[string]*vfs
 }
 
 // NewFileFromPath creates a torrent file structure from the raw torrent file data.

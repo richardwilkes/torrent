@@ -14,11 +14,11 @@ var _ fs.File = &vfile{}
 type vfs struct {
 	storage  string
 	name     string
+	modTime  time.Time
+	children []*vfs
 	offset   int64
 	length   int64
 	mode     os.FileMode
-	modTime  time.Time
-	children []*vfs
 }
 
 func (v *vfs) Name() string {

@@ -35,32 +35,36 @@ var (
 type tracker struct {
 	client           *Client
 	stopAnnounceChan chan bool
-	lock             sync.RWMutex
-	currentState     State
-	trackerID        string
-	uploadedBytes    int64
-	downloadedBytes  int64
-	totalBytes       int64
-	remainingBytes   int64
-	interval         int
-	leechers         int
-	seeders          int
-	peerAddresses    map[string]int
-	have             *bits.Bits
-	downloading      *bits.Bits
-	who              map[int]*peer
-	seedExpires      time.Time
-	progress         float64
-	started          bool
+	trackerLockData
+	lock sync.RWMutex
+}
+
+type trackerLockData struct {
+	have            *bits.Bits
+	downloading     *bits.Bits
+	who             map[int]*peer
+	peerAddresses   map[string]int
+	seedExpires     time.Time
+	trackerID       string
+	currentState    State
+	uploadedBytes   int64
+	downloadedBytes int64
+	totalBytes      int64
+	remainingBytes  int64
+	interval        int
+	leechers        int
+	seeders         int
+	progress        float64
+	started         bool
 }
 
 type trackerWire struct {
-	Interval      int    `bencode:"interval"`
 	PeerAddresses any    `bencode:"peers"`
-	Seeders       int    `bencode:"complete"`
-	Leechers      int    `bencode:"incomplete"`
 	TrackerID     string `bencode:"tracker id"`
 	Failure       string `bencode:"failure reason"`
+	Interval      int    `bencode:"interval"`
+	Seeders       int    `bencode:"complete"`
+	Leechers      int    `bencode:"incomplete"`
 }
 
 func newTracker(client *Client) *tracker {
@@ -69,11 +73,13 @@ func newTracker(client *Client) *tracker {
 	return &tracker{
 		client:           client,
 		stopAnnounceChan: make(chan bool),
-		totalBytes:       totalBytes,
-		remainingBytes:   totalBytes,
-		have:             bits.New(totalPieces),
-		downloading:      bits.New(totalPieces),
-		who:              make(map[int]*peer),
+		trackerLockData: trackerLockData{
+			totalBytes:     totalBytes,
+			remainingBytes: totalBytes,
+			have:           bits.New(totalPieces),
+			downloading:    bits.New(totalPieces),
+			who:            make(map[int]*peer),
+		},
 	}
 }
 

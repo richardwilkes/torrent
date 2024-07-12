@@ -9,12 +9,12 @@ import (
 
 // EmbeddedFile represents a file embedded in torrent file storage.
 type EmbeddedFile struct {
+	file   *os.File
+	path   string
 	Name   string
 	Dir    string
 	Length int64
 	offset int64
-	path   string
-	file   *os.File
 }
 
 // Open the file for reading.
