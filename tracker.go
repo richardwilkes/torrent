@@ -58,13 +58,13 @@ type trackerLockData struct {
 	started         bool
 }
 
-type trackerWire struct {
-	PeerAddresses any    `bencode:"peers"`
-	TrackerID     string `bencode:"tracker id"`
-	Failure       string `bencode:"failure reason"`
+type trackerWire struct { //nolint:govet // We can't change the order of these fields
 	Interval      int    `bencode:"interval"`
+	PeerAddresses any    `bencode:"peers"`
 	Seeders       int    `bencode:"complete"`
 	Leechers      int    `bencode:"incomplete"`
+	TrackerID     string `bencode:"tracker id"`
+	Failure       string `bencode:"failure reason"`
 }
 
 func newTracker(client *Client) *tracker {

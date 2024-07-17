@@ -32,16 +32,16 @@ type File struct {
 	fs       map[string]*vfs // protected by lock
 	Path     string          `bencode:"-"`
 	Announce string          `bencode:"announce"`
-	Info     struct {
-		Name   string `bencode:"name"`
-		Pieces []byte `bencode:"pieces"`
-		Files  []struct {
-			Path   []string `bencode:"path"`
+	Info     struct {        //nolint:govet // We can't change the order of these fields
+		Name        string     `bencode:"name"`
+		PieceLength int        `bencode:"piece length"`
+		Pieces      []byte     `bencode:"pieces"`
+		Length      int64      `bencode:"length,omitempty"`
+		Files       []struct { //nolint:govet // We can't change the order of these fields
 			Length int64    `bencode:"length"`
+			Path   []string `bencode:"path"`
 		} `bencode:"files,omitempty"`
-		PieceLength int   `bencode:"piece length"`
-		Length      int64 `bencode:"length,omitempty"`
-		Private     bool  `bencode:"private"`
+		Private bool `bencode:"private"`
 	} `bencode:"info"`
 	InfoHash InfoHash `bencode:"-"`
 	lock     sync.Mutex
