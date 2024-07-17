@@ -160,6 +160,8 @@ func (t *tracker) status(peersDownloading, peersConnected int) *Status {
 	return &Status{
 		State:                  t.currentState,
 		PercentComplete:        t.progress,
+		TotalBytes:             t.totalBytes,
+		RemainingBytes:         t.remainingBytes,
 		UploadBytesPerSecond:   t.client.OutRate.LastUsed(),
 		DownloadBytesPerSecond: t.client.InRate.LastUsed(),
 		PeersDownloading:       peersDownloading,

@@ -27,6 +27,8 @@ type Status struct {
 	SeedingStopsAt         time.Time
 	State                  State
 	PercentComplete        float64
+	TotalBytes             int64
+	RemainingBytes         int64
 	UploadBytesPerSecond   int
 	DownloadBytesPerSecond int
 	PeersDownloading       int
