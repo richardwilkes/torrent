@@ -86,12 +86,12 @@ func NewDispatcher(options ...func(*Dispatcher) error) (*Dispatcher, error) {
 			}
 		}
 		if !success {
-			return nil, errs.Newf("Unable to listen on any port in the range %d to %d", d.internalPort, d.externalPort)
+			return nil, errs.Newf("unable to listen on any port in the range %d to %d", d.internalPort, d.externalPort)
 		}
 	}
 	if d.natpmpChan != nil {
-		port, err := natpmp.MapTCP(int(d.internalPort), d.natpmpChan)
-		if err != nil {
+		var port int
+		if port, err = natpmp.MapTCP(int(d.internalPort), d.natpmpChan); err != nil {
 			if lerr := d.listener.Close(); lerr != nil {
 				err = errs.Append(err, lerr)
 			}

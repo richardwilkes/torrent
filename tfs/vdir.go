@@ -35,12 +35,12 @@ func (v *vdir) Readdir(count int) ([]os.FileInfo, error) {
 	if v.done {
 		return nil, io.EOF
 	}
-	max := len(v.owner.children) - v.next
+	maximum := len(v.owner.children) - v.next
 	if count < 1 {
-		count = max
+		count = maximum
 	}
-	if count > max {
-		count = max
+	if count > maximum {
+		count = maximum
 	}
 	result := make([]os.FileInfo, count)
 	for i := range result {

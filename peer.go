@@ -322,12 +322,12 @@ func (p *peer) receivedChunk(index, begin int, buffer []byte) error {
 	one, ok := p.pieces[index]
 	p.lock.RUnlock()
 	if !ok {
-		return errs.New("Received chunk for piece not requested")
+		return errs.New("received chunk for piece not requested")
 	}
 	last := begin + len(buffer)
 	if last > len(one.buffer) {
 		p.client.dispatcher.GateKeeper().BlockAddress(p.conn.RemoteAddr())
-		return errs.New("Chunk data would overrun buffer")
+		return errs.New("chunk data would overrun buffer")
 	}
 	one.lock.Lock()
 	now := time.Now()

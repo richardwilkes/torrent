@@ -238,7 +238,7 @@ func (t *tracker) announce(event string) error {
 		return errs.New(in.Failure)
 	}
 	if in.Interval < 1 {
-		return errs.New("Invalid interval")
+		return errs.New("invalid interval")
 	}
 	externalAddr := t.client.ExternalIP()
 	peerAddresses := make(map[string]int)
@@ -287,7 +287,8 @@ func (t *tracker) announce(event string) error {
 	if event == "" {
 		event = "update"
 	}
-	t.client.logger.Info("announce", "event", event, "seeders", in.Seeders, "leechers", in.Leechers, "peers", len(peerAddresses))
+	t.client.logger.Info("announce", "event", event, "seeders", in.Seeders, "leechers", in.Leechers, "peers",
+		len(peerAddresses))
 	return nil
 }
 
@@ -323,7 +324,7 @@ func (t *tracker) announceURL(event string) string {
 func (t *tracker) get(urlStr string) (*trackerWire, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, http.NoBody)
 	if err != nil {
 		return nil, errs.Wrap(err)
 	}
@@ -343,7 +344,7 @@ func (t *tracker) get(urlStr string) (*trackerWire, error) {
 		xio.CloseIgnoringErrors(resp.Body)
 	}()
 	if resp.StatusCode != http.StatusOK {
-		return nil, errs.New("Unexpected status: " + resp.Status)
+		return nil, errs.New("unexpected status: " + resp.Status)
 	}
 	var in trackerWire
 	if err = bencode.NewDecoder(resp.Body).Decode(&in); err != nil {

@@ -11,7 +11,7 @@ import (
 func GlobalDownloadCap(bytesPerSecond int) func(*Dispatcher) error {
 	return func(d *Dispatcher) error {
 		if bytesPerSecond < 1 {
-			return errs.New("DownloadCap must be at least 1")
+			return errs.New("GlobalDownloadCap must be at least 1")
 		}
 		d.InRate.SetCap(bytesPerSecond)
 		return nil
@@ -23,7 +23,7 @@ func GlobalDownloadCap(bytesPerSecond int) func(*Dispatcher) error {
 func GlobalUploadCap(bytesPerSecond int) func(*Dispatcher) error {
 	return func(d *Dispatcher) error {
 		if bytesPerSecond < 1 {
-			return errs.New("UploadCap must be at least 1")
+			return errs.New("GlobalUploadCap must be at least 1")
 		}
 		d.OutRate.SetCap(bytesPerSecond)
 		return nil

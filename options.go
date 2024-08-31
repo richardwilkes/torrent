@@ -57,7 +57,7 @@ func ConcurrentDownloads(concurrent int) func(*Client) error {
 func SeedDuration(duration time.Duration) func(*Client) error {
 	return func(c *Client) error {
 		if duration < 0 {
-			return errs.New("duration must be at least 0")
+			return errs.New("SeedDuration must be at least 0")
 		}
 		c.seedDuration = duration
 		return nil

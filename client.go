@@ -221,7 +221,7 @@ func (c *Client) prepareFile() error {
 			}
 			if n != c.torrentFile.Info.PieceLength {
 				if i != count-1 || n != lastPieceLength {
-					return errs.New("Unable to read file: " + c.torrentFile.StoragePath())
+					return errs.New("unable to read file: " + c.torrentFile.StoragePath())
 				}
 			}
 			if c.torrentFile.Validate(i, buffer[:n]) {

@@ -51,7 +51,7 @@ func (v *vfs) open() (fs.File, error) {
 	}
 	f, err := os.Open(v.storage)
 	if err != nil {
-		return nil, errs.NewWithCausef(err, "Unable to open %s", v.name)
+		return nil, errs.NewWithCausef(err, "unable to open %s", v.name)
 	}
 	return &vfile{
 		owner: v,
