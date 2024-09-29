@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -91,7 +90,7 @@ func (t *tracker) markBlockValid(index int) {
 		t.downloading.Unset(index)
 		delete(t.who, index)
 		t.remainingBytes -= int64(t.client.torrentFile.LengthOf(index))
-		if t.remainingBytes == 0 {
+		if t.remainingBytes <= 0 {
 			t.seedExpires = time.Now().Add(t.client.seedDuration)
 			announce = true
 		}
@@ -135,13 +134,13 @@ func (t *tracker) setState(state State) {
 func (t *tracker) isDownloadComplete() bool {
 	t.lock.RLock()
 	defer t.lock.RUnlock()
-	return t.remainingBytes == 0
+	return t.remainingBytes <= 0
 }
 
 func (t *tracker) isSeedingComplete() bool {
 	t.lock.RLock()
 	defer t.lock.RUnlock()
-	return t.remainingBytes == 0 && time.Now().After(t.seedExpires)
+	return t.remainingBytes <= 0 && time.Now().After(t.seedExpires)
 }
 
 func (t *tracker) setProgress(progress float64) {
@@ -335,14 +334,7 @@ func (t *tracker) get(urlStr string) (*trackerWire, error) {
 	if err != nil {
 		return nil, errs.Wrap(err)
 	}
-	defer func() {
-		// Read any lingering bytes that the decoder might have left behind since
-		// failure to do so may prevent connection reuse.
-		if _, closeErr := io.Copy(io.Discard, resp.Body); closeErr != nil {
-			errs.LogTo(t.client.logger, closeErr)
-		}
-		xio.CloseIgnoringErrors(resp.Body)
-	}()
+	defer xio.DiscardAndCloseIgnoringErrors(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return nil, errs.New("unexpected status: " + resp.Status)
 	}

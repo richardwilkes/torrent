@@ -318,16 +318,17 @@ func (p *peer) queuePieceDownload(index int) {
 }
 
 func (p *peer) receivedChunk(index, begin int, buffer []byte) error {
+	p.logger.Info("received chunk", "index", index, "begin", begin, "length", len(buffer))
 	p.lock.RLock()
 	one, ok := p.pieces[index]
 	p.lock.RUnlock()
 	if !ok {
-		return errs.New("received chunk for piece not requested")
+		return errs.Newf("received unrequested piece %d", index)
 	}
 	last := begin + len(buffer)
 	if last > len(one.buffer) {
 		p.client.dispatcher.GateKeeper().BlockAddress(p.conn.RemoteAddr())
-		return errs.New("chunk data would overrun buffer")
+		return errs.Newf("piece %d would overrun buffer", index)
 	}
 	one.lock.Lock()
 	now := time.Now()
@@ -360,7 +361,7 @@ func (p *peer) receivedChunk(index, begin int, buffer []byte) error {
 		} else {
 			one.lock.Unlock()
 			p.client.dispatcher.GateKeeper().BlockAddress(p.conn.RemoteAddr())
-			return errs.Newf("received invalid piece %d", index)
+			return errs.Newf("discarding invalid piece %d", index)
 		}
 	} else {
 		one.lock.Unlock()
