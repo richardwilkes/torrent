@@ -318,7 +318,6 @@ func (p *peer) queuePieceDownload(index int) {
 }
 
 func (p *peer) receivedChunk(index, begin int, buffer []byte) error {
-	p.logger.Info("received chunk", "index", index, "begin", begin, "length", len(buffer))
 	p.lock.RLock()
 	one, ok := p.pieces[index]
 	p.lock.RUnlock()
