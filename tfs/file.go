@@ -99,7 +99,7 @@ func (f *File) OffsetOf(index int) int64 {
 
 // LengthOf returns the length of the piece at the specified index.
 func (f *File) LengthOf(index int) int {
-	if last := f.PieceCount() - 1; index >= last {
+	if last := f.PieceCount() - 1; index == last {
 		return int(f.Size() - int64(last)*int64(f.Info.PieceLength))
 	}
 	return f.Info.PieceLength
