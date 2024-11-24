@@ -196,7 +196,9 @@ func (d *Dispatcher) dispatch(conn net.Conn) {
 		return
 	}
 	if handler, ok := d.handlers.Load(infoHash); ok {
-		handler.(ConnectionHandler).HandleConnection(conn, logger, extensions, infoHash, true)
+		if connHandler, ok2 := handler.(ConnectionHandler); ok2 {
+			connHandler.HandleConnection(conn, logger, extensions, infoHash, true)
+		}
 	}
 }
 

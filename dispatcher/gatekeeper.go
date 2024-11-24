@@ -46,8 +46,12 @@ func (r *GateKeeper) IsAddressBlocked(addr net.Addr) bool {
 
 // IsAddressStringBlocked returns true if the address is blocked.
 func (r *GateKeeper) IsAddressStringBlocked(addr string) bool {
-	expires, ok := r.addresses.Load(addr)
-	return ok && !expires.(time.Time).Before(time.Now())
+	if expires, ok := r.addresses.Load(addr); ok {
+		if t, ok2 := expires.(time.Time); ok2 {
+			return t.Before(time.Now())
+		}
+	}
+	return false
 }
 
 func (r *GateKeeper) prune() {
@@ -55,7 +59,7 @@ func (r *GateKeeper) prune() {
 		select {
 		case <-time.After(blockDuration):
 			r.addresses.Range(func(addr, expires any) bool {
-				if expires.(time.Time).Before(time.Now()) {
+				if t, ok := expires.(time.Time); ok && t.Before(time.Now()) {
 					r.addresses.Delete(addr)
 				}
 				return true
