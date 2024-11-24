@@ -17,11 +17,11 @@ import (
 )
 
 const (
-	msgReadDeadline         = 10 * time.Second
-	msgWriteDeadline        = 10 * time.Second
+	msgReadDeadline         = 5 * time.Second
+	msgWriteDeadline        = 5 * time.Second
 	keepAlivePeriod         = 2 * time.Minute
-	downloadReadDeadline    = 10 * time.Second
-	maxWaitForChunkDownload = 15 * time.Second
+	downloadReadDeadline    = 5 * time.Second
+	maxWaitForChunkDownload = 10 * time.Second
 	chunkSize               = 16384
 )
 
