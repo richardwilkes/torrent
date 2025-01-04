@@ -250,7 +250,6 @@ func (c *Client) prepareFile() error {
 func (c *Client) HandleConnection(conn net.Conn, logger *slog.Logger, _ dispatcher.ProtocolExtensions, infoHash tfs.InfoHash, sendHandshake bool) {
 	_, storagePath := filepath.Split(c.torrentFile.StoragePath())
 	logger = logger.With("torrent_file", storagePath[:len(storagePath)-len(filepath.Ext(storagePath))])
-	logger.Info("HandleConnection", "remote_addr", conn.RemoteAddr().String())
 	if !bytes.Equal(infoHash[:], c.torrentFile.InfoHash[:]) {
 		c.dispatcher.GateKeeper().BlockAddress(conn.RemoteAddr())
 		return

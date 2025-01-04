@@ -2,3 +2,4 @@
 *.tordata
 logs
 /tools/
+release-notes.txt
