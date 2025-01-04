@@ -89,8 +89,8 @@ func (t *tracker) markBlockValid(index int) {
 		t.have.Set(index)
 		t.downloading.Unset(index)
 		delete(t.who, index)
-		t.remainingBytes -= int64(t.client.torrentFile.LengthOf(index))
-		if t.remainingBytes <= 0 {
+		if t.remainingBytes -= t.client.torrentFile.LengthOf(index); t.remainingBytes <= 0 {
+			t.remainingBytes = 0
 			t.seedExpires = time.Now().Add(t.client.seedDuration)
 			announce = true
 		}
@@ -184,10 +184,10 @@ func (t *tracker) announceStart() error {
 	if err := t.announce(startedMsg); err != nil {
 		return err
 	}
-	if !t.isDownloadComplete() {
-		t.setStateAndProgress(Downloading, -1)
-	} else {
+	if t.isDownloadComplete() {
 		t.setState(Seeding)
+	} else {
+		t.setStateAndProgress(Downloading, -1)
 	}
 	go t.periodicAnnounce()
 	return nil

@@ -93,97 +93,63 @@ func (b *Bits) Unset(index int) {
 // NextSet returns the index of the next set bit, starting at 'from'. Returns
 // -1 if no bits are set from 'from' through the end of the bits.
 func (b *Bits) NextSet(from int) int {
-	if from >= 0 && from < b.size {
-		i := from / 8
-		one := b.data[i]
+	if from < 0 || from >= b.size {
+		return -1
+	}
+	start := 7 - (from % 8)
+	i := from / 8
+	one := b.data[i]
+	for {
 		if one != 0 {
-			for j := 7 - (from % 8); j >= 0; j-- {
+			for j := start; j >= 0; j-- {
 				if one&(1<<uint(j)) != 0 {
-					i = i*8 + 7 - j
-					if i < b.size {
+					if i = i*8 + 7 - j; i < b.size {
 						return i
 					}
 					return -1
 				}
 			}
-			i++
-			if i >= len(b.data) {
+			if start == 7 {
 				return -1
 			}
-			one = b.data[i]
 		}
-		for {
-			if one != 0 {
-				for j := 7; j > 0; j-- {
-					if one&(1<<uint(j)) != 0 {
-						i = i*8 + 7 - j
-						if i < b.size {
-							return i
-						}
-						return -1
-					}
-				}
-				i = i*8 + 7
-				if i < b.size {
-					return i
-				}
-				return -1
-			}
-			i++
-			if i >= len(b.data) {
-				break
-			}
-			one = b.data[i]
+		i++
+		if i >= len(b.data) {
+			return -1
 		}
+		one = b.data[i]
+		start = 7
 	}
-	return -1
 }
 
 // NextUnset returns the index of the next unset bit, starting at 'from'.
 // Returns -1 if no bits are unset from 'from' through the end of the bits.
 func (b *Bits) NextUnset(from int) int {
-	if from >= 0 && from < b.size {
-		i := from / 8
-		one := b.data[i]
+	if from < 0 || from >= b.size {
+		return -1
+	}
+	start := 7 - (from % 8)
+	i := from / 8
+	one := b.data[i]
+	for {
 		if one != 255 {
-			for j := 7 - (from % 8); j >= 0; j-- {
+			for j := start; j >= 0; j-- {
 				if one&(1<<uint(j)) == 0 {
-					i = i*8 + 7 - j
-					if i < b.size {
+					if i = i*8 + 7 - j; i < b.size {
 						return i
 					}
 					return -1
 				}
 			}
-			i++
-			if i >= len(b.data) {
+			if start == 7 {
 				return -1
 			}
-			one = b.data[i]
 		}
-		for {
-			if one != 255 {
-				for j := 7; j > 0; j-- {
-					if one&(1<<uint(j)) == 0 {
-						i = i*8 + 7 - j
-						if i < b.size {
-							return i
-						}
-						return -1
-					}
-				}
-				i = i*8 + 7
-				if i < b.size {
-					return i
-				}
-				return -1
-			}
-			i++
-			if i >= len(b.data) {
-				break
-			}
-			one = b.data[i]
+		i++
+		if i >= len(b.data) {
+			return -1
 		}
+		one = b.data[i]
+		start = 7
 	}
-	return -1
 }

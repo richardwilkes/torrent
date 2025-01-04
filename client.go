@@ -24,6 +24,12 @@ import (
 	"github.com/richardwilkes/torrent/tio"
 )
 
+const (
+	peerDialTimeout                   = 5 * time.Second
+	peerAdjustmentInterval            = 10 * time.Second
+	peerClearExpiredDownloadsInterval = time.Minute
+)
+
 const urlQuerySafeBytes = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_.~"
 
 var errStopRequested = errors.New("stop requested")
@@ -61,13 +67,13 @@ func NewClient(d *dispatcher.Dispatcher, torrentFile *tfs.File, options ...func(
 	if torrentFile == nil {
 		return nil, errs.New("torrentFile may not be nil")
 	}
-	_, storagePath := filepath.Split(torrentFile.StoragePath())
+	_, path := filepath.Split(torrentFile.StoragePath())
 	c := &Client{
 		InRate:              d.InRate.New(math.MaxInt32),
 		OutRate:             d.OutRate.New(math.MaxInt32),
 		dispatcher:          d,
 		torrentFile:         torrentFile,
-		logger:              d.Logger().With("torrent_file", storagePath[:len(storagePath)-len(filepath.Ext(storagePath))]),
+		logger:              d.Logger().With("torrent_file", path[:len(path)-len(filepath.Ext(path))]),
 		concurrentDownloads: 4,
 		peersWanted:         32,
 		peerWaitGroup:       &sync.WaitGroup{},
@@ -209,9 +215,9 @@ func (c *Client) prepareFile() error {
 		}
 		buffer := make([]byte, c.torrentFile.Info.PieceLength)
 		count := c.torrentFile.PieceCount()
-		lastPieceLength := int(length - int64(count-1)*int64(c.torrentFile.Info.PieceLength))
+		lastPieceLength := length - int64(count-1)*c.torrentFile.Info.PieceLength
 		for i := 0; i < count; i++ {
-			pos := int64(i) * int64(c.torrentFile.Info.PieceLength)
+			pos := int64(i) * c.torrentFile.Info.PieceLength
 			if pos >= original {
 				break
 			}
@@ -219,8 +225,8 @@ func (c *Client) prepareFile() error {
 			if n, err = f.ReadAt(buffer, pos); err != nil && !errors.Is(err, io.EOF) {
 				return errs.Wrap(err)
 			}
-			if n != c.torrentFile.Info.PieceLength {
-				if i != count-1 || n != lastPieceLength {
+			if int64(n) != c.torrentFile.Info.PieceLength {
+				if i != count-1 || int64(n) != lastPieceLength {
 					return errs.New("unable to read file: " + c.torrentFile.StoragePath())
 				}
 			}
@@ -244,6 +250,7 @@ func (c *Client) prepareFile() error {
 func (c *Client) HandleConnection(conn net.Conn, logger *slog.Logger, _ dispatcher.ProtocolExtensions, infoHash tfs.InfoHash, sendHandshake bool) {
 	_, storagePath := filepath.Split(c.torrentFile.StoragePath())
 	logger = logger.With("torrent_file", storagePath[:len(storagePath)-len(filepath.Ext(storagePath))])
+	logger.Info("HandleConnection", "remote_addr", conn.RemoteAddr().String())
 	if !bytes.Equal(infoHash[:], c.torrentFile.InfoHash[:]) {
 		c.dispatcher.GateKeeper().BlockAddress(conn.RemoteAddr())
 		return
@@ -299,7 +306,7 @@ func (c *Client) HandleConnection(conn net.Conn, logger *slog.Logger, _ dispatch
 }
 
 func (c *Client) connectToPeer(addr string, port int) {
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", addr, port), 5*time.Second)
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", addr, port), peerDialTimeout)
 	if err != nil {
 		if tio.ShouldLogIOError(err) {
 			errs.LogTo(c.logger, err)
@@ -385,11 +392,11 @@ func (c *Client) managePeers() {
 	c.adjustPeers()
 	for {
 		select {
-		case <-time.After(time.Minute):
+		case <-time.After(peerClearExpiredDownloadsInterval):
 			for _, p := range c.currentPeers() {
 				p.clearExpiredDownloads()
 			}
-		case <-time.After(10 * time.Second):
+		case <-time.After(peerAdjustmentInterval):
 			c.adjustPeers()
 		case ch := <-stopChan:
 			ch <- true
@@ -445,7 +452,8 @@ func (c *Client) adjustPeers() {
 				if pd[i].state.peerChoking && !pd[j].state.peerChoking {
 					return true
 				}
-				if now.Sub(pd[i].state.lastReceived) > maxWaitForChunkDownload && now.Sub(pd[j].state.lastReceived) <= maxWaitForChunkDownload {
+				if now.Sub(pd[i].state.lastReceived) > maxWaitForChunkDownload &&
+					now.Sub(pd[j].state.lastReceived) <= maxWaitForChunkDownload {
 					return true
 				}
 				if pd[i].peer.bytesRead < pd[j].peer.bytesRead {
@@ -491,7 +499,8 @@ func (c *Client) adjustPeers() {
 		if pd[i].state.peerInterested && !pd[j].state.peerInterested {
 			return true
 		}
-		if now.Sub(pd[i].state.lastReceived) <= maxWaitForChunkDownload && now.Sub(pd[j].state.lastReceived) > maxWaitForChunkDownload {
+		if now.Sub(pd[i].state.lastReceived) <= maxWaitForChunkDownload &&
+			now.Sub(pd[j].state.lastReceived) > maxWaitForChunkDownload {
 			return true
 		}
 		if pd[i].state.bytesRead > pd[j].state.bytesRead {

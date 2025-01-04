@@ -34,7 +34,7 @@ type File struct {
 	Announce string          `bencode:"announce"`
 	Info     struct {        //nolint:govet // We can't change the order of these fields
 		Name        string     `bencode:"name"`
-		PieceLength int        `bencode:"piece length"`
+		PieceLength int64      `bencode:"piece length"`
 		Pieces      []byte     `bencode:"pieces"`
 		Length      int64      `bencode:"length,omitempty"`
 		Files       []struct { //nolint:govet // We can't change the order of these fields
@@ -94,13 +94,13 @@ func NewFileFromBytes(data []byte) (*File, error) {
 // OffsetOf returns the offset into the data for the piece at the specified
 // index.
 func (f *File) OffsetOf(index int) int64 {
-	return int64(index) * int64(f.Info.PieceLength)
+	return int64(index) * f.Info.PieceLength
 }
 
 // LengthOf returns the length of the piece at the specified index.
-func (f *File) LengthOf(index int) int {
+func (f *File) LengthOf(index int) int64 {
 	if last := f.PieceCount() - 1; index == last {
-		return int(f.Size() - int64(last)*int64(f.Info.PieceLength))
+		return f.Size() - int64(last)*f.Info.PieceLength
 	}
 	return f.Info.PieceLength
 }
@@ -112,7 +112,7 @@ func (f *File) PieceCount() int {
 
 // Size returns the size of the complete data.
 func (f *File) Size() int64 {
-	if f.Info.Length != 0 {
+	if f.Info.Length > 0 {
 		return f.Info.Length
 	}
 	var total int64
@@ -187,7 +187,7 @@ func (f *File) buildFS() {
 			modTime: modTime,
 		}
 		f.fs[f.root.name] = f.root
-		if f.Info.Length != 0 {
+		if f.Info.Length > 0 {
 			child := &vfs{
 				storage: storage,
 				name:    f.root.name + f.Info.Name,

@@ -48,7 +48,7 @@ func (r *GateKeeper) IsAddressBlocked(addr net.Addr) bool {
 func (r *GateKeeper) IsAddressStringBlocked(addr string) bool {
 	if expires, ok := r.addresses.Load(addr); ok {
 		if t, ok2 := expires.(time.Time); ok2 {
-			return t.Before(time.Now())
+			return time.Now().Before(t)
 		}
 	}
 	return false

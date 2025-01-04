@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,11 +18,11 @@ import (
 )
 
 const (
-	msgReadDeadline         = 5 * time.Second
-	msgWriteDeadline        = 5 * time.Second
+	msgReadDeadline         = 10 * time.Second
+	msgWriteDeadline        = 10 * time.Second
 	keepAlivePeriod         = 2 * time.Minute
-	downloadReadDeadline    = 5 * time.Second
-	maxWaitForChunkDownload = 10 * time.Second
+	downloadReadDeadline    = 10 * time.Second
+	maxWaitForChunkDownload = 20 * time.Second
 	chunkSize               = 16384
 )
 
@@ -154,7 +155,7 @@ func (p *peer) processIncomingMessages() {
 		p.lock.Lock()
 		p.bail = true
 		for {
-			list := make([]int, 0)
+			list := make([]int, 0, len(p.pieces))
 			for index := range p.pieces {
 				list = append(list, index)
 			}
@@ -166,9 +167,8 @@ func (p *peer) processIncomingMessages() {
 			p.lock.Lock()
 			if len(p.pieces) == 0 {
 				p.lock.Unlock()
-				// Notify other peers on the client to check for potential
-				// downloads, since we may have freed up some pieces to
-				// download
+				// Notify other peers on the client to check for potential downloads, since we may have freed up some
+				// pieces to download
 				for _, other := range p.client.currentPeers() {
 					if other != p {
 						other.startDownloadIfNeeded()
@@ -193,6 +193,9 @@ func (p *peer) processIncomingMessages() {
 			if tio.ShouldLogIOError(err) {
 				errs.LogTo(p.logger, err)
 			}
+			if strings.Contains(err.Error(), "connection reset by peer") {
+				p.client.dispatcher.GateKeeper().BlockAddress(p.conn.RemoteAddr())
+			}
 			return
 		}
 		length := binary.BigEndian.Uint32(lengthBuffer)
@@ -201,6 +204,9 @@ func (p *peer) processIncomingMessages() {
 			if err := tio.ReadWithDeadline(p.conn, buffer, msgReadDeadline); err != nil {
 				if tio.ShouldLogIOError(err) {
 					errs.LogTo(p.logger, err)
+				}
+				if strings.Contains(err.Error(), "connection reset by peer") {
+					p.client.dispatcher.GateKeeper().BlockAddress(p.conn.RemoteAddr())
 				}
 				return
 			}
@@ -234,6 +240,7 @@ func (p *peer) processIncomingMessages() {
 				if length != uint32(1+p.has.ByteLength()) {
 					p.lock.Unlock()
 					p.logger.Warn("unexpected bit field length", "expected", p.has.ByteLength(), "actual", length-1)
+					p.client.dispatcher.GateKeeper().BlockAddress(p.conn.RemoteAddr())
 					return
 				}
 				p.has.SetBytes(buffer[1:])
@@ -290,7 +297,7 @@ func (p *peer) startDownloadIfNeeded() {
 func (p *peer) queuePieceDownload(index int) {
 	// Likely need to mark when this was requested and if it goes for too long,
 	// remove from the list of downloading pieces.
-	length := p.client.torrentFile.LengthOf(index)
+	length := int(p.client.torrentFile.LengthOf(index))
 	p.lock.Lock()
 	_, ok := p.pieces[index]
 	if !ok {
