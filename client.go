@@ -171,7 +171,9 @@ func (c *Client) run() {
 		c.finish(err)
 		return
 	}
-	go c.managePeers()
+	ready := make(chan struct{})
+	go c.managePeers(ready)
+	<-ready
 	for {
 		if c.tracker.isSeedingComplete() {
 			c.finish(nil)
@@ -249,9 +251,12 @@ func (c *Client) prepareFile() error {
 // HandleConnection is called by the dispatcher for new connections.
 func (c *Client) HandleConnection(conn net.Conn, logger *slog.Logger, _ dispatcher.ProtocolExtensions, infoHash tfs.InfoHash, sendHandshake bool) {
 	_, storagePath := filepath.Split(c.torrentFile.StoragePath())
-	logger = logger.With("torrent_file", storagePath[:len(storagePath)-len(filepath.Ext(storagePath))])
+	remoteAddr := conn.RemoteAddr()
+	logger = logger.With("torrent_file", storagePath[:len(storagePath)-len(filepath.Ext(storagePath))],
+		"remote_addr", remoteAddr.String())
+	logger.Debug("new connection")
 	if !bytes.Equal(infoHash[:], c.torrentFile.InfoHash[:]) {
-		c.dispatcher.GateKeeper().BlockAddress(conn.RemoteAddr())
+		c.dispatcher.GateKeeper().BlockAddress(remoteAddr)
 		return
 	}
 	if sendHandshake {
@@ -260,7 +265,7 @@ func (c *Client) HandleConnection(conn net.Conn, logger *slog.Logger, _ dispatch
 			if tio.ShouldLogIOError(err) {
 				errs.LogTo(logger, err)
 			}
-			c.dispatcher.GateKeeper().BlockAddress(conn.RemoteAddr())
+			c.dispatcher.GateKeeper().BlockAddress(remoteAddr)
 			return
 		}
 	}
@@ -269,7 +274,7 @@ func (c *Client) HandleConnection(conn net.Conn, logger *slog.Logger, _ dispatch
 		if tio.ShouldLogIOError(err) {
 			errs.LogTo(logger, err)
 		}
-		c.dispatcher.GateKeeper().BlockAddress(conn.RemoteAddr())
+		c.dispatcher.GateKeeper().BlockAddress(remoteAddr)
 		return
 	}
 	p := newPeer(c, conn, logger)
@@ -305,6 +310,7 @@ func (c *Client) HandleConnection(conn net.Conn, logger *slog.Logger, _ dispatch
 }
 
 func (c *Client) connectToPeer(addr string, port int) {
+	slog.Debug("dialing peer", "address", addr, "port", port)
 	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", addr, port), peerDialTimeout)
 	if err != nil {
 		if tio.ShouldLogIOError(err) {
@@ -384,11 +390,12 @@ func (c *Client) closeAllPeers() {
 	}
 }
 
-func (c *Client) managePeers() {
+func (c *Client) managePeers(ready chan<- struct{}) {
 	c.peerMgmtLock.Lock()
 	stopChan := c.peerMgmtStop
 	c.peerMgmtLock.Unlock()
 	c.adjustPeers()
+	ready <- struct{}{}
 	for {
 		select {
 		case <-time.After(peerClearExpiredDownloadsInterval):
@@ -431,6 +438,7 @@ func (c *Client) adjustPeers() {
 		}
 		pd = append(pd, data)
 	}
+	slog.Debug("managing peers", "download_count", downloadCount, "seeding_complete", c.tracker.isSeedingComplete())
 	if downloadCount < c.concurrentDownloads && !c.tracker.isSeedingComplete() {
 		existing := make(map[string]bool)
 		for _, one := range pd {
@@ -438,7 +446,7 @@ func (c *Client) adjustPeers() {
 				existing[host] = true
 			}
 		}
-		count := c.peersWanted - len(pd)
+		count := min(c.peersWanted-len(pd), 4)
 		if count < 1 && len(pd) > 0 {
 			// Find one to disconnect so we can add an alternate
 			sort.Slice(pd, func(i, j int) bool {
@@ -464,15 +472,17 @@ func (c *Client) adjustPeers() {
 			pd = pd[1:]
 			count = 1
 		}
+		slog.Debug("managing peers", "wanted", count)
 		if count > 0 {
-			if count > 4 {
-				count = 4
-			}
 			peerAddressMap := c.tracker.peerAddressesMap()
+			slog.Debug("managing peers", "available", len(peerAddressMap))
 			for i := 0; i < count; i++ {
 				added := false
 				for addr, port := range peerAddressMap {
-					if _, exists := existing[addr]; !exists && !c.dispatcher.GateKeeper().IsAddressStringBlocked(addr) {
+					blocked := c.dispatcher.GateKeeper().IsAddressStringBlocked(addr)
+					slog.Debug("managing peers", "address", addr, "port", port, "exists", existing[addr],
+						"blocked", blocked)
+					if _, exists := existing[addr]; !exists && !blocked {
 						go c.connectToPeer(addr, port)
 						existing[addr] = true
 						added = true

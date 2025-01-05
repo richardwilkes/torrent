@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -25,8 +26,7 @@ const (
 )
 
 var (
-	// TrackerUserAgent will be used as the http client user agent header if
-	// not empty.
+	// TrackerUserAgent will be used as the http client user agent header if not empty.
 	TrackerUserAgent = ""
 	httpClient       = &http.Client{Timeout: 30 * time.Second}
 )
@@ -229,6 +229,7 @@ func (t *tracker) periodicAnnounce() {
 }
 
 func (t *tracker) announce(event string) error {
+	slog.Debug("announce", "url", t.announceURL(event))
 	in, err := t.get(t.announceURL(event))
 	if err != nil {
 		return err
@@ -243,6 +244,7 @@ func (t *tracker) announce(event string) error {
 	peerAddresses := make(map[string]int)
 	switch value := in.PeerAddresses.(type) {
 	case string:
+		slog.Debug("announce string", "peers_list", value)
 		for i := 0; i < len(value); i += 6 {
 			addr := net.IPv4(value[i], value[i+1], value[i+2], value[i+3]).String()
 			if addr != externalAddr {
@@ -265,11 +267,14 @@ func (t *tracker) announce(event string) error {
 		if err = bencode.DecodeBytes(data, &inPeerAddresses); err != nil {
 			return errs.Wrap(err)
 		}
+		slog.Debug("announce map", "count", len(inPeerAddresses))
 		for _, one := range inPeerAddresses {
 			if one.IP != externalAddr && one.Port != 0 {
 				peerAddresses[one.IP] = one.Port
 			}
 		}
+	default:
+		slog.Debug("announce: unknown peer address format", "type", fmt.Sprintf("%T", in.PeerAddresses))
 	}
 	t.lock.Lock()
 	t.interval = in.Interval

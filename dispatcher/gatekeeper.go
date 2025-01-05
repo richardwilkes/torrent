@@ -1,6 +1,7 @@
 package dispatcher
 
 import (
+	"log/slog"
 	"net"
 	"sync"
 	"time"
@@ -33,6 +34,7 @@ func (r *GateKeeper) BlockAddress(addr net.Addr) {
 // BlockAddressString adds the specified address to the incoming blocked list.
 func (r *GateKeeper) BlockAddressString(addr string) {
 	r.addresses.Store(addr, time.Now().Add(blockDuration))
+	slog.Debug("blocked peer", "address", addr)
 }
 
 // IsAddressBlocked returns true if the address is blocked.
@@ -61,6 +63,7 @@ func (r *GateKeeper) prune() {
 			r.addresses.Range(func(addr, expires any) bool {
 				if t, ok := expires.(time.Time); ok && t.Before(time.Now()) {
 					r.addresses.Delete(addr)
+					slog.Debug("unblocked peer", "address", addr)
 				}
 				return true
 			})

@@ -1,9 +1,11 @@
 package main
 
 import (
+	"io"
 	"log"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/richardwilkes/toolbox/cmdline"
@@ -27,18 +29,29 @@ func main() {
 	uploadCap := 100 * 1024
 	port := uint32(1029)
 	seedDuration := time.Minute
+	debug := false
 
-	slog.SetDefault(slog.New(tracelog.New(&tracelog.Config{Sink: log.Default().Writer()})))
+	var logLevel slog.LevelVar
+	slog.SetDefault(slog.New(tracelog.New(&tracelog.Config{
+		Level: &logLevel,
+		Sink:  log.Default().Writer(),
+	})))
 
 	cl := cmdline.New(true)
 	cl.NewGeneralOption(&downloadCap).SetName("down").SetSingle('d').SetUsage("Maximum download rate in bytes/second")
 	cl.NewGeneralOption(&uploadCap).SetName("up").SetSingle('u').SetUsage("Maximum upload rate in bytes/second")
 	cl.NewGeneralOption(&port).SetName("port").SetSingle('p').SetUsage("Port to use for incoming connections")
 	cl.NewGeneralOption(&seedDuration).SetName("seed").SetSingle('s').SetUsage("Seed time")
+	cl.NewGeneralOption(&torrent.TrackerUserAgent).SetName("agent").SetSingle('a').SetUsage("User agent to use")
+	cl.NewGeneralOption(&debug).SetName("debug").SetUsage("Enable debug logging")
 
 	files := cl.Parse(os.Args[1:])
 	if len(files) == 0 {
 		fatal.WithErr(errs.New("No file specified"))
+	}
+
+	if debug {
+		logLevel.Set(slog.LevelDebug)
 	}
 
 	f, err := tfs.NewFileFromPath(files[0])
@@ -66,17 +79,46 @@ func main() {
 		select {
 		case <-completeNotifier:
 			slog.Info("complete")
+			extractFiles(c.TorrentFile())
 		case <-stoppedNotifier:
 			switch c.Status().State {
 			case torrent.Errored:
 				slog.Error("stopped with error")
 			case torrent.Done:
 				slog.Info("stopped")
+				fatal.IfErr(os.Remove(f.StoragePath()))
 			}
 			return
 		case <-t.C:
 			slog.Info(c.Status().String())
 			t.Reset(time.Second)
+		}
+	}
+}
+
+func extractFiles(tf *tfs.File) {
+	files := tf.EmbeddedFiles()
+	dir := "."
+	if len(files) > 1 {
+		dir = filepath.Join(dir, tf.Info.Name)
+		fatal.IfErr(os.Mkdir(dir, 0o750))
+	}
+	for _, file := range files {
+		path := filepath.Join(dir, file.Name())
+		if file.IsDir() {
+			slog.Info("extract", "dir", path)
+			fatal.IfErr(os.Mkdir(path, 0o750))
+		} else {
+			slog.Info("extract", "file", path)
+			r, err := tf.Open(file.Name())
+			fatal.IfErr(err)
+			var f *os.File
+			f, err = os.Create(path)
+			fatal.IfErr(err)
+			_, err = io.Copy(f, r)
+			fatal.IfErr(err)
+			fatal.IfErr(f.Close())
+			fatal.IfErr(r.Close())
 		}
 	}
 }
