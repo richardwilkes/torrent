@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"github.com/richardwilkes/toolbox/cmdline"
@@ -101,11 +102,11 @@ func extractFiles(tf *tfs.File) {
 	files := tf.EmbeddedFiles()
 	dir := "."
 	if len(files) > 1 {
-		dir = filepath.Join(dir, fs.SanitizeName(tf.Info.Name))
+		dir = filepath.Join(dir, sanitizePath(tf.Info.Name))
 		fatal.IfErr(os.Mkdir(dir, 0o750))
 	}
 	for _, file := range files {
-		path := filepath.Join(dir, fs.SanitizeName(file.Name()))
+		path := filepath.Join(dir, sanitizePath(file.Name()))
 		if file.IsDir() {
 			slog.Info("extract", "dir", path)
 			fatal.IfErr(os.Mkdir(path, 0o750))
@@ -122,4 +123,19 @@ func extractFiles(tf *tfs.File) {
 			fatal.IfErr(r.Close())
 		}
 	}
+}
+
+func sanitizePath(path string) string {
+	var list []string
+	path = filepath.Clean(path)
+	for {
+		var file string
+		path, file = filepath.Split(path)
+		list = append(list, fs.SanitizeName(file))
+		if path == "" || (len(path) == 1 && path[0] == os.PathSeparator) {
+			break
+		}
+	}
+	slices.Reverse(list)
+	return filepath.Join(list...)
 }
