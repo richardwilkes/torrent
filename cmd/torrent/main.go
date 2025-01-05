@@ -12,6 +12,7 @@ import (
 	"github.com/richardwilkes/toolbox/errs"
 	"github.com/richardwilkes/toolbox/fatal"
 	"github.com/richardwilkes/toolbox/log/tracelog"
+	"github.com/richardwilkes/toolbox/xio/fs"
 	"github.com/richardwilkes/torrent"
 	"github.com/richardwilkes/torrent/dispatcher"
 	"github.com/richardwilkes/torrent/tfs"
@@ -28,8 +29,8 @@ func main() {
 	downloadCap := 300 * 1024 * 1024
 	uploadCap := 100 * 1024
 	port := uint32(1029)
-	seedDuration := time.Minute
-	debug := false
+	var seedDuration time.Duration
+	var debug bool
 
 	var logLevel slog.LevelVar
 	slog.SetDefault(slog.New(tracelog.New(&tracelog.Config{
@@ -100,11 +101,11 @@ func extractFiles(tf *tfs.File) {
 	files := tf.EmbeddedFiles()
 	dir := "."
 	if len(files) > 1 {
-		dir = filepath.Join(dir, tf.Info.Name)
+		dir = filepath.Join(dir, fs.SanitizeName(tf.Info.Name))
 		fatal.IfErr(os.Mkdir(dir, 0o750))
 	}
 	for _, file := range files {
-		path := filepath.Join(dir, file.Name())
+		path := filepath.Join(dir, fs.SanitizeName(file.Name()))
 		if file.IsDir() {
 			slog.Info("extract", "dir", path)
 			fatal.IfErr(os.Mkdir(path, 0o750))
