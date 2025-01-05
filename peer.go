@@ -6,7 +6,6 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"strings"
 	"sync"
 	"time"
 
@@ -18,8 +17,8 @@ import (
 )
 
 const (
-	msgReadDeadline         = 10 * time.Second
-	msgWriteDeadline        = 10 * time.Second
+	msgReadDeadline         = 5 * time.Second
+	msgWriteDeadline        = 5 * time.Second
 	keepAlivePeriod         = 2 * time.Minute
 	downloadReadDeadline    = 10 * time.Second
 	maxWaitForChunkDownload = 20 * time.Second
@@ -193,9 +192,7 @@ func (p *peer) processIncomingMessages() {
 			if tio.ShouldLogIOError(err) {
 				errs.LogTo(p.logger, err)
 			}
-			if strings.Contains(err.Error(), "connection reset by peer") {
-				p.client.dispatcher.GateKeeper().BlockAddress(p.conn.RemoteAddr())
-			}
+			p.client.dispatcher.GateKeeper().BlockAddress(p.conn.RemoteAddr())
 			return
 		}
 		length := binary.BigEndian.Uint32(lengthBuffer)
@@ -205,9 +202,7 @@ func (p *peer) processIncomingMessages() {
 				if tio.ShouldLogIOError(err) {
 					errs.LogTo(p.logger, err)
 				}
-				if strings.Contains(err.Error(), "connection reset by peer") {
-					p.client.dispatcher.GateKeeper().BlockAddress(p.conn.RemoteAddr())
-				}
+				p.client.dispatcher.GateKeeper().BlockAddress(p.conn.RemoteAddr())
 				return
 			}
 			switch buffer[0] {

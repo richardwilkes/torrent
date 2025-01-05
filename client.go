@@ -25,8 +25,8 @@ import (
 )
 
 const (
-	peerDialTimeout                   = 10 * time.Second
-	peerAdjustmentInterval            = 20 * time.Second
+	peerDialTimeout                   = 5 * time.Second
+	peerAdjustmentInterval            = 15 * time.Second
 	peerClearExpiredDownloadsInterval = time.Minute
 )
 
