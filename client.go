@@ -475,14 +475,20 @@ func (c *Client) adjustPeers() {
 		slog.Debug("managing peers", "wanted", count)
 		if count > 0 {
 			peerAddressMap := c.tracker.peerAddressesMap()
-			slog.Debug("managing peers", "available", len(peerAddressMap))
+			pam := make(map[string]int, len(peerAddressMap))
+			for addr, port := range peerAddressMap {
+				blocked := c.dispatcher.GateKeeper().IsAddressStringBlocked(addr)
+				slog.Debug("managing peers", "address", addr, "port", port, "exists", existing[addr],
+					"blocked", blocked)
+				if _, exists := existing[addr]; !exists && !blocked {
+					pam[addr] = port
+				}
+			}
+			slog.Debug("managing peers", "available", len(pam))
 			for i := 0; i < count; i++ {
 				added := false
-				for addr, port := range peerAddressMap {
-					blocked := c.dispatcher.GateKeeper().IsAddressStringBlocked(addr)
-					slog.Debug("managing peers", "address", addr, "port", port, "exists", existing[addr],
-						"blocked", blocked)
-					if _, exists := existing[addr]; !exists && !blocked {
+				for addr, port := range pam {
+					if _, exists := existing[addr]; !exists && !c.dispatcher.GateKeeper().IsAddressStringBlocked(addr) {
 						go c.connectToPeer(addr, port)
 						existing[addr] = true
 						added = true
