@@ -29,7 +29,7 @@ func main() {
 
 	downloadCap := 300 * 1024 * 1024
 	uploadCap := 100 * 1024
-	port := uint32(1029)
+	var port uint32
 	var seedDuration time.Duration
 	var debug bool
 
@@ -42,7 +42,7 @@ func main() {
 	cl := cmdline.New(true)
 	cl.NewGeneralOption(&downloadCap).SetName("down").SetSingle('d').SetUsage("Maximum download rate in bytes/second")
 	cl.NewGeneralOption(&uploadCap).SetName("up").SetSingle('u').SetUsage("Maximum upload rate in bytes/second")
-	cl.NewGeneralOption(&port).SetName("port").SetSingle('p').SetUsage("Port to use for incoming connections")
+	cl.NewGeneralOption(&port).SetName("port").SetSingle('p').SetUsage("Port to use for incoming connections (use 0 for random)")
 	cl.NewGeneralOption(&seedDuration).SetName("seed").SetSingle('s').SetUsage("Seed time")
 	cl.NewGeneralOption(&torrent.TrackerUserAgent).SetName("agent").SetSingle('a').SetUsage("User agent to use")
 	cl.NewGeneralOption(&debug).SetName("debug").SetUsage("Enable debug logging")
@@ -59,12 +59,14 @@ func main() {
 	f, err := tfs.NewFileFromPath(files[0])
 	fatal.IfErr(err)
 
+	opts := make([]func(*dispatcher.Dispatcher) error, 0, 3)
+	opts = append(opts, dispatcher.GlobalDownloadCap(downloadCap), dispatcher.GlobalUploadCap(uploadCap))
+	if port != 0 {
+		opts = append(opts, dispatcher.PortRange(port, port))
+	}
+
 	var d *dispatcher.Dispatcher
-	d, err = dispatcher.NewDispatcher(
-		dispatcher.GlobalDownloadCap(downloadCap),
-		dispatcher.GlobalUploadCap(uploadCap),
-		dispatcher.PortRange(port, port),
-	)
+	d, err = dispatcher.NewDispatcher(opts...)
 	fatal.IfErr(err)
 
 	completeNotifier := make(chan *torrent.Client, 1)
