@@ -5,7 +5,6 @@ import (
 	"crypto/sha1" //nolint:gosec // The spec requires sha1
 	"io"
 	"io/fs"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -178,7 +177,6 @@ func (f *File) buildFS() {
 	f.lock.Lock()
 	defer f.lock.Unlock()
 	if f.root == nil {
-		slog.Debug("building fs", "storage", f.StoragePath(), "length", f.Info.Length)
 		f.fs = make(map[string]*vfs)
 		storage := f.StoragePath()
 		modTime := time.Now()
@@ -199,11 +197,9 @@ func (f *File) buildFS() {
 			}
 			f.root.children = []*vfs{child}
 			f.fs[child.name] = child
-			slog.Debug("single file", "name", child.name, "length", child.length)
 		} else {
 			var offset int64
-			slog.Debug("multiple files", "count", len(f.Info.Files))
-			for i, one := range f.Info.Files {
+			for _, one := range f.Info.Files {
 				path := filepath.Clean("/" + filepath.Join(one.Path...))
 				dir := f.mkdirs(filepath.Dir(path))
 				child := &vfs{
@@ -217,7 +213,6 @@ func (f *File) buildFS() {
 				dir.children = append(dir.children, child)
 				f.fs[child.name] = child
 				offset += one.Length
-				slog.Debug("file", "name", child.name, "length", child.length, "index", i)
 			}
 		}
 		sortDirs(f.root)

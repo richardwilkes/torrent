@@ -6,7 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"slices"
+	"strings"
 	"time"
 
 	"github.com/richardwilkes/toolbox/atexit"
@@ -114,7 +114,6 @@ func extractFiles(tf *tfs.File) {
 	dir := "."
 	if len(files) > 1 {
 		dir = filepath.Join(dir, sanitizePath(tf.Info.Name))
-		fatal.IfErr(os.Mkdir(dir, 0o750))
 	}
 	for _, file := range files {
 		path := filepath.Join(dir, sanitizePath(file.Name()))
@@ -125,6 +124,8 @@ func extractFiles(tf *tfs.File) {
 			slog.Info("extract", "file", path)
 			r, err := tf.Open(file.Name())
 			fatal.IfErr(err)
+			d, _ := filepath.Split(path)
+			fatal.IfErr(os.MkdirAll(d, 0o750))
 			var f *os.File
 			f, err = os.Create(path)
 			fatal.IfErr(err)
@@ -137,16 +138,12 @@ func extractFiles(tf *tfs.File) {
 }
 
 func sanitizePath(path string) string {
-	var list []string
-	path = filepath.Clean(path)
-	for {
-		var file string
-		path, file = filepath.Split(path)
-		list = append(list, fs.SanitizeName(file))
-		if path == "" || (len(path) == 1 && path[0] == os.PathSeparator) {
-			break
+	parts := strings.Split(filepath.Clean(path), string(os.PathSeparator))
+	list := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part != "" {
+			list = append(list, fs.SanitizeName(part))
 		}
 	}
-	slices.Reverse(list)
 	return filepath.Join(list...)
 }
