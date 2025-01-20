@@ -63,6 +63,7 @@ func main() {
 	fatal.IfErr(err)
 
 	if unpackOnly {
+		slog.Info("unpacking")
 		extractFiles(f)
 		atexit.Exit(0)
 	}
