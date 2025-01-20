@@ -9,6 +9,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/richardwilkes/toolbox/atexit"
 	"github.com/richardwilkes/toolbox/cmdline"
 	"github.com/richardwilkes/toolbox/errs"
 	"github.com/richardwilkes/toolbox/fatal"
@@ -32,6 +33,7 @@ func main() {
 	var port uint32
 	var seedDuration time.Duration
 	var debug bool
+	var unpackOnly bool
 
 	var logLevel slog.LevelVar
 	slog.SetDefault(slog.New(tracelog.New(&tracelog.Config{
@@ -45,6 +47,7 @@ func main() {
 	cl.NewGeneralOption(&port).SetName("port").SetSingle('p').SetUsage("Port to use for incoming connections (use 0 for random)")
 	cl.NewGeneralOption(&seedDuration).SetName("seed").SetSingle('s').SetUsage("Seed time")
 	cl.NewGeneralOption(&torrent.TrackerUserAgent).SetName("agent").SetSingle('a').SetUsage("User agent to use")
+	cl.NewGeneralOption(&unpackOnly).SetName("unpack").SetUsage("Only unpack the torrent")
 	cl.NewGeneralOption(&debug).SetName("debug").SetUsage("Enable debug logging")
 
 	files := cl.Parse(os.Args[1:])
@@ -58,6 +61,11 @@ func main() {
 
 	f, err := tfs.NewFileFromPath(files[0])
 	fatal.IfErr(err)
+
+	if unpackOnly {
+		extractFiles(f)
+		atexit.Exit(0)
+	}
 
 	opts := make([]func(*dispatcher.Dispatcher) error, 0, 3)
 	opts = append(opts, dispatcher.GlobalDownloadCap(downloadCap), dispatcher.GlobalUploadCap(uploadCap))
@@ -92,7 +100,7 @@ func main() {
 				slog.Info("stopped")
 				fatal.IfErr(os.Remove(f.StoragePath()))
 			}
-			return
+			atexit.Exit(0)
 		case <-t.C:
 			slog.Info(c.Status().String())
 			t.Reset(time.Second)
