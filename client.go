@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"math"
@@ -13,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -311,7 +311,7 @@ func (c *Client) HandleConnection(conn net.Conn, logger *slog.Logger, _ dispatch
 
 func (c *Client) connectToPeer(addr string, port int) {
 	slog.Debug("dialing peer", "address", addr, "port", port)
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", addr, port), peerDialTimeout)
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(addr, strconv.Itoa(port)), peerDialTimeout)
 	if err != nil {
 		if tio.ShouldLogIOError(err) {
 			errs.LogTo(c.logger, err)
