@@ -282,9 +282,10 @@ func (t *tracker) announce(event string) error {
 	t.seeders = in.Seeders
 	t.leechers = in.Leechers
 	t.peerAddresses = peerAddresses
-	if event == startedMsg {
+	switch event {
+	case startedMsg:
 		t.started = true
-	} else if event == stoppedMsg {
+	case stoppedMsg:
 		t.started = false
 	}
 	t.lock.Unlock()
