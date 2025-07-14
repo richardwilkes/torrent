@@ -34,6 +34,7 @@ func main() {
 	unpackOnly := flag.Bool("unpack", false, "Only unpack the torrent")
 
 	var logCfg xslog.Config
+	logCfg.Console = true
 	logCfg.AddFlags()
 	xflag.AddVersionFlags()
 	xflag.SetUsage(nil, "", "")
