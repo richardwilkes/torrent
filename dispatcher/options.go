@@ -3,7 +3,7 @@ package dispatcher
 import (
 	"log/slog"
 
-	"github.com/richardwilkes/toolbox/errs"
+	"github.com/richardwilkes/toolbox/v2/errs"
 )
 
 // GlobalDownloadCap sets the maximum download speed of the dispatcher.
@@ -36,13 +36,6 @@ func LogTo(logger *slog.Logger) func(*Dispatcher) error {
 		d.logger = logger
 		return nil
 	}
-}
-
-// UseNATPMP sets the dispatcher to use NatPMP to route traffic through the
-// external gateway.
-func UseNATPMP(d *Dispatcher) error {
-	d.natpmpChan = make(chan any, 1)
-	return nil
 }
 
 // PortRange sets the available ports to listen on to the specified range.

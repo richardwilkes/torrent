@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/richardwilkes/toolbox/errs"
-	"github.com/richardwilkes/toolbox/xio"
+	"github.com/richardwilkes/toolbox/v2/errs"
+	"github.com/richardwilkes/toolbox/v2/xio"
 	"github.com/richardwilkes/torrent/container/bits"
 	"github.com/richardwilkes/torrent/container/spanlist"
 	"github.com/richardwilkes/torrent/tio"

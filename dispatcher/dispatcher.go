@@ -1,6 +1,7 @@
 package dispatcher
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"math"
@@ -10,11 +11,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/richardwilkes/toolbox/errs"
-	"github.com/richardwilkes/toolbox/rate"
-	"github.com/richardwilkes/toolbox/xio"
-	"github.com/richardwilkes/toolbox/xio/network"
-	"github.com/richardwilkes/toolbox/xio/network/natpmp"
+	"github.com/richardwilkes/toolbox/v2/errs"
+	"github.com/richardwilkes/toolbox/v2/rate"
+	"github.com/richardwilkes/toolbox/v2/xio"
+	"github.com/richardwilkes/toolbox/v2/xnet"
 	"github.com/richardwilkes/torrent/tfs"
 	"github.com/richardwilkes/torrent/tio"
 )
@@ -30,11 +30,10 @@ type Dispatcher struct {
 	OutRate             rate.Limiter
 	listener            net.Listener
 	logger              *slog.Logger
-	natpmpChan          chan any
 	gatekeeper          *GateKeeper
 	handlers            sync.Map
 	lastExternalIPCheck time.Time // protected by lock
-	externalIP          string    // protected by lock
+	externalIP          net.IP    // protected by lock
 	internalPort        uint32
 	externalPort        uint32
 	lock                sync.Mutex
@@ -89,19 +88,7 @@ func NewDispatcher(options ...func(*Dispatcher) error) (*Dispatcher, error) {
 			return nil, errs.Newf("unable to listen on any port in the range %d to %d", d.internalPort, d.externalPort)
 		}
 	}
-	if d.natpmpChan != nil {
-		var port int
-		if port, err = natpmp.MapTCP(int(d.internalPort), d.natpmpChan); err != nil {
-			if lerr := d.listener.Close(); lerr != nil {
-				err = errs.Append(err, lerr)
-			}
-			return nil, err
-		}
-		d.externalPort = uint32(port)
-		go d.monitorNatPMP()
-	} else {
-		d.externalPort = d.internalPort
-	}
+	d.externalPort = d.internalPort
 	go d.listen()
 	return d, nil
 }
@@ -145,24 +132,13 @@ func (d *Dispatcher) Deregister(infoHash tfs.InfoHash) {
 }
 
 // ExternalIP returns our external IP address.
-func (d *Dispatcher) ExternalIP() string {
-	const unknownIP = "<unknown>"
+func (d *Dispatcher) ExternalIP() net.IP {
 	d.lock.Lock()
 	defer d.lock.Unlock()
-	if time.Since(d.lastExternalIPCheck) < time.Hour && d.externalIP != "" && d.externalIP != unknownIP {
+	if time.Since(d.lastExternalIPCheck) < time.Hour && d.externalIP != nil {
 		return d.externalIP
 	}
-	d.externalIP = ""
-	if d.natpmpChan != nil {
-		if ip, err := natpmp.ExternalAddress(); err == nil {
-			d.externalIP = ip.String()
-		}
-	} else {
-		d.externalIP = network.ExternalIP(5 * time.Second)
-	}
-	if d.externalIP == "" {
-		d.externalIP = unknownIP
-	}
+	d.externalIP = xnet.ExternalIPAddress(context.Background(), 5*time.Second)
 	d.lastExternalIPCheck = time.Now()
 	return d.externalIP
 }
@@ -172,9 +148,6 @@ func (d *Dispatcher) listen() {
 	for {
 		conn, err := d.listener.Accept()
 		if err != nil {
-			if d.natpmpChan != nil {
-				d.natpmpChan <- nil
-			}
 			d.logger.Info("stopped listening", "port", d.InternalPort())
 			return
 		}
@@ -198,21 +171,6 @@ func (d *Dispatcher) dispatch(conn net.Conn) {
 	if handler, ok := d.handlers.Load(infoHash); ok {
 		if connHandler, ok2 := handler.(ConnectionHandler); ok2 {
 			connHandler.HandleConnection(conn, logger, extensions, infoHash, true)
-		}
-	}
-}
-
-func (d *Dispatcher) monitorNatPMP() {
-	for data := range d.natpmpChan {
-		switch value := data.(type) {
-		case int:
-			old := d.ExternalPort()
-			atomic.StoreUint32(&d.externalPort, uint32(value))
-			d.logger.Info("external port changed", "from", old, "to", value)
-		case error:
-			errs.LogTo(d.logger, value)
-		default:
-			return
 		}
 	}
 }

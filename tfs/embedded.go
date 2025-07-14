@@ -4,7 +4,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/richardwilkes/toolbox/errs"
+	"github.com/richardwilkes/toolbox/v2/errs"
 )
 
 // EmbeddedFile represents a file embedded in torrent file storage.

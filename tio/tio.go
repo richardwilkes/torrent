@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/richardwilkes/toolbox/errs"
+	"github.com/richardwilkes/toolbox/v2/errs"
 )
 
 // ReadWithDeadline reads a buffer from a connection with a deadline.

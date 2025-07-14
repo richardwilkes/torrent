@@ -12,9 +12,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/richardwilkes/toolbox/errs"
-	"github.com/richardwilkes/toolbox/txt"
-	xfs "github.com/richardwilkes/toolbox/xio/fs"
+	"github.com/richardwilkes/toolbox/v2/errs"
+	"github.com/richardwilkes/toolbox/v2/xfilepath"
+	"github.com/richardwilkes/toolbox/v2/xstrings"
 	"github.com/zeebo/bencode"
 )
 
@@ -87,7 +87,7 @@ func NewFileFromBytes(data []byte) (*File, error) {
 		return nil, errs.Wrap(err)
 	}
 	f.InfoHash = sha1.Sum(data) //nolint:gosec // The spec requires sha1
-	f.Path = xfs.SanitizeName(f.Info.Name)
+	f.Path = xfilepath.SanitizeName(f.Info.Name)
 	return &f, nil
 }
 
@@ -151,7 +151,7 @@ func (f *File) EmbeddedFiles() []os.FileInfo {
 		}
 	}
 	sort.Slice(files, func(i, j int) bool {
-		return txt.NaturalLess(files[i].Name(), files[j].Name(), true)
+		return xstrings.NaturalLess(files[i].Name(), files[j].Name(), true)
 	})
 	return files
 }
@@ -259,7 +259,7 @@ func sortDirs(dir *vfs) {
 			iDir := dir.children[i].IsDir()
 			jDir := dir.children[j].IsDir()
 			if iDir == jDir {
-				return txt.NaturalLess(dir.children[i].name, dir.children[j].name, true)
+				return xstrings.NaturalLess(dir.children[i].name, dir.children[j].name, true)
 			}
 			return iDir
 		})

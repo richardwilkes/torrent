@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/richardwilkes/toolbox/txt"
+	"github.com/richardwilkes/toolbox/v2/xtime"
 )
 
 // Possible states.
@@ -53,7 +53,7 @@ func (s *Status) String() string {
 	case Seeding:
 		return fmt.Sprintf("Seeding: Up %.2f MB/s - %s remaining - Peers %dC/%dL/%dP",
 			float64(s.UploadBytesPerSecond)/toMegaBytesPerSecond,
-			txt.FormatDuration(time.Until(s.SeedingStopsAt), false),
+			xtime.FormatDuration(time.Until(s.SeedingStopsAt), false),
 			s.PeersConnected,
 			s.Leechers,
 			s.Seeders)

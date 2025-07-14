@@ -3,7 +3,7 @@ package torrent
 import (
 	"time"
 
-	"github.com/richardwilkes/toolbox/errs"
+	"github.com/richardwilkes/toolbox/v2/errs"
 )
 
 // DownloadCap sets the maximum download speed of the client, subject to the

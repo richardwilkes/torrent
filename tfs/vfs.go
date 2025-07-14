@@ -6,7 +6,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/richardwilkes/toolbox/errs"
+	"github.com/richardwilkes/toolbox/v2/errs"
 )
 
 var _ fs.File = &vfile{}

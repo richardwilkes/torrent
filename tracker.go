@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/richardwilkes/toolbox/errs"
-	"github.com/richardwilkes/toolbox/xio"
+	"github.com/richardwilkes/toolbox/v2/errs"
+	"github.com/richardwilkes/toolbox/v2/xio"
 	"github.com/richardwilkes/torrent/container/bits"
 	"github.com/richardwilkes/torrent/tio"
 	"github.com/zeebo/bencode"
@@ -240,7 +240,10 @@ func (t *tracker) announce(event string) error {
 	if in.Interval < 1 {
 		return errs.New("invalid interval")
 	}
-	externalAddr := t.client.ExternalIP()
+	externalAddr := "<unknown>"
+	if extIP := t.client.ExternalIP(); extIP != nil {
+		externalAddr = extIP.String()
+	}
 	peerAddresses := make(map[string]int)
 	switch value := in.PeerAddresses.(type) {
 	case string:
