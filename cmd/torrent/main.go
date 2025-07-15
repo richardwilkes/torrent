@@ -21,6 +21,7 @@ import (
 func main() {
 	xos.AppName = "Simple Torrent"
 	xos.AppCmdName = "torrent"
+	xos.AppVersion = "1.5.0"
 	xos.License = "Mozilla Public License, version 2.0"
 	xos.CopyrightStartYear = "2017"
 	xos.CopyrightHolder = "Richard A. Wilkes"
