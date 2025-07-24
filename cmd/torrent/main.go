@@ -30,7 +30,7 @@ import (
 func main() {
 	xos.AppName = "Simple Torrent"
 	xos.AppCmdName = "torrent"
-	xos.AppVersion = "1.5.0"
+	xos.AppVersion = "1.5.1"
 	xos.License = "Mozilla Public License, version 2.0"
 	xos.CopyrightStartYear = "2017"
 	xos.CopyrightHolder = "Richard A. Wilkes"
@@ -119,8 +119,9 @@ func extractFiles(tf *tfs.File) {
 			slog.Info("extract", "file", path)
 			r, err := tf.Open(file.Name())
 			xos.ExitIfErr(err)
-			d, _ := filepath.Split(path)
-			xos.ExitIfErr(os.MkdirAll(d, 0o750))
+			if d, _ := filepath.Split(path); d != "" {
+				xos.ExitIfErr(os.MkdirAll(d, 0o750))
+			}
 			var f *os.File
 			f, err = os.Create(path)
 			xos.ExitIfErr(err)
