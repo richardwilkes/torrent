@@ -35,18 +35,14 @@ var protocolIdentifier = []byte{19, 'B', 'i', 't', 'T', 'o', 'r', 'r', 'e', 'n',
 // ReceiveTorrentHandshake reads the torrent protocol handshake.
 func ReceiveTorrentHandshake(conn net.Conn) (extensions ProtocolExtensions, infoHash tfs.InfoHash, err error) {
 	buffer := make([]byte, len(protocolIdentifier))
-	if err = tio.ReadWithDeadline(conn, buffer, HandshakeDeadline); err != nil {
-		return
+	if err = tio.ReadWithDeadline(conn, buffer, HandshakeDeadline); err == nil {
+		if !bytes.Equal(buffer, protocolIdentifier) {
+			err = io.EOF // Invalid protocol identifier; just return EOF to indicate failure.
+		} else if err = tio.ReadWithDeadline(conn, extensions[:], HandshakeDeadline); err == nil {
+			err = tio.ReadWithDeadline(conn, infoHash[:], HandshakeDeadline)
+		}
 	}
-	if !bytes.Equal(buffer, protocolIdentifier) {
-		err = io.EOF // Invalid protocol identifier; just return EOF to indicate failure.
-		return
-	}
-	if err = tio.ReadWithDeadline(conn, extensions[:], HandshakeDeadline); err != nil {
-		return
-	}
-	err = tio.ReadWithDeadline(conn, infoHash[:], HandshakeDeadline)
-	return
+	return extensions, infoHash, err
 }
 
 // SendTorrentHandshake sends the torrent protocol handshake.

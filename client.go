@@ -227,7 +227,7 @@ func (c *Client) prepareFile() error {
 		buffer := make([]byte, c.torrentFile.Info.PieceLength)
 		count := c.torrentFile.PieceCount()
 		lastPieceLength := length - int64(count-1)*c.torrentFile.Info.PieceLength
-		for i := 0; i < count; i++ {
+		for i := range count {
 			pos := int64(i) * c.torrentFile.Info.PieceLength
 			if pos >= original {
 				break

@@ -14,13 +14,14 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/richardwilkes/toolbox/v2/errs"
 	"github.com/richardwilkes/toolbox/v2/xio"
-	"github.com/richardwilkes/torrent/container/bits"
+	"github.com/richardwilkes/torrent/container/fixedbits"
 	"github.com/richardwilkes/torrent/container/spanlist"
 	"github.com/richardwilkes/torrent/tio"
 )
@@ -52,7 +53,7 @@ type peer struct {
 	logger      *slog.Logger
 	conn        net.Conn
 	created     time.Time
-	has         *bits.Bits
+	has         *fixedbits.Bits
 	requestChan chan *pieceRequest
 	writeQueue  chan []byte
 	pieces      map[int]*piece // protected by lock
@@ -90,7 +91,7 @@ func newPeer(client *Client, conn net.Conn, logger *slog.Logger) *peer {
 		logger:      logger,
 		conn:        conn,
 		created:     time.Now(),
-		has:         bits.New(client.torrentFile.PieceCount()),
+		has:         fixedbits.New(client.torrentFile.PieceCount()),
 		requestChan: make(chan *pieceRequest),
 		writeQueue:  make(chan []byte, 32),
 		pieces:      make(map[int]*piece),
@@ -285,7 +286,7 @@ func (p *peer) processIncomingMessages() {
 }
 
 func (p *peer) startDownloadIfNeeded() {
-	var has *bits.Bits
+	var has *fixedbits.Bits
 	p.lock.RLock()
 	if !p.bail && !p.peerChoking && len(p.pieces) == 0 {
 		has = p.has.Clone()
@@ -318,10 +319,7 @@ func (p *peer) queuePieceDownload(index int) {
 			buffer[4] = requestID
 			binary.BigEndian.PutUint32(buffer[5:9], uint32(index))
 			binary.BigEndian.PutUint32(buffer[9:13], uint32(i))
-			size := chunkSize
-			if length-i < chunkSize {
-				size = length - i
-			}
+			size := min(length-i, chunkSize)
 			binary.BigEndian.PutUint32(buffer[13:], uint32(size))
 			p.writeQueue <- buffer
 		}
@@ -516,9 +514,7 @@ func (p *peer) keepAlive(done chan bool) {
 func (p *peer) clearExpiredDownloads() {
 	m := make(map[int]*piece)
 	p.lock.RLock()
-	for k, v := range p.pieces {
-		m[k] = v
-	}
+	maps.Copy(m, p.pieces)
 	p.lock.RUnlock()
 	now := time.Now()
 	for k, v := range m {

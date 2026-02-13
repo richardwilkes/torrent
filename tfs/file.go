@@ -235,7 +235,7 @@ func (f *File) mkdirs(path string) *vfs {
 	path = filepath.Clean(path)
 	dir := f.root
 	cur := "/"
-	for _, part := range strings.Split(path, "/") {
+	for part := range strings.SplitSeq(path, "/") {
 		if part != "" {
 			cur += "/" + part
 			found := false

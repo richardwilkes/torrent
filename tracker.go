@@ -24,7 +24,7 @@ import (
 
 	"github.com/richardwilkes/toolbox/v2/errs"
 	"github.com/richardwilkes/toolbox/v2/xio"
-	"github.com/richardwilkes/torrent/container/bits"
+	"github.com/richardwilkes/torrent/container/fixedbits"
 	"github.com/richardwilkes/torrent/tio"
 	"github.com/zeebo/bencode"
 )
@@ -48,8 +48,8 @@ type tracker struct {
 }
 
 type trackerLockData struct {
-	have            *bits.Bits
-	downloading     *bits.Bits
+	have            *fixedbits.Bits
+	downloading     *fixedbits.Bits
 	who             map[int]*peer
 	peerAddresses   map[string]int
 	seedExpires     time.Time
@@ -84,8 +84,8 @@ func newTracker(client *Client) *tracker {
 		trackerLockData: trackerLockData{
 			totalBytes:     totalBytes,
 			remainingBytes: totalBytes,
-			have:           bits.New(totalPieces),
-			downloading:    bits.New(totalPieces),
+			have:           fixedbits.New(totalPieces),
+			downloading:    fixedbits.New(totalPieces),
 			who:            make(map[int]*peer),
 		},
 	}
@@ -370,16 +370,16 @@ func (t *tracker) clearDownload(index int) {
 	t.lock.Unlock()
 }
 
-func (t *tracker) isInteresting(has *bits.Bits) bool {
+func (t *tracker) isInteresting(has *fixedbits.Bits) bool {
 	t.lock.RLock()
-	i := bits.FirstAvailable(has, t.downloading, t.have)
+	i := fixedbits.FirstAvailable(has, t.downloading, t.have)
 	t.lock.RUnlock()
 	return i != -1
 }
 
-func (t *tracker) selectForDownloading(who *peer, has *bits.Bits) int {
+func (t *tracker) selectForDownloading(who *peer, has *fixedbits.Bits) int {
 	t.lock.Lock()
-	i := bits.FirstAvailable(has, t.downloading, t.have)
+	i := fixedbits.FirstAvailable(has, t.downloading, t.have)
 	if i != -1 {
 		t.who[i] = who
 		t.downloading.Set(i)
