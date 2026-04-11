@@ -41,8 +41,8 @@ func WriteWithDeadline(conn net.Conn, buffer []byte, deadline time.Duration) err
 	return errs.Wrap(err)
 }
 
-// ShouldLogIOErrorOriginal returns true if the error should be logged. (kept for use later)
-func ShouldLogIOErrorOriginal(err error) bool {
+// ShouldLogIOError returns true if the error should be logged.
+func ShouldLogIOError(err error) bool {
 	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return false
 	}
@@ -59,9 +59,4 @@ func ShouldLogIOErrorOriginal(err error) bool {
 		}
 	}
 	return true
-}
-
-// ShouldLogIOError returns true if the error should be logged.
-func ShouldLogIOError(err error) bool {
-	return err != nil && !errors.Is(err, io.EOF)
 }
