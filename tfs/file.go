@@ -234,29 +234,31 @@ func (f *File) mkdirs(path string) *vfs {
 	}
 	path = filepath.Clean(path)
 	dir := f.root
-	cur := "/"
+	var cur strings.Builder
 	for part := range strings.SplitSeq(path, "/") {
-		if part != "" {
-			cur += "/" + part
-			found := false
-			for _, child := range dir.children {
-				if child.name == cur {
-					dir = child
-					found = true
-					break
-				}
+		if part == "" {
+			continue
+		}
+		cur.WriteByte('/')
+		cur.WriteString(part)
+		found := false
+		for _, child := range dir.children {
+			if child.name == cur.String() {
+				dir = child
+				found = true
+				break
 			}
-			if !found {
-				d := &vfs{
-					storage: dir.storage,
-					name:    cur,
-					mode:    os.ModeDir | 0o775,
-					modTime: dir.modTime,
-				}
-				dir.children = append(dir.children, d)
-				f.fs[d.name] = d
-				dir = d
+		}
+		if !found {
+			d := &vfs{
+				storage: dir.storage,
+				name:    cur.String(),
+				mode:    os.ModeDir | 0o775,
+				modTime: dir.modTime,
 			}
+			dir.children = append(dir.children, d)
+			f.fs[d.name] = d
+			dir = d
 		}
 	}
 	return dir
