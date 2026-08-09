@@ -95,3 +95,66 @@ func TestSpan(t *testing.T) {
 	c.Equal(spanlist.Span{Start: 0, Length: 75}, list.Spans[0])
 	c.True(hadOverlap)
 }
+
+func TestSpanInsertIntoGap(t *testing.T) {
+	c := check.New(t)
+
+	var list spanlist.SpanList
+	c.False(list.Insert(&spanlist.Span{Start: 0, Length: 10}))
+	c.False(list.Insert(&spanlist.Span{Start: 40, Length: 10}))
+	c.False(list.Insert(&spanlist.Span{Start: 80, Length: 10}))
+
+	// Insert into the gap between the first and second spans; must land at index 1, not index 0
+	c.False(list.Insert(&spanlist.Span{Start: 20, Length: 10}))
+	c.Equal([]spanlist.Span{
+		{Start: 0, Length: 10},
+		{Start: 20, Length: 10},
+		{Start: 40, Length: 10},
+		{Start: 80, Length: 10},
+	}, list.Spans)
+
+	// Insert into the gap just before the last span; must land at index 4
+	c.False(list.Insert(&spanlist.Span{Start: 60, Length: 5}))
+	c.Equal([]spanlist.Span{
+		{Start: 0, Length: 10},
+		{Start: 20, Length: 10},
+		{Start: 40, Length: 10},
+		{Start: 60, Length: 5},
+		{Start: 80, Length: 10},
+	}, list.Spans)
+
+	// Insert into a gap ahead of everything; must land at index 0
+	c.False(list.Insert(&spanlist.Span{Start: -20, Length: 10}))
+	c.Equal(spanlist.Span{Start: -20, Length: 10}, list.Spans[0])
+	c.Equal(6, len(list.Spans))
+}
+
+func TestSpanInsertOutOfOrder(t *testing.T) {
+	c := check.New(t)
+
+	// Mimic chunks of a piece arriving out of order. Each chunk is 10 bytes long and the piece is 5 chunks long. Only
+	// once all 5 have arrived should the list collapse to a single span covering the whole piece.
+	for _, order := range [][]int{
+		{0, 4, 2, 3, 1},
+		{4, 3, 2, 1, 0},
+		{2, 0, 4, 1, 3},
+		{1, 3, 0, 2, 4},
+		{3, 1, 4, 0, 2},
+	} {
+		var list spanlist.SpanList
+		for i, chunk := range order {
+			c.False(list.Insert(&spanlist.Span{Start: chunk * 10, Length: 10}), "order %v, chunk %d", order, chunk)
+			// The list must always remain sorted, non-overlapping and free of gaps that weren't inserted
+			covered := 0
+			for j, span := range list.Spans {
+				if j > 0 {
+					prev := list.Spans[j-1]
+					c.True(prev.Start+prev.Length < span.Start, "order %v, chunk %d, span %d", order, chunk, j)
+				}
+				covered += span.Length
+			}
+			c.Equal((i+1)*10, covered, "order %v, chunk %d", order, chunk)
+		}
+		c.Equal([]spanlist.Span{{Start: 0, Length: 50}}, list.Spans, "order %v", order)
+	}
+}

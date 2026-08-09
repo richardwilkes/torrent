@@ -9,6 +9,8 @@
 
 package spanlist
 
+import "slices"
+
 // Span holds a starting position and a length.
 type Span struct {
 	Start  int
@@ -38,10 +40,7 @@ func (sl *SpanList) Insert(span *Span) bool {
 	for i, one := range sl.Spans {
 		// Before
 		if span.Start+span.Length < one.Start {
-			spans := make([]Span, len(sl.Spans)+1)
-			copy(spans[1:], sl.Spans)
-			spans[0] = *span
-			sl.Spans = spans
+			sl.Spans = slices.Insert(sl.Spans, i, *span)
 			return false
 		}
 		// Overlap or abut
