@@ -33,7 +33,7 @@ func New(numberOfBits int) *Bits {
 // FirstAvailable returns the first index set in 'has' and is not set in both
 // 'downloading' and 'have', or -1 if no such index exists.
 func FirstAvailable(has, downloading, have *Bits) int {
-	avail := New(min(len(has.data), len(downloading.data), len(have.data)) * 8)
+	avail := New(min(has.size, downloading.size, have.size))
 	for i := range avail.data {
 		avail.data[i] = has.data[i] &^ downloading.data[i] &^ have.data[i]
 	}
@@ -52,9 +52,20 @@ func (b *Bits) Clone() *Bits {
 
 // SetBytes sets the bytes in the buffer into the backing storage for this
 // bits object. If the buffer is shorter than the backing storage, the
-// remaining bytes will remain as-is.
+// remaining bytes will remain as-is. Any bits in the buffer beyond the number
+// of bits this object holds are discarded.
 func (b *Bits) SetBytes(buffer []byte) {
 	copy(b.data, buffer)
+	b.clearSpareBits()
+}
+
+// clearSpareBits clears any bits in the backing storage that are beyond the
+// number of bits this object holds, since they aren't valid and would
+// otherwise be seen as set by the methods that scan the backing storage.
+func (b *Bits) clearSpareBits() {
+	if spare := len(b.data)*8 - b.size; spare > 0 {
+		b.data[len(b.data)-1] &= 0xFF << uint(spare)
+	}
 }
 
 // ByteLength returns the number of bytes required to hold the data.

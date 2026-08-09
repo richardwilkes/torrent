@@ -13,8 +13,10 @@ import (
 	"encoding/binary"
 	"io"
 	"log/slog"
+	"maps"
 	"math"
 	"net"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -82,7 +84,7 @@ func TestMalformedMessagesAreRejected(t *testing.T) {
 	} {
 		t.Run(one.name, func(t *testing.T) {
 			c := check.New(t)
-			conn, done := startTestPeer(t, d)
+			conn, _, done := startTestPeer(t, newTestClient(d))
 			defer xio.CloseIgnoringErrors(conn)
 			_, werr := conn.Write(one.message)
 			c.NoError(werr)
@@ -103,7 +105,7 @@ func TestWellFormedMessagesAreAccepted(t *testing.T) {
 	d, err := dispatcher.NewDispatcher()
 	c.NoError(err)
 	defer d.Stop()
-	conn, done := startTestPeer(t, d)
+	conn, _, done := startTestPeer(t, newTestClient(d))
 	defer xio.CloseIgnoringErrors(conn)
 
 	// Tell the peer we have piece 0, which should result in it telling us it is interested
@@ -122,6 +124,51 @@ func TestWellFormedMessagesAreAccepted(t *testing.T) {
 	}
 }
 
+// TestBitFieldSpareBitsAreIgnored verifies that a peer that sets the spare bits at the end of its bit field, which
+// correspond to pieces that don't exist, can't get us to request a piece index beyond the end of the torrent. Doing so
+// would panic when the piece it returned was validated against the piece hashes.
+func TestBitFieldSpareBitsAreIgnored(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+	client := newTestClient(d)
+
+	// We already have every piece in the torrent, so only the spare bits could be seen as something to download
+	client.tracker.lock.Lock()
+	for i := range testPieceCount {
+		client.tracker.have.Set(i)
+	}
+	client.tracker.lock.Unlock()
+
+	conn, p, done := startTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+
+	// The peer claims to have everything, including the pieces that don't exist
+	c.Equal(1, p.has.ByteLength())
+	_, err = conn.Write(newTestMessage(bitFieldID, 0xFF))
+	c.NoError(err)
+	_, err = conn.Write(newTestMessage(unchokeID))
+	c.NoError(err)
+
+	// Nothing should be requested, since there is nothing left to download
+	c.NoError(conn.SetReadDeadline(time.Now().Add(time.Second)))
+	buffer := make([]byte, 64)
+	if n, rerr := conn.Read(buffer); rerr == nil {
+		t.Fatalf("the peer had nothing to say, but sent %v", buffer[:n])
+	}
+	p.lock.RLock()
+	requested := slices.Sorted(maps.Keys(p.pieces))
+	p.lock.RUnlock()
+	c.Equal(0, len(requested), "requested piece indexes: %v", requested)
+
+	select {
+	case <-done:
+		t.Fatal("peer closed the connection for well-formed messages")
+	default:
+	}
+}
+
 // newTestMessage creates a peer message with the given ID and payload, prefixed with its length.
 func newTestMessage(id byte, payload ...byte) []byte {
 	buffer := make([]byte, 5+len(payload))
@@ -131,18 +178,17 @@ func newTestMessage(id byte, payload ...byte) []byte {
 	return buffer
 }
 
-// startTestPeer returns a connection to a peer that is processing incoming messages, along with a channel that will be
-// closed when that peer stops processing them.
-func startTestPeer(t *testing.T, d *dispatcher.Dispatcher) (conn net.Conn, done chan struct{}) {
+// startTestPeer adds a peer to the client and starts it processing incoming messages from the returned connection.
+// The returned channel is closed when that peer stops processing them.
+func startTestPeer(t *testing.T, client *Client) (conn net.Conn, p *peer, done chan struct{}) {
 	t.Helper()
-	client := newTestClient(d)
-	conn, p := newTestPeer(t, client)
+	conn, p = newTestPeer(t, client)
 	done = make(chan struct{})
 	go func() {
 		defer close(done)
 		p.processIncomingMessages()
 	}()
-	return conn, done
+	return conn, p, done
 }
 
 // newTestPeer adds a peer to the client and returns the connection the remote side of that peer would use to talk to
