@@ -55,7 +55,8 @@ type Client struct {
 	tracker                  *tracker
 	peerWaitGroup            *sync.WaitGroup
 	file                     *os.File
-	peerMgmtStop             chan chan bool     // protected by peerMgmtLock
+	peerMgmtStop             chan struct{}      // closed when peer management should stop
+	peerMgmtDone             chan struct{}      // protected by peerMgmtLock
 	peers                    map[net.Conn]*peer // protected by lock
 	stoppedChan              chan bool          // protected by lock
 	concurrentDownloads      int
@@ -66,6 +67,7 @@ type Client struct {
 	id                       dispatcher.PeerID
 	stopRequested            bool // protected by lock
 	stopped                  bool // protected by lock
+	peerMgmtStopping         bool // protected by peerMgmtLock
 }
 
 // NewClient creates and starts a new client for a torrent.
@@ -86,7 +88,7 @@ func NewClient(d *dispatcher.Dispatcher, torrentFile *tfs.File, options ...func(
 		concurrentDownloads: 4,
 		peersWanted:         32,
 		peerWaitGroup:       &sync.WaitGroup{},
-		peerMgmtStop:        make(chan chan bool, 1),
+		peerMgmtStop:        make(chan struct{}),
 		seedDuration:        96 * time.Hour,
 		peers:               make(map[net.Conn]*peer),
 		stoppedChan:         make(chan bool, 1),
@@ -180,9 +182,7 @@ func (c *Client) run() {
 		c.finish(err)
 		return
 	}
-	ready := make(chan struct{})
-	go c.managePeers(ready)
-	<-ready
+	c.startPeerManagement()
 	for {
 		if c.tracker.isSeedingComplete() {
 			c.finish(nil)
@@ -302,7 +302,7 @@ func (c *Client) HandleConnection(conn net.Conn, logger *slog.Logger, _ dispatch
 	c.peers[conn] = p
 	c.lock.Unlock()
 	c.peerMgmtLock.Lock()
-	if c.peerMgmtStop == nil {
+	if c.peerMgmtStopping {
 		c.peerMgmtLock.Unlock()
 		return
 	}
@@ -380,18 +380,17 @@ func (c *Client) finish(err error) {
 }
 
 func (c *Client) closeAllPeers() {
-	var ch chan bool
 	c.peerMgmtLock.Lock()
-	if c.peerMgmtStop != nil {
-		ch = make(chan bool)
-		c.peerMgmtStop <- ch
-		c.peerMgmtStop = nil
+	if !c.peerMgmtStopping {
+		c.peerMgmtStopping = true
+		close(c.peerMgmtStop)
 	}
+	done := c.peerMgmtDone
 	c.peerMgmtLock.Unlock()
-	if ch != nil {
+	if done != nil {
 		select {
 		case <-time.After(time.Minute):
-		case <-ch:
+		case <-done:
 		}
 	}
 	for _, p := range c.currentPeers() {
@@ -399,12 +398,30 @@ func (c *Client) closeAllPeers() {
 	}
 }
 
-func (c *Client) managePeers(ready chan<- struct{}) {
+// startPeerManagement starts the goroutine that manages our peers and does not return until it has made its initial
+// adjustment.
+func (c *Client) startPeerManagement() {
+	ready := make(chan struct{})
+	done := make(chan struct{})
 	c.peerMgmtLock.Lock()
-	stopChan := c.peerMgmtStop
+	c.peerMgmtDone = done
 	c.peerMgmtLock.Unlock()
-	c.adjustPeers()
-	ready <- struct{}{}
+	go c.managePeers(ready, done)
+	<-ready
+}
+
+// managePeers periodically adjusts our peers until the client is stopped. 'ready' is closed once the initial
+// adjustment has been made and 'done' is closed once peer management has stopped. Note that c.peerMgmtStop is only
+// ever closed, never replaced, so it may be used without holding the lock.
+func (c *Client) managePeers(ready, done chan struct{}) {
+	defer close(done)
+	select {
+	case <-c.peerMgmtStop:
+		// The client was stopped before we started, so don't connect to any peers
+	default:
+		c.adjustPeers()
+	}
+	close(ready)
 	for {
 		select {
 		case <-time.After(peerClearExpiredDownloadsInterval):
@@ -413,8 +430,7 @@ func (c *Client) managePeers(ready chan<- struct{}) {
 			}
 		case <-time.After(peerAdjustmentInterval):
 			c.adjustPeers()
-		case ch := <-stopChan:
-			ch <- true
+		case <-c.peerMgmtStop:
 			return
 		}
 	}

@@ -176,6 +176,7 @@ func newTestClient(d *dispatcher.Dispatcher) *Client {
 		torrentFile:         newTestTorrentFile(),
 		logger:              slog.New(slog.DiscardHandler),
 		peerWaitGroup:       &sync.WaitGroup{},
+		peerMgmtStop:        make(chan struct{}),
 		peers:               make(map[net.Conn]*peer),
 		stoppedChan:         make(chan bool, 1),
 		concurrentDownloads: 4,
