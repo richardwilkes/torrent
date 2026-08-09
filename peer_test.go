@@ -16,6 +16,8 @@ import (
 	"maps"
 	"math"
 	"net"
+	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"testing"
@@ -167,6 +169,296 @@ func TestBitFieldSpareBitsAreIgnored(t *testing.T) {
 		t.Fatal("peer closed the connection for well-formed messages")
 	default:
 	}
+}
+
+// TestReadDeadlines verifies that we're willing to wait longer than the keep-alive period for the next message from a
+// peer, since a peer with nothing to say would otherwise be disconnected and blocked, while the remainder of a message
+// that has started to arrive is still expected promptly.
+func TestReadDeadlines(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+	client := newTestClient(d)
+	conn, remote := newTestConnPair(t)
+	defer xio.CloseIgnoringErrors(conn)
+	recorder := &deadlineConn{Conn: remote, deadlines: make(chan time.Duration, 8)}
+	p := newPeer(client, recorder, client.logger)
+	go p.processIncomingMessages()
+
+	idle := nextReadDeadline(t, recorder)
+	c.True(idle > keepAlivePeriod, "waiting for a message must outlast the keep-alive period of %v, was %v",
+		keepAlivePeriod, idle)
+
+	// Send just the length prefix of a message, so that the peer starts waiting for the rest of it
+	_, err = conn.Write(newTestMessage(haveID, 0, 0, 0, 0)[:4])
+	c.NoError(err)
+	rest := nextReadDeadline(t, recorder)
+	c.True(rest <= msgReadDeadline, "waiting for the rest of a message must be no more than %v, was %v",
+		msgReadDeadline, rest)
+}
+
+// TestOversizedMessageIsRejected verifies that a peer can't demand an arbitrarily large allocation from us.
+func TestOversizedMessageIsRejected(t *testing.T) {
+	d, err := dispatcher.NewDispatcher()
+	check.New(t).NoError(err)
+	defer d.Stop()
+	for _, one := range []struct {
+		name   string
+		length uint32
+	}{
+		{name: "one byte too large", length: maxMessageLength + 1},
+		{name: "as large as the length prefix allows", length: math.MaxUint32},
+	} {
+		t.Run(one.name, func(t *testing.T) {
+			c := check.New(t)
+			conn, _, done := startTestPeer(t, newTestClient(d))
+			defer xio.CloseIgnoringErrors(conn)
+			buffer := make([]byte, 4)
+			binary.BigEndian.PutUint32(buffer, one.length)
+			_, werr := conn.Write(buffer)
+			c.NoError(werr)
+			// The rejection must happen without waiting for a message body that will never arrive
+			select {
+			case <-done:
+			case <-time.After(msgReadDeadline / 2):
+				t.Fatal("peer did not reject the oversized message")
+			}
+		})
+	}
+}
+
+// TestLargestAllowedMessageIsAccepted verifies that the message size limit isn't off by one.
+func TestLargestAllowedMessageIsAccepted(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+	conn, _, done := startTestPeer(t, newTestClient(d))
+	defer xio.CloseIgnoringErrors(conn)
+
+	// An unknown message ID is ignored, no matter how large it is, as long as it is within the limit
+	_, err = conn.Write(newTestMessage(200, make([]byte, maxMessageLength-1)...))
+	c.NoError(err)
+	select {
+	case <-done:
+		t.Fatal("peer rejected a message that was within the size limit")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// TestInvalidPieceRequestsAreRejected verifies that a peer can't ask us for data that doesn't exist, which would
+// otherwise result in an allocation sized by the peer and a read beyond the end of the piece.
+func TestInvalidPieceRequestsAreRejected(t *testing.T) {
+	d, err := dispatcher.NewDispatcher()
+	check.New(t).NoError(err)
+	defer d.Stop()
+	for _, one := range []struct {
+		name   string
+		index  uint32
+		begin  uint32
+		length uint32
+	}{
+		{name: "no length", length: 0},
+		{name: "one byte more than a chunk", length: chunkSize + 1},
+		{name: "as large as the length field allows", length: math.MaxUint32},
+		{name: "index beyond the last piece", index: testPieceCount, length: chunkSize},
+		{name: "absurd index", index: math.MaxUint32, length: chunkSize},
+		{name: "range extends beyond the end of the piece", begin: chunkSize / 2, length: chunkSize},
+		{name: "offset beyond the end of the piece", begin: chunkSize, length: 1},
+	} {
+		t.Run(one.name, func(t *testing.T) {
+			c := check.New(t)
+			conn, _, done := startTestPeer(t, newTestClient(d))
+			defer xio.CloseIgnoringErrors(conn)
+			_, werr := conn.Write(newTestPieceRequest(requestID, one.index, one.begin, one.length))
+			c.NoError(werr)
+			select {
+			case <-done:
+			case <-time.After(msgReadDeadline / 2):
+				t.Fatal("peer did not reject the invalid piece request")
+			}
+		})
+	}
+}
+
+// TestValidPieceRequestIsServed verifies that the piece request validation doesn't reject legitimate requests.
+func TestValidPieceRequestIsServed(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+	client := newTestClient(d)
+	client.file = newTestStorage(t, client)
+	conn, p, done := startTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+
+	// Let the peer know it isn't choked, so that it will serve requests
+	p.setChoked(false)
+	c.NoError(conn.SetReadDeadline(time.Now().Add(msgReadDeadline)))
+	buffer := make([]byte, 5)
+	_, err = io.ReadFull(conn, buffer)
+	c.NoError(err)
+	c.Equal(newTestMessage(unchokeID), buffer)
+
+	// Ask for the second half of the second piece
+	const begin = chunkSize / 2
+	const length = chunkSize / 2
+	_, err = conn.Write(newTestPieceRequest(requestID, 1, begin, length))
+	c.NoError(err)
+	buffer = make([]byte, 13+length)
+	_, err = io.ReadFull(conn, buffer)
+	c.NoError(err)
+	c.Equal(uint32(9+length), binary.BigEndian.Uint32(buffer[:4]))
+	c.Equal(pieceID, buffer[4])
+	c.Equal(uint32(1), binary.BigEndian.Uint32(buffer[5:9]))
+	c.Equal(uint32(begin), binary.BigEndian.Uint32(buffer[9:13]))
+	c.Equal(testStorageBytes(1, begin, length), buffer[13:])
+
+	select {
+	case <-done:
+		t.Fatal("peer closed the connection for a valid piece request")
+	default:
+	}
+}
+
+// TestPieceRequestFloodIsRejected verifies that a peer that asks for far more than we can deliver is disconnected
+// rather than allowed to grow the pending request queue without bound.
+func TestPieceRequestFloodIsRejected(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+	client := newTestClient(d)
+	client.file = newTestStorage(t, client)
+	conn, p, done := startTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+	p.setChoked(false)
+
+	// Ask for more than will be held onto, without ever reading the responses
+	for i := range maxPendingPieceRequests + 128 {
+		if _, err = conn.Write(newTestPieceRequest(requestID, uint32(i%testPieceCount), 0, chunkSize)); err != nil {
+			break
+		}
+	}
+
+	// The disconnect must come from the flood detection, which happens immediately, rather than from the write
+	// deadline expiring while the responses back up
+	select {
+	case <-done:
+	case <-time.After(msgWriteDeadline / 2):
+		t.Fatal("peer did not reject the piece request flood")
+	}
+}
+
+func TestPendingRequests(t *testing.T) {
+	c := check.New(t)
+	q := newPendingRequests()
+	c.Equal(0, q.count())
+	c.Nil(q.next())
+
+	// Requests are fulfilled in the order they were received
+	for i := range 3 {
+		c.True(q.add(&pieceRequest{index: i, length: chunkSize}))
+	}
+	c.Equal(3, q.count())
+	for i := range 3 {
+		req := q.next()
+		c.NotNil(req)
+		c.Equal(i, req.index)
+		q.removeNext()
+	}
+	c.Nil(q.next())
+	c.Equal(0, q.count())
+
+	// A cancellation removes the request it matches and leaves the others in order
+	for i := range 3 {
+		c.True(q.add(&pieceRequest{index: i, length: chunkSize}))
+	}
+	c.True(q.add(&pieceRequest{index: 1, length: chunkSize, cancel: true}))
+	c.Equal(2, q.count())
+	c.Equal(0, q.next().index)
+	q.removeNext()
+	c.Equal(2, q.next().index)
+	q.removeNext()
+	c.Nil(q.next())
+
+	// A cancellation that matches nothing is harmless
+	c.True(q.add(&pieceRequest{index: 22, length: chunkSize, cancel: true}))
+	c.Equal(0, q.count())
+
+	// Only so many requests will be held onto
+	q = newPendingRequests()
+	for i := range maxPendingPieceRequests {
+		c.True(q.add(&pieceRequest{index: i % testPieceCount, begin: i, length: chunkSize}), "request %d", i)
+	}
+	c.False(q.add(&pieceRequest{index: 0, begin: maxPendingPieceRequests, length: chunkSize}))
+	c.Equal(maxPendingPieceRequests, q.count())
+
+	// Room becomes available again as requests are fulfilled
+	c.NotNil(q.next())
+	q.removeNext()
+	c.Equal(maxPendingPieceRequests-1, q.count())
+	c.True(q.add(&pieceRequest{index: 0, begin: maxPendingPieceRequests, length: chunkSize}))
+	c.Equal(maxPendingPieceRequests, q.count())
+}
+
+// deadlineConn records the read deadlines that are set on a connection.
+type deadlineConn struct {
+	net.Conn
+	deadlines chan time.Duration
+}
+
+func (c *deadlineConn) SetReadDeadline(t time.Time) error {
+	select {
+	case c.deadlines <- time.Until(t):
+	default:
+	}
+	return c.Conn.SetReadDeadline(t)
+}
+
+// nextReadDeadline returns how long the peer is willing to wait for the data it is currently reading.
+func nextReadDeadline(t *testing.T, conn *deadlineConn) time.Duration {
+	t.Helper()
+	select {
+	case deadline := <-conn.deadlines:
+		return deadline
+	case <-time.After(msgReadDeadline):
+		t.Fatal("no read deadline was set")
+		return 0
+	}
+}
+
+// newTestStorage creates the storage file for the test torrent, filled with a pattern that identifies each offset.
+func newTestStorage(t *testing.T, client *Client) *os.File {
+	t.Helper()
+	f, err := os.Create(filepath.Join(t.TempDir(), "test"+tfs.DownloadExt))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { xio.CloseIgnoringErrors(f) })
+	if _, err = f.Write(testStorageBytes(0, 0, int(client.torrentFile.Size()))); err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+// testStorageBytes returns the data the test storage holds for a range within a piece.
+func testStorageBytes(index, begin, length int) []byte {
+	buffer := make([]byte, length)
+	for i := range buffer {
+		buffer[i] = byte((index*chunkSize + begin + i) % 251)
+	}
+	return buffer
+}
+
+// newTestPieceRequest creates a request or cancel message for a range within a piece.
+func newTestPieceRequest(id byte, index, begin, length uint32) []byte {
+	payload := make([]byte, 12)
+	binary.BigEndian.PutUint32(payload[:4], index)
+	binary.BigEndian.PutUint32(payload[4:8], begin)
+	binary.BigEndian.PutUint32(payload[8:], length)
+	return newTestMessage(id, payload...)
 }
 
 // newTestMessage creates a peer message with the given ID and payload, prefixed with its length.

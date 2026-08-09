@@ -27,12 +27,22 @@ import (
 )
 
 const (
+	// idleReadDeadline is how long we'll wait for the next message from a peer. It must be longer than the period
+	// peers send keep-alive messages at, otherwise a peer with nothing to say will be disconnected.
+	idleReadDeadline        = keepAlivePeriod + 30*time.Second
 	msgReadDeadline         = 5 * time.Second
 	msgWriteDeadline        = 5 * time.Second
 	keepAlivePeriod         = 2 * time.Minute
 	downloadReadDeadline    = 10 * time.Second
 	maxWaitForChunkDownload = 20 * time.Second
 	chunkSize               = 16384
+	// maxMessageLength is the largest message we'll accept from a peer, not counting the length prefix. The largest
+	// message we ever expect is a piece message, which is 9 bytes plus a chunk, but bit field messages grow with the
+	// number of pieces in the torrent, so allow a generous amount beyond that.
+	maxMessageLength = 128 * 1024
+	// maxPendingPieceRequests is the number of unfulfilled piece requests we'll hold onto for a peer before deciding
+	// it is flooding us.
+	maxPendingPieceRequests = 512
 )
 
 const (
@@ -99,6 +109,19 @@ func newPieceRequest(buffer []byte, cancel bool) *pieceRequest {
 		length: int(binary.BigEndian.Uint32(buffer[9:])),
 		cancel: cancel,
 	}
+}
+
+// validPieceRequest returns true if the request is for a range of data that actually exists within the torrent and is
+// no larger than a single chunk. Requests from a peer are unverified data, so a request that isn't valid is a sign of
+// either a broken or a hostile peer.
+func (p *peer) validPieceRequest(req *pieceRequest) bool {
+	if req.length < 1 || req.length > chunkSize || req.begin < 0 {
+		return false
+	}
+	if req.index < 0 || req.index >= p.client.torrentFile.PieceCount() {
+		return false
+	}
+	return int64(req.begin)+int64(req.length) <= p.client.torrentFile.LengthOf(req.index)
 }
 
 type piece struct {
@@ -237,7 +260,7 @@ func (p *peer) processIncomingMessages() {
 			p.logger.Warn("Piece download taking too long, closing connection to peer")
 			return
 		}
-		if err := tio.ReadWithDeadline(p.conn, lengthBuffer, msgReadDeadline); err != nil {
+		if err := tio.ReadWithDeadline(p.conn, lengthBuffer, idleReadDeadline); err != nil {
 			if tio.ShouldLogIOError(err) {
 				errs.LogTo(p.logger, err)
 			}
@@ -245,6 +268,11 @@ func (p *peer) processIncomingMessages() {
 			return
 		}
 		length := binary.BigEndian.Uint32(lengthBuffer)
+		if length > maxMessageLength {
+			p.logger.Warn("message too large", "length", length, "max", maxMessageLength)
+			p.client.dispatcher.GateKeeper().BlockAddress(p.conn.RemoteAddr())
+			return
+		}
 		if length > 0 { // Not a keep-alive message
 			buffer := make([]byte, length)
 			if err := tio.ReadWithDeadline(p.conn, buffer, msgReadDeadline); err != nil {
@@ -296,11 +324,17 @@ func (p *peer) processIncomingMessages() {
 				p.lock.Unlock()
 				p.updateInterest()
 			case requestID:
+				req := newPieceRequest(buffer, false)
+				if !p.validPieceRequest(req) {
+					p.logger.Warn("invalid piece request", "index", req.index, "begin", req.begin, "length", req.length)
+					p.client.dispatcher.GateKeeper().BlockAddress(p.conn.RemoteAddr())
+					return
+				}
 				p.lock.RLock()
 				canRequest := !p.amChoking
 				p.lock.RUnlock()
 				if canRequest {
-					p.requestChan <- newPieceRequest(buffer, false)
+					p.requestChan <- req
 				}
 			case pieceID:
 				if err := p.receivedChunk(int(binary.BigEndian.Uint32(buffer[1:5])), int(binary.BigEndian.Uint32(buffer[5:9])), buffer[9:]); err != nil {
@@ -428,56 +462,96 @@ func (p *peer) receivedChunk(index, begin int, buffer []byte) error {
 	return nil
 }
 
+// pendingRequests holds the piece requests that have been received from a peer, but have not been fulfilled yet, in
+// the order they were received.
+type pendingRequests struct {
+	queue map[int]*pieceRequest
+	head  int
+	tail  int
+}
+
+func newPendingRequests() *pendingRequests {
+	return &pendingRequests{queue: make(map[int]*pieceRequest)}
+}
+
+// count returns the number of requests waiting to be fulfilled.
+func (q *pendingRequests) count() int {
+	return len(q.queue)
+}
+
+// add a request to the end of the queue, or remove the request it cancels. Returns false if the queue is already
+// holding as many requests as it is willing to.
+func (q *pendingRequests) add(req *pieceRequest) bool {
+	if req.cancel {
+		for k, one := range q.queue {
+			if req.index == one.index && req.begin == one.begin && req.length == one.length {
+				delete(q.queue, k)
+				break
+			}
+		}
+		return true
+	}
+	if len(q.queue) >= maxPendingPieceRequests {
+		return false
+	}
+	q.queue[q.head] = req
+	q.head++
+	return true
+}
+
+// next returns the request that should be fulfilled next, or nil if there are none. The request remains in the queue
+// until removeNext is called.
+func (q *pendingRequests) next() *pieceRequest {
+	for q.tail < q.head {
+		if req, ok := q.queue[q.tail]; ok {
+			return req
+		}
+		q.tail++
+	}
+	return nil
+}
+
+// removeNext removes the request that the last call to next returned.
+func (q *pendingRequests) removeNext() {
+	delete(q.queue, q.tail)
+	q.tail++
+}
+
 func (p *peer) pieceRequestQueue() {
 	queueChan := make(chan *pieceRequest)
 	go p.processPieceRequests(queueChan)
 	defer close(queueChan)
-	queue := make(map[int]*pieceRequest)
-	var head, tail int
+	queue := newPendingRequests()
+	flooded := false
 	for {
-		if head == tail {
-			req, ok := <-p.requestChan
-			if !ok {
+		var req *pieceRequest
+		var ok bool
+		if next := queue.next(); next == nil {
+			if req, ok = <-p.requestChan; !ok {
 				return
 			}
-			if !req.cancel {
-				queue[head] = req
-				head++
-			}
 		} else {
-			next := queue[tail]
-			if next == nil {
-				tail++
-			} else {
-				select {
-				case req, ok := <-p.requestChan:
-					if !ok {
-						for head != tail {
-							next = queue[tail]
-							if next != nil {
-								queueChan <- next
-								delete(queue, tail)
-							}
-							tail++
-						}
-						return
+			select {
+			case req, ok = <-p.requestChan:
+				if !ok {
+					for one := queue.next(); one != nil; one = queue.next() {
+						queueChan <- one
+						queue.removeNext()
 					}
-					if req.cancel {
-						for k, one := range queue {
-							if req.index == one.index && req.begin == one.begin && req.length == one.length {
-								delete(queue, k)
-								break
-							}
-						}
-					} else {
-						queue[head] = req
-						head++
-					}
-				case queueChan <- next:
-					delete(queue, tail)
-					tail++
+					return
 				}
+			case queueChan <- next:
+				queue.removeNext()
+				continue
 			}
+		}
+		if !queue.add(req) && !flooded {
+			// Drop the connection, but keep draining the channel, since the goroutine feeding it would otherwise be
+			// left blocked trying to hand us another request.
+			flooded = true
+			p.logger.Warn("too many outstanding piece requests", "max", maxPendingPieceRequests)
+			p.client.dispatcher.GateKeeper().BlockAddress(p.conn.RemoteAddr())
+			xio.CloseIgnoringErrors(p.conn)
 		}
 	}
 }
