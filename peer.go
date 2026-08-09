@@ -69,6 +69,29 @@ type pieceRequest struct {
 	cancel bool
 }
 
+// validMessageLength returns true if the given message length, which includes the one-byte message ID, is valid for a
+// message with the given ID. Unknown IDs are accepted, since they are ignored when processed. The bit field message is
+// only checked for a minimum length here, since its exact length must be verified against the size of the bit field
+// when it is processed.
+func validMessageLength(id byte, length uint32) bool {
+	switch id {
+	case chokeID, unchokeID, interestedID, notInterestedID:
+		return length == 1
+	case haveID:
+		return length == 5
+	case bitFieldID:
+		return length >= 1
+	case requestID, cancelID:
+		return length == 13
+	case pieceID:
+		return length >= 9
+	case portID:
+		return length == 3
+	default:
+		return true
+	}
+}
+
 func newPieceRequest(buffer []byte, cancel bool) *pieceRequest {
 	return &pieceRequest{
 		index:  int(binary.BigEndian.Uint32(buffer[1:5])),
@@ -212,6 +235,11 @@ func (p *peer) processIncomingMessages() {
 				if tio.ShouldLogIOError(err) {
 					errs.LogTo(p.logger, err)
 				}
+				p.client.dispatcher.GateKeeper().BlockAddress(p.conn.RemoteAddr())
+				return
+			}
+			if !validMessageLength(buffer[0], length) {
+				p.logger.Warn("invalid message length", "id", int(buffer[0]), "length", length)
 				p.client.dispatcher.GateKeeper().BlockAddress(p.conn.RemoteAddr())
 				return
 			}
