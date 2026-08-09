@@ -126,14 +126,30 @@ func newPeer(client *Client, conn net.Conn, logger *slog.Logger) *peer {
 }
 
 type peerState struct {
-	lastReceived   time.Time
-	bytesRead      int64
-	bytesWritten   int64
-	amChoking      bool
-	amInterested   bool
-	peerChoking    bool
-	peerInterested bool
-	downloading    bool
+	lastReceived    time.Time
+	downloadStarted time.Time
+	bytesRead       int64
+	bytesWritten    int64
+	amChoking       bool
+	amInterested    bool
+	peerChoking     bool
+	peerInterested  bool
+	downloading     bool
+}
+
+// lastProgress returns the time the most recent progress was made on a download, which is either when a chunk was
+// last received or when the current download was started, whichever is later. Note that the download start time is
+// needed because a peer that has just been asked for a piece has yet to send us anything for it.
+func (s *peerState) lastProgress() time.Time {
+	if s.lastReceived.Before(s.downloadStarted) {
+		return s.downloadStarted
+	}
+	return s.lastReceived
+}
+
+// downloadStalled returns true if no progress has been made on the current download within the allowed time.
+func (s *peerState) downloadStalled(now time.Time) bool {
+	return now.Sub(s.lastProgress()) > maxWaitForChunkDownload
 }
 
 func (p *peer) updateInterest() peerState {
@@ -334,10 +350,12 @@ func (p *peer) queuePieceDownload(index int) {
 	p.lock.Lock()
 	_, ok := p.pieces[index]
 	if !ok {
+		now := time.Now()
 		p.pieces[index] = &piece{
 			buffer:  make([]byte, length),
-			timeout: time.Now().Add(downloadReadDeadline),
+			timeout: now.Add(downloadReadDeadline),
 		}
+		p.downloadStarted = now
 	}
 	p.lock.Unlock()
 	if !ok {

@@ -441,6 +441,17 @@ type peerData struct {
 	state peerState
 }
 
+// connectedHosts returns the set of hosts we already have a connection to.
+func connectedHosts(pd []*peerData) map[string]bool {
+	existing := make(map[string]bool, len(pd))
+	for _, one := range pd {
+		if host, _, err := net.SplitHostPort(one.peer.conn.RemoteAddr().String()); err == nil {
+			existing[host] = true
+		}
+	}
+	return existing
+}
+
 func (c *Client) adjustPeers() {
 	peers := c.currentPeers()
 	pd := make([]*peerData, 0, len(peers))
@@ -451,26 +462,22 @@ func (c *Client) adjustPeers() {
 			peer:  p,
 			state: p.updateInterest(),
 		}
-		if data.state.downloading {
-			if data.state.peerChoking || now.Sub(data.state.lastReceived) > maxWaitForChunkDownload {
+		// Peers that are choking us won't be sending us anything, but that is normal protocol behavior, so they are
+		// simply not counted as downloading. Only a peer that is free to send us data and has failed to do so within
+		// the allowed time is considered to be at fault.
+		if data.state.downloading && !data.state.peerChoking {
+			if data.state.downloadStalled(now) {
 				c.dispatcher.GateKeeper().BlockAddress(data.peer.conn.RemoteAddr())
 				xio.CloseIgnoringErrors(data.peer.conn)
 				continue
 			}
-			if !data.state.peerChoking && now.Sub(data.state.lastReceived) <= maxWaitForChunkDownload {
-				downloadCount++
-			}
+			downloadCount++
 		}
 		pd = append(pd, data)
 	}
 	slog.Debug("managing peers", "download_count", downloadCount, "seeding_complete", c.tracker.isSeedingComplete())
 	if downloadCount < c.concurrentDownloads && !c.tracker.isSeedingComplete() {
-		existing := make(map[string]bool)
-		for _, one := range pd {
-			if host, _, err := net.SplitHostPort(one.peer.conn.RemoteAddr().String()); err != nil {
-				existing[host] = true
-			}
-		}
+		existing := connectedHosts(pd)
 		count := min(c.peersWanted-len(pd), 4)
 		if count < 1 && len(pd) > 0 {
 			// Find one to disconnect so we can add an alternate
@@ -484,8 +491,7 @@ func (c *Client) adjustPeers() {
 				if pd[i].state.peerChoking && !pd[j].state.peerChoking {
 					return true
 				}
-				if now.Sub(pd[i].state.lastReceived) > maxWaitForChunkDownload &&
-					now.Sub(pd[j].state.lastReceived) <= maxWaitForChunkDownload {
+				if pd[i].state.downloadStalled(now) && !pd[j].state.downloadStalled(now) {
 					return true
 				}
 				if pd[i].peer.bytesRead < pd[j].peer.bytesRead {
@@ -539,8 +545,7 @@ func (c *Client) adjustPeers() {
 		if pd[i].state.peerInterested && !pd[j].state.peerInterested {
 			return true
 		}
-		if now.Sub(pd[i].state.lastReceived) <= maxWaitForChunkDownload &&
-			now.Sub(pd[j].state.lastReceived) > maxWaitForChunkDownload {
+		if !pd[i].state.downloadStalled(now) && pd[j].state.downloadStalled(now) {
 			return true
 		}
 		if pd[i].state.bytesRead > pd[j].state.bytesRead {

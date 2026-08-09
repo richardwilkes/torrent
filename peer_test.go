@@ -135,6 +135,31 @@ func newTestMessage(id byte, payload ...byte) []byte {
 // closed when that peer stops processing them.
 func startTestPeer(t *testing.T, d *dispatcher.Dispatcher) (conn net.Conn, done chan struct{}) {
 	t.Helper()
+	client := newTestClient(d)
+	conn, p := newTestPeer(t, client)
+	done = make(chan struct{})
+	go func() {
+		defer close(done)
+		p.processIncomingMessages()
+	}()
+	return conn, done
+}
+
+// newTestPeer adds a peer to the client and returns the connection the remote side of that peer would use to talk to
+// it, along with the peer itself.
+func newTestPeer(t *testing.T, client *Client) (conn net.Conn, p *peer) {
+	t.Helper()
+	conn, remote := newTestConnPair(t)
+	p = newPeer(client, remote, client.logger)
+	client.lock.Lock()
+	client.peers[remote] = p
+	client.lock.Unlock()
+	return conn, p
+}
+
+// newTestConnPair returns the two ends of a loopback connection.
+func newTestConnPair(t *testing.T) (local, remote net.Conn) {
+	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -149,23 +174,14 @@ func startTestPeer(t *testing.T, d *dispatcher.Dispatcher) (conn net.Conn, done 
 		}
 		accepted <- one
 	}()
-	conn, err = net.Dial("tcp", listener.Addr().String())
-	if err != nil {
+	if local, err = net.Dial("tcp", listener.Addr().String()); err != nil {
 		t.Fatal(err)
 	}
 	remote, ok := <-accepted
 	if !ok {
 		t.Fatal("unable to accept the connection")
 	}
-	client := newTestClient(d)
-	p := newPeer(client, remote, client.logger)
-	client.peers[remote] = p
-	done = make(chan struct{})
-	go func() {
-		defer close(done)
-		p.processIncomingMessages()
-	}()
-	return conn, done
+	return local, remote
 }
 
 func newTestClient(d *dispatcher.Dispatcher) *Client {
