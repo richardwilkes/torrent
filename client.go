@@ -37,6 +37,9 @@ const (
 	peerDialTimeout                   = 5 * time.Second
 	peerAdjustmentInterval            = 15 * time.Second
 	peerClearExpiredDownloadsInterval = time.Minute
+	// stoppedNotifyTimeout is how long we'll hold onto the stopped notification waiting for it to be accepted. A
+	// buffered channel is expected, so this only comes into play for a consumer that has stopped listening.
+	stoppedNotifyTimeout = time.Minute
 )
 
 const urlQuerySafeBytes = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_.~"
@@ -67,6 +70,7 @@ type Client struct {
 	id                       dispatcher.PeerID
 	stopRequested            bool // protected by lock
 	stopped                  bool // protected by lock
+	stoppedNotified          bool // protected by lock
 	peerMgmtStopping         bool // protected by peerMgmtLock
 }
 
@@ -94,6 +98,7 @@ func NewClient(d *dispatcher.Dispatcher, torrentFile *tfs.File, options ...func(
 		stoppedChan:         make(chan bool, 1),
 	}
 	if _, err := rand.Read(c.id[:]); err != nil {
+		c.closeRateLimiters()
 		return nil, errs.Wrap(err)
 	}
 	for i := range c.id {
@@ -101,6 +106,7 @@ func NewClient(d *dispatcher.Dispatcher, torrentFile *tfs.File, options ...func(
 	}
 	for _, option := range options {
 		if err := option(c); err != nil {
+			c.closeRateLimiters()
 			return nil, err
 		}
 	}
@@ -137,14 +143,39 @@ func (c *Client) Stop(timeout time.Duration) {
 	c.closeAllPeers()
 	select {
 	case <-time.After(timeout):
-		if c.stoppedNotifier != nil {
-			// Notify that we've stopped, but only if we won't block
-			select {
-			case c.stoppedNotifier <- c:
-			default:
-			}
-		}
+		// Notify that we've stopped, but only if we won't block
+		c.notifyStopped(0)
 	case <-c.stoppedChan:
+	}
+}
+
+// notifyStopped delivers the stopped notification, if one was asked for and one hasn't been delivered already. Waits
+// up to 'wait' for it to be accepted, so that a consumer that is no longer listening can't leave us blocked forever.
+// A 'wait' of zero or less means the notification is only delivered if it can be done without blocking.
+func (c *Client) notifyStopped(wait time.Duration) {
+	if c.stoppedNotifier == nil {
+		return
+	}
+	c.lock.Lock()
+	if c.stoppedNotified {
+		c.lock.Unlock()
+		return
+	}
+	if wait <= 0 {
+		// Only claim the notification if it can be handed off right now, so that a later attempt can still deliver it
+		select {
+		case c.stoppedNotifier <- c:
+			c.stoppedNotified = true
+		default:
+		}
+		c.lock.Unlock()
+		return
+	}
+	c.stoppedNotified = true
+	c.lock.Unlock()
+	select {
+	case c.stoppedNotifier <- c:
+	case <-time.After(wait):
 	}
 }
 
@@ -168,9 +199,7 @@ func (c *Client) Status() *Status {
 func (c *Client) run() {
 	defer func() {
 		close(c.stoppedChan)
-		if c.stoppedNotifier != nil {
-			c.stoppedNotifier <- c
-		}
+		c.notifyStopped(stoppedNotifyTimeout)
 	}()
 	if err := c.prepareFile(); err != nil {
 		c.finish(err)
@@ -376,7 +405,15 @@ func (c *Client) finish(err error) {
 		}
 		c.file = nil
 	}
+	c.closeRateLimiters()
 	c.tracker.setState(state)
+}
+
+// closeRateLimiters releases our rate limiters from the dispatcher's limiter tree, which would otherwise continue to
+// traverse them on every tick for the life of the dispatcher.
+func (c *Client) closeRateLimiters() {
+	c.InRate.Close()
+	c.OutRate.Close()
 }
 
 func (c *Client) closeAllPeers() {

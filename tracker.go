@@ -237,6 +237,23 @@ func (t *tracker) periodicAnnounce() {
 	}
 }
 
+// parseCompactPeers extracts the peer addresses from the compact peer list format, which is a series of 6-byte
+// entries, each holding a 4-byte IPv4 address followed by a 2-byte port. A tracker response is unverified data, so a
+// trailing partial entry is ignored rather than allowed to run off the end of the list. Our own address, which the
+// caller passes in, is omitted, as are entries with no port.
+func parseCompactPeers(value, externalAddr string) map[string]int {
+	peerAddresses := make(map[string]int, len(value)/6)
+	for i := 0; i+6 <= len(value); i += 6 {
+		addr := net.IPv4(value[i], value[i+1], value[i+2], value[i+3]).String()
+		if addr != externalAddr {
+			if port := int(binary.BigEndian.Uint16([]byte(value[i+4 : i+6]))); port != 0 {
+				peerAddresses[addr] = port
+			}
+		}
+	}
+	return peerAddresses
+}
+
 func (t *tracker) announce(event string) error {
 	slog.Debug("announce", "url", t.announceURL(event))
 	in, err := t.get(t.announceURL(event))
@@ -257,15 +274,7 @@ func (t *tracker) announce(event string) error {
 	switch value := in.PeerAddresses.(type) {
 	case string:
 		slog.Debug("announce string", "peers_list", value)
-		for i := 0; i < len(value); i += 6 {
-			addr := net.IPv4(value[i], value[i+1], value[i+2], value[i+3]).String()
-			if addr != externalAddr {
-				port := int(binary.BigEndian.Uint16([]byte(value[i+4 : i+6])))
-				if port != 0 {
-					peerAddresses[addr] = port
-				}
-			}
-		}
+		peerAddresses = parseCompactPeers(value, externalAddr)
 	case []map[string]any:
 		var inPeerAddresses []struct {
 			ID   string `bencode:"peer id"`

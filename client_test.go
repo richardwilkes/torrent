@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/richardwilkes/toolbox/v2/check"
+	"github.com/richardwilkes/toolbox/v2/errs"
 	"github.com/richardwilkes/toolbox/v2/xio"
 	"github.com/richardwilkes/torrent/dispatcher"
 )
@@ -248,6 +249,94 @@ func checkConnOpen(t *testing.T, conn net.Conn, expected bool) {
 			t.Fatalf("connection was closed: %v", err)
 		}
 		t.Fatal("connection was not closed")
+	}
+}
+
+// TestRateLimitersAreClosed verifies that our limiters are released from the dispatcher's limiter tree, which would
+// otherwise keep traversing them on every tick for the life of the dispatcher.
+func TestRateLimitersAreClosed(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+
+	client := newTestClient(d)
+	c.False(client.InRate.Closed())
+	c.False(client.OutRate.Closed())
+	client.finish(errStopRequested)
+	c.True(client.InRate.Closed())
+	c.True(client.OutRate.Closed())
+
+	// A client that never starts because one of its options failed must not leave them behind either
+	var partial *Client
+	_, err = NewClient(d, newTestTorrentFile(),
+		func(one *Client) error {
+			partial = one
+			return nil
+		},
+		func(_ *Client) error {
+			return errs.New("option failed")
+		})
+	c.HasError(err)
+	c.NotNil(partial)
+	c.True(partial.InRate.Closed())
+	c.True(partial.OutRate.Closed())
+}
+
+// TestStoppedNotification verifies that exactly one stopped notification is delivered.
+func TestStoppedNotification(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+	client := newTestClient(d)
+	notifier := make(chan *Client, 2)
+	client.stoppedNotifier = notifier
+
+	client.notifyStopped(peerMgmtWait)
+	c.Equal(client, <-notifier)
+
+	// Both the run and the timed-out Stop paths must leave it at the single notification already delivered
+	client.notifyStopped(peerMgmtWait)
+	client.notifyStopped(0)
+	select {
+	case <-notifier:
+		t.Fatal("a second stopped notification was delivered")
+	default:
+	}
+}
+
+// TestStoppedNotificationDoesNotBlockForever verifies that a consumer that has stopped listening doesn't strand the
+// goroutine delivering the notification.
+func TestStoppedNotificationDoesNotBlockForever(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+	client := newTestClient(d)
+	client.stoppedNotifier = make(chan *Client) // Nothing is listening
+
+	waitFor(t, "notifyStopped", func() { client.notifyStopped(100 * time.Millisecond) })
+}
+
+// TestStoppedNotificationIsNotLost verifies that the non-blocking attempt made when Stop times out doesn't consume the
+// notification when there is nothing there to accept it.
+func TestStoppedNotificationIsNotLost(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+	client := newTestClient(d)
+	notifier := make(chan *Client) // Unbuffered, with nothing listening yet
+	client.stoppedNotifier = notifier
+
+	waitFor(t, "notifyStopped", func() { client.notifyStopped(0) })
+	go client.notifyStopped(peerMgmtWait)
+	select {
+	case one := <-notifier:
+		c.Equal(client, one)
+	case <-time.After(peerMgmtWait):
+		t.Fatal("the stopped notification was lost")
 	}
 }
 

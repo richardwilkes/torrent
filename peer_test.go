@@ -24,7 +24,6 @@ import (
 	"time"
 
 	"github.com/richardwilkes/toolbox/v2/check"
-	"github.com/richardwilkes/toolbox/v2/rate"
 	"github.com/richardwilkes/toolbox/v2/xio"
 	"github.com/richardwilkes/torrent/dispatcher"
 	"github.com/richardwilkes/torrent/tfs"
@@ -524,8 +523,8 @@ func newTestConnPair(t *testing.T) (local, remote net.Conn) {
 
 func newTestClient(d *dispatcher.Dispatcher) *Client {
 	c := &Client{
-		InRate:              rate.New(math.MaxInt32, time.Second),
-		OutRate:             rate.New(math.MaxInt32, time.Second),
+		InRate:              d.InRate.New(math.MaxInt32),
+		OutRate:             d.OutRate.New(math.MaxInt32),
 		dispatcher:          d,
 		torrentFile:         newTestTorrentFile(),
 		logger:              slog.New(slog.DiscardHandler),
