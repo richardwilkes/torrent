@@ -73,6 +73,13 @@ func (b *Bits) ByteLength() int {
 	return len(b.data)
 }
 
+// Bytes returns a copy of the backing storage for these bits.
+func (b *Bits) Bytes() []byte {
+	buffer := make([]byte, len(b.data))
+	copy(buffer, b.data)
+	return buffer
+}
+
 // Length returns the number of bits contained.
 func (b *Bits) Length() int {
 	return b.size

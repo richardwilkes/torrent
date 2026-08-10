@@ -25,6 +25,8 @@ import (
 
 	"github.com/richardwilkes/toolbox/v2/check"
 	"github.com/richardwilkes/toolbox/v2/xio"
+	"github.com/richardwilkes/torrent/container/fixedbits"
+	"github.com/richardwilkes/torrent/container/spanlist"
 	"github.com/richardwilkes/torrent/dispatcher"
 	"github.com/richardwilkes/torrent/tfs"
 )
@@ -49,7 +51,7 @@ func TestValidMessageLength(t *testing.T) {
 		{name: "have", id: haveID, valid: []uint32{5}, invalid: []uint32{1, 2, 3, 4, 6, 13}},
 		{name: "bit field", id: bitFieldID, valid: []uint32{1, 2, 100}, invalid: nil},
 		{name: "request", id: requestID, valid: []uint32{13}, invalid: []uint32{1, 5, 9, 12, 14}},
-		{name: "piece", id: pieceID, valid: []uint32{9, 10, 9 + chunkSize}, invalid: []uint32{1, 5, 8}},
+		{name: "piece", id: pieceID, valid: []uint32{10, 9 + chunkSize}, invalid: []uint32{1, 5, 8, 9}},
 		{name: "cancel", id: cancelID, valid: []uint32{13}, invalid: []uint32{1, 5, 9, 12, 14}},
 		{name: "port", id: portID, valid: []uint32{3}, invalid: []uint32{1, 2, 4}},
 		{name: "unknown", id: 200, valid: []uint32{1, 2, 3, 4, 5}, invalid: nil},
@@ -144,6 +146,7 @@ func TestBitFieldSpareBitsAreIgnored(t *testing.T) {
 
 	conn, p, done := startTestPeer(t, client)
 	defer xio.CloseIgnoringErrors(conn)
+	expectBitField(t, conn, 0xF0)
 
 	// The peer claims to have everything, including the pieces that don't exist
 	c.Equal(1, p.has.ByteLength())
@@ -168,6 +171,250 @@ func TestBitFieldSpareBitsAreIgnored(t *testing.T) {
 		t.Fatal("peer closed the connection for well-formed messages")
 	default:
 	}
+}
+
+// TestBitFieldIsSentToNewPeers verifies that a peer is told which pieces we already have as soon as it connects. The
+// only other advertisement we make is for pieces that finish while the peer is connected, so a peer that connects to a
+// client that already has pieces — every peer that connects to one that is seeding — would otherwise see us as having
+// nothing and never ask us for anything at all.
+func TestBitFieldIsSentToNewPeers(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+	client := newTestClient(d)
+	markTestPiecesAvailable(client, 1, 3)
+	conn, _, done := startTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+
+	// The bit field must be the first thing the peer says, and must name exactly the pieces we have
+	expectBitField(t, conn, 0x50)
+
+	select {
+	case <-done:
+		t.Fatal("peer closed the connection")
+	default:
+	}
+}
+
+// TestNoBitFieldIsSentWhenWeHaveNothing verifies that a client with nothing to offer leaves the bit field out, which
+// the protocol allows, rather than sending an empty one.
+func TestNoBitFieldIsSentWhenWeHaveNothing(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+	conn, _, _ := startTestPeer(t, newTestClient(d))
+	defer xio.CloseIgnoringErrors(conn)
+
+	// Tell the peer we have a piece, which makes it interested. That message arriving first proves no bit field came
+	// ahead of it.
+	_, err = conn.Write(newTestMessage(haveID, 0, 0, 0, 0))
+	c.NoError(err)
+	c.NoError(conn.SetReadDeadline(time.Now().Add(msgReadDeadline)))
+	buffer := make([]byte, 5)
+	_, err = io.ReadFull(conn, buffer)
+	c.NoError(err)
+	c.Equal(newTestMessage(interestedID), buffer)
+}
+
+// expectBitField fails the test unless the next message from the peer is a bit field holding the given bytes.
+func expectBitField(t *testing.T, conn net.Conn, bits ...byte) {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(msgReadDeadline)); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, 5+len(bits))
+	if _, err := io.ReadFull(conn, buffer); err != nil {
+		t.Fatal(err)
+	}
+	check.New(t).Equal(newTestMessage(bitFieldID, bits...), buffer, "the peer must announce the pieces we have")
+}
+
+// TestDuplicateChunksDoNotRenewTheDownloadDeadline verifies that a chunk carrying nothing we don't already have
+// doesn't count as progress. A peer that dribbles out duplicate chunks would otherwise hold onto a piece for as long
+// as it liked, at almost no cost to itself, and no other peer could take that piece while it did.
+func TestDuplicateChunksDoNotRenewTheDownloadDeadline(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+	client := newTestClient(d)
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+	p.queuePieceDownload(0)
+	p.lock.RLock()
+	one := p.pieces[0]
+	p.lock.RUnlock()
+	c.NotNil(one)
+
+	// The first half of the piece arrives, which is progress
+	c.NoError(p.receivedChunk(0, 0, testStorageBytes(0, 0, chunkSize/2)))
+	deadline, received := downloadDeadline(p, one)
+
+	// The same half arrives again, carrying nothing new
+	c.NoError(p.receivedChunk(0, 0, testStorageBytes(0, 0, chunkSize/2)))
+	repeated, repeatedReceived := downloadDeadline(p, one)
+	c.Equal(deadline, repeated, "a duplicate chunk must not renew the deadline for the piece")
+	c.Equal(received, repeatedReceived, "a duplicate chunk must not count as progress for the peer")
+
+	// A chunk holding data we don't have yet does renew it
+	c.NoError(p.receivedChunk(0, chunkSize/2, testStorageBytes(0, chunkSize/2, chunkSize/4)))
+	renewed, renewedReceived := downloadDeadline(p, one)
+	c.True(renewed.After(deadline), "a chunk with new data must renew the deadline for the piece")
+	c.True(renewedReceived.After(received), "a chunk with new data must count as progress for the peer")
+
+	// With the deadline no longer being renewed, the piece is given up and the peer dropped
+	one.lock.Lock()
+	one.timeout = time.Now().Add(-time.Second)
+	one.lock.Unlock()
+	p.clearExpiredDownloads()
+	p.lock.RLock()
+	remaining := len(p.pieces)
+	p.lock.RUnlock()
+	c.Equal(0, remaining, "the piece must be given up once its deadline passes")
+}
+
+// downloadDeadline returns the deadline for the given piece along with the last time the peer made progress.
+func downloadDeadline(p *peer, one *piece) (deadline, lastReceived time.Time) {
+	one.lock.RLock()
+	deadline = one.timeout
+	one.lock.RUnlock()
+	p.lock.RLock()
+	lastReceived = p.lastReceived
+	p.lock.RUnlock()
+	return deadline, lastReceived
+}
+
+// TestChunkOutsideThePieceIsRejected verifies that a chunk whose range doesn't fit inside the piece it claims to be
+// part of is refused. The offset is unverified data from the peer, so on a platform where int is 32 bits a large
+// enough one arrives as a negative number, which would slice the buffer out of bounds and panic.
+func TestChunkOutsideThePieceIsRejected(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+	client := newTestClient(d)
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+	p.queuePieceDownload(0)
+
+	for _, one := range []struct {
+		name   string
+		begin  int
+		length int
+	}{
+		{name: "a negative offset", begin: -1, length: 16},
+		{name: "an offset that wrapped around", begin: math.MinInt32, length: 16},
+		{name: "an offset just past the end", begin: chunkSize, length: 1},
+		{name: "a chunk that runs past the end", begin: chunkSize - 8, length: 16},
+		{name: "a chunk larger than the piece", begin: 0, length: chunkSize + 1},
+	} {
+		c.HasError(p.receivedChunk(0, one.begin, make([]byte, one.length)), one.name)
+	}
+
+	// The piece is still there, untouched, and a chunk that does fit is accepted
+	c.NoError(p.receivedChunk(0, chunkSize-16, testStorageBytes(0, chunkSize-16, 16)))
+}
+
+// TestChokeDoesNotCostTheConnectionOrThePiece verifies that a peer choking us in the middle of a piece, which real
+// clients do as a matter of course when they rotate who they upload to, neither drops the connection nor throws away
+// what has already arrived, and that the requests it discarded are made again once it unchokes us.
+func TestChokeDoesNotCostTheConnectionOrThePiece(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+	client := newTestClient(d)
+	conn, p, done := startTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+
+	// The peer unchokes us and we ask it for a piece
+	c.NoError(conn.SetDeadline(time.Now().Add(peerMgmtWait)))
+	_, err = conn.Write(newTestMessage(unchokeID))
+	c.NoError(err)
+	p.queuePieceDownload(0)
+	buffer := make([]byte, 17)
+	_, err = io.ReadFull(conn, buffer)
+	c.NoError(err)
+	c.Equal(newTestPieceRequest(requestID, 0, 0, chunkSize), buffer)
+
+	// It chokes us before sending anything, which must push the deadline for the piece out rather than let it run out
+	_, err = conn.Write(newTestMessage(chokeID))
+	c.NoError(err)
+	p.lock.RLock()
+	one := p.pieces[0]
+	p.lock.RUnlock()
+	waitForDeadlineBeyond(t, one, time.Now().Add(downloadReadDeadline))
+
+	// Nothing gives up on a peer that is choking us, so the piece and the connection both survive
+	p.clearExpiredDownloads()
+	p.lock.RLock()
+	held := len(p.pieces)
+	p.lock.RUnlock()
+	c.Equal(1, held, "the piece must be kept while the peer is choking us")
+	select {
+	case <-done:
+		t.Fatal("the connection was dropped for a peer that only choked us")
+	default:
+	}
+
+	// Once it unchokes us, the request it was told to discard has to be made again
+	_, err = conn.Write(newTestMessage(unchokeID))
+	c.NoError(err)
+	_, err = io.ReadFull(conn, buffer)
+	c.NoError(err)
+	c.Equal(newTestPieceRequest(requestID, 0, 0, chunkSize), buffer)
+}
+
+// waitForDeadlineBeyond fails the test if the piece's deadline isn't pushed out past the given time.
+func waitForDeadlineBeyond(t *testing.T, one *piece, beyond time.Time) {
+	t.Helper()
+	deadline := time.Now().Add(peerMgmtWait)
+	for {
+		one.lock.RLock()
+		timeout := one.timeout
+		one.lock.RUnlock()
+		if timeout.After(beyond) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the deadline for the piece was never pushed out")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestResumeOnlyAsksForTheChunksThatAreMissing verifies that the requests made again after a peer unchokes us cover
+// just the chunks that haven't arrived, rather than asking for the whole piece over again.
+func TestResumeOnlyAsksForTheChunksThatAreMissing(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+	client := newTestClient(d)
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+
+	// A piece three chunks long, of which the first and last have already arrived
+	one := &piece{buffer: make([]byte, 3*chunkSize), timeout: time.Now().Add(-time.Minute)}
+	one.spans.Insert(&spanlist.Span{Start: 0, Length: chunkSize})
+	one.spans.Insert(&spanlist.Span{Start: 2 * chunkSize, Length: chunkSize})
+	p.lock.Lock()
+	p.pieces[2] = one
+	p.lock.Unlock()
+
+	p.resumeDownloads()
+	c.Equal(newTestPieceRequest(requestID, 2, chunkSize, chunkSize), <-p.writeQueue)
+	select {
+	case buffer := <-p.writeQueue:
+		t.Fatalf("only the missing chunk should have been asked for, but %v was too", buffer)
+	default:
+	}
+	one.lock.RLock()
+	timeout := one.timeout
+	one.lock.RUnlock()
+	c.True(timeout.After(time.Now()), "the deadline for the piece must be restarted")
 }
 
 // TestReadDeadlines verifies that we're willing to wait longer than the keep-alive period for the next message from a
@@ -292,6 +539,7 @@ func TestValidPieceRequestIsServed(t *testing.T) {
 	markTestPiecesAvailable(client, 1)
 	conn, p, done := startTestPeer(t, client)
 	defer xio.CloseIgnoringErrors(conn)
+	expectBitField(t, conn, 0x40)
 
 	// Let the peer know it isn't choked, so that it will serve requests
 	p.setChoked(false)
@@ -337,6 +585,7 @@ func TestPieceRequestForPieceWeDontHaveIsIgnored(t *testing.T) {
 	markTestPiecesAvailable(client, 1)
 	conn, p, done := startTestPeer(t, client)
 	defer xio.CloseIgnoringErrors(conn)
+	expectBitField(t, conn, 0x40)
 
 	// Let the peer know it isn't choked, so that it will serve requests
 	p.setChoked(false)
@@ -381,6 +630,7 @@ func TestPieceRequestFloodIsRejected(t *testing.T) {
 	markTestPiecesAvailable(client, 0, 1, 2, 3)
 	conn, p, done := startTestPeer(t, client)
 	defer xio.CloseIgnoringErrors(conn)
+	expectBitField(t, conn, 0xF0)
 
 	// Throttle what may be written before unchoking. Without this, the responses drain out of the pending queue and
 	// into the kernel's socket buffers as fast as the requests arrive, so whether the queue ever reaches its limit
@@ -566,6 +816,180 @@ func nextQueuedMessage(t *testing.T, p *peer) []byte {
 	case <-time.After(peerMgmtWait):
 		t.Fatal("no message was queued up for the peer")
 		return nil
+	}
+}
+
+// TestPieceIsNotClaimedByAPeerThatIsOnItsWayOut verifies that a peer whose teardown has already run doesn't end up
+// holding a piece. Nothing would ever come back for it, so the piece would be marked as being downloaded by a peer
+// that no longer exists and no other peer could take it for as long as the torrent ran.
+func TestPieceIsNotClaimedByAPeerThatIsOnItsWayOut(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+	client := newTestClient(d)
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+
+	// The peer claims a piece just as its own teardown finishes
+	c.Equal(0, client.tracker.selectForDownloading(p, everyTestPiece()))
+	p.lock.Lock()
+	p.bail = true
+	p.lock.Unlock()
+	p.queuePieceDownload(0)
+
+	p.lock.RLock()
+	held := len(p.pieces)
+	p.lock.RUnlock()
+	c.Equal(0, held, "a peer that is bailing out must not take on a piece")
+	client.tracker.lock.RLock()
+	downloading := client.tracker.downloading.IsSet(0)
+	who := client.tracker.who[0]
+	client.tracker.lock.RUnlock()
+	c.False(downloading, "the piece must be left available for another peer")
+	c.Nil(who)
+}
+
+// TestExpiredDownloadsLeaveAnotherPeersClaimAlone verifies that a peer giving up a piece can't take the claim away
+// from the peer that has since taken it up, which would leave two peers downloading the same piece and one of them
+// unable to ever finish it.
+func TestExpiredDownloadsLeaveAnotherPeersClaimAlone(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+	client := newTestClient(d)
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+	otherConn, other := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(otherConn)
+
+	// The first peer still has an expired download recorded for a piece the second peer has since claimed
+	p.lock.Lock()
+	p.pieces[0] = &piece{buffer: make([]byte, chunkSize), timeout: time.Now().Add(-time.Minute)}
+	p.lock.Unlock()
+	c.Equal(0, client.tracker.selectForDownloading(other, everyTestPiece()))
+
+	p.clearExpiredDownloads()
+	client.tracker.lock.RLock()
+	downloading := client.tracker.downloading.IsSet(0)
+	who := client.tracker.who[0]
+	client.tracker.lock.RUnlock()
+	c.True(downloading, "the claim of the peer that is downloading the piece must be left alone")
+	c.Equal(other, who)
+
+	// Its own record of the piece is still given up, and the claim goes away once its owner releases it
+	p.lock.RLock()
+	held := len(p.pieces)
+	p.lock.RUnlock()
+	c.Equal(0, held)
+	client.tracker.clearDownload(0, other)
+	client.tracker.lock.RLock()
+	downloading = client.tracker.downloading.IsSet(0)
+	client.tracker.lock.RUnlock()
+	c.False(downloading)
+}
+
+// everyTestPiece returns a bit set claiming every piece of the test torrent, as a peer that has the whole thing would.
+func everyTestPiece() *fixedbits.Bits {
+	has := fixedbits.New(testPieceCount)
+	for i := range testPieceCount {
+		has.Set(i)
+	}
+	return has
+}
+
+// TestGivingUpOnAPeerClosesTheConnection verifies that a peer we've given up on is disconnected right away. The read
+// loop only looks at the flag between messages and can be parked waiting for the next one for minutes, which would
+// leave a peer we're done with holding one of the limited peer slots for all of that time.
+func TestGivingUpOnAPeerClosesTheConnection(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+	client := newTestClient(d)
+	conn, remote := newTestConnPair(t)
+	recorder := &deadlineConn{Conn: remote, deadlines: make(chan time.Duration, 8)}
+	p := newPeer(client, recorder, client.logger)
+	client.lock.Lock()
+	client.peers[recorder] = p
+	client.lock.Unlock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		p.processIncomingMessages()
+	}()
+
+	// Wait until the peer is parked waiting for the next message, which is past the point where it last looked at the
+	// flag saying we're done with it
+	c.True(nextReadDeadline(t, recorder) > keepAlivePeriod)
+
+	// The peer was asked for a piece and never delivered any of it
+	p.lock.Lock()
+	p.peerChoking = false
+	p.pieces[0] = &piece{buffer: make([]byte, chunkSize), timeout: time.Now().Add(-time.Second)}
+	p.lock.Unlock()
+	p.clearExpiredDownloads()
+
+	select {
+	case <-done:
+	case <-time.After(peerMgmtWait):
+		t.Fatal("the peer we gave up on was left connected")
+	}
+	checkConnOpen(t, conn, false)
+}
+
+// TestRoutineDisconnectsDoNotBlockTheAddress verifies that an address is only blocked for something the peer did
+// wrong. Banning a well-behaved peer for hanging up, or for a connection we closed ourselves during the ordinary
+// churn of rotating peers, keeps us from talking to it for minutes and can leave a small swarm with nothing to
+// connect to.
+func TestRoutineDisconnectsDoNotBlockTheAddress(t *testing.T) {
+	for _, one := range []struct {
+		disconnect func(t *testing.T, local net.Conn, p *peer)
+		name       string
+		blocked    bool
+	}{
+		{
+			name:       "the remote hangs up",
+			disconnect: func(_ *testing.T, local net.Conn, _ *peer) { xio.CloseIgnoringErrors(local) },
+		},
+		{
+			name:       "we close the connection ourselves",
+			disconnect: func(_ *testing.T, _ net.Conn, p *peer) { xio.CloseIgnoringErrors(p.conn) },
+		},
+		{
+			name:       "we give up on the peer",
+			disconnect: func(_ *testing.T, _ net.Conn, p *peer) { p.bailOut() },
+		},
+		{
+			name:    "the peer sends something malformed",
+			blocked: true,
+			disconnect: func(t *testing.T, local net.Conn, _ *peer) {
+				t.Helper()
+				if _, err := local.Write(newTestMessage(haveID)); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(one.name, func(t *testing.T) {
+			c := check.New(t)
+			// A dispatcher of its own, since every one of these connections comes from the same address
+			d, err := dispatcher.NewDispatcher()
+			c.NoError(err)
+			defer d.Stop()
+			conn, p, done := startTestPeer(t, newTestClient(d))
+			defer xio.CloseIgnoringErrors(conn)
+			addr := p.conn.RemoteAddr()
+
+			one.disconnect(t, conn, p)
+			select {
+			case <-done:
+			case <-time.After(peerMgmtWait):
+				t.Fatal("the peer kept processing messages after the connection ended")
+			}
+			c.Equal(one.blocked, d.GateKeeper().IsAddressBlocked(addr))
+		})
 	}
 }
 

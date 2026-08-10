@@ -312,3 +312,22 @@ func TestSetBytesWithOversizedBuffer(t *testing.T) {
 	c.Equal(0, bm.ByteLength())
 	c.False(bm.AnySet())
 }
+
+// TestBytes verifies that the backing storage can be handed out, which is what a bit field message is built from, and
+// that what comes back is a copy rather than the storage itself.
+func TestBytes(t *testing.T) {
+	c := check.New(t)
+	c.Equal([]byte{}, New(0).Bytes())
+
+	bm := New(12)
+	c.Equal([]byte{0, 0}, bm.Bytes())
+	bm.Set(0)
+	bm.Set(11)
+	c.Equal([]byte{0x80, 0x10}, bm.Bytes())
+
+	// Altering what was returned must not alter the bits it came from
+	buffer := bm.Bytes()
+	buffer[0] = 0xFF
+	c.Equal([]byte{0x80, 0x10}, bm.Bytes())
+	c.False(bm.IsSet(1))
+}

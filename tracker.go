@@ -392,11 +392,26 @@ func (t *tracker) get(urlStr string) (*trackerWire, error) {
 	return &in, nil
 }
 
-func (t *tracker) clearDownload(index int) {
+// clearDownload gives up the claim the given peer has on a piece, so that another peer can download it. A claim that
+// has since passed to a different peer is left alone: a peer releasing a piece it no longer holds must not take the
+// claim away from the peer that has since taken it up.
+func (t *tracker) clearDownload(index int, who *peer) {
 	t.lock.Lock()
-	delete(t.who, index)
-	t.downloading.Unset(index)
+	if t.who[index] == who {
+		delete(t.who, index)
+		t.downloading.Unset(index)
+	}
 	t.lock.Unlock()
+}
+
+// bitField returns the bytes describing which pieces we have, or nil if we have none of them.
+func (t *tracker) bitField() []byte {
+	t.lock.RLock()
+	defer t.lock.RUnlock()
+	if !t.have.AnySet() {
+		return nil
+	}
+	return t.have.Bytes()
 }
 
 // hasPiece returns true if the piece with the given index has been downloaded and verified.

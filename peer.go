@@ -36,7 +36,11 @@ const (
 	keepAlivePeriod         = 2 * time.Minute
 	downloadReadDeadline    = 10 * time.Second
 	maxWaitForChunkDownload = 20 * time.Second
-	chunkSize               = dispatcher.ChunkSize
+	// maxChokedDownloadWait is how long we'll hold onto a piece we're in the middle of downloading while the peer is
+	// choking us. A choked peer has been told to discard our requests, so the time it spends choking us can't be held
+	// against it, but the piece can't stay claimed forever either, since no other peer can take it while it is.
+	maxChokedDownloadWait = time.Minute
+	chunkSize             = dispatcher.ChunkSize
 	// maxMessageLength is the largest message we'll accept from a peer, not counting the length prefix. The largest
 	// message we ever expect is a piece message, which is 9 bytes plus a chunk, but bit field messages grow with the
 	// number of pieces in the torrent, so allow a generous amount beyond that.
@@ -109,7 +113,9 @@ func validMessageLength(id byte, length uint32) bool {
 	case requestID, cancelID:
 		return length == 13
 	case pieceID:
-		return length >= 9
+		// A piece message with no chunk data at all carries no progress, so it is refused rather than allowed to pass
+		// through the code that decides whether a peer is still delivering what we asked it for
+		return length > 9
 	case portID:
 		return length == 3
 	default:
@@ -320,6 +326,54 @@ func newHaveMessage(index int) []byte {
 	return buffer
 }
 
+// newBitFieldMessage creates the message that tells a peer which pieces we have.
+func newBitFieldMessage(bits []byte) []byte {
+	buffer := make([]byte, 5+len(bits))
+	binary.BigEndian.PutUint32(buffer[:4], uint32(1+len(bits)))
+	buffer[4] = bitFieldID
+	copy(buffer[5:], bits)
+	return buffer
+}
+
+// newRequestMessage creates the message that asks a peer for a chunk of a piece.
+func newRequestMessage(index, begin, length int) []byte {
+	buffer := make([]byte, 17)
+	binary.BigEndian.PutUint32(buffer[:4], 13)
+	buffer[4] = requestID
+	binary.BigEndian.PutUint32(buffer[5:9], uint32(index))
+	binary.BigEndian.PutUint32(buffer[9:13], uint32(begin))
+	binary.BigEndian.PutUint32(buffer[13:], uint32(length))
+	return buffer
+}
+
+// bailOut records that we're done with this peer and closes the connection. Closing it is what actually ends the
+// exchange: the read loop only looks at the flag between messages and may be parked waiting up to idleReadDeadline for
+// the next one, which would leave a peer we've already given up on holding one of the limited peer slots, and being
+// walked by peer management, for minutes.
+func (p *peer) bailOut() {
+	p.lock.Lock()
+	p.bail = true
+	p.lock.Unlock()
+	xio.CloseIgnoringErrors(p.conn)
+}
+
+// blockAddressOnReadFailure blocks the peer's address unless the failure was routine churn rather than something the
+// peer did wrong. A remote that simply hangs up, and a connection that we closed ourselves — peer rotation, making
+// room for an incoming connection, or bailing out on a piece — would otherwise leave a well-behaved peer banned from
+// both dialing us and being dialed for the full block duration, which can leave a small swarm with no usable peers.
+func (p *peer) blockAddressOnReadFailure(err error) {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
+		return
+	}
+	p.lock.RLock()
+	bailing := p.bail
+	p.lock.RUnlock()
+	if bailing {
+		return
+	}
+	p.client.dispatcher.GateKeeper().BlockAddress(p.conn.RemoteAddr())
+}
+
 func (p *peer) processIncomingMessages() {
 	defer func() {
 		close(p.requestChan)
@@ -334,7 +388,7 @@ func (p *peer) processIncomingMessages() {
 			p.pieces = make(map[int]*piece)
 			p.lock.Unlock()
 			for _, index := range list {
-				p.client.tracker.clearDownload(index)
+				p.client.tracker.clearDownload(index, p)
 			}
 			p.lock.Lock()
 			if len(p.pieces) == 0 {
@@ -350,6 +404,14 @@ func (p *peer) processIncomingMessages() {
 			}
 		}
 	}()
+	// The bit field has to be the first message we send, so it is queued up before anything else can be. Without it, a
+	// peer that connects once we already have pieces — which is every peer that connects to a client that is seeding,
+	// since the pieces are validated before any peer exists — would see us as having nothing and never ask us for
+	// anything. It is only sent when we actually have something to advertise, since a peer that has nothing is free to
+	// leave it out entirely.
+	if bits := p.client.tracker.bitField(); bits != nil {
+		p.writeQueue <- newBitFieldMessage(bits)
+	}
 	// done is closed once nothing more can be written to the peer, releasing the goroutines that would otherwise be
 	// left waiting on a write queue that no longer has a reader.
 	done := make(chan bool)
@@ -369,7 +431,7 @@ func (p *peer) processIncomingMessages() {
 			if tio.ShouldLogIOError(err) {
 				errs.LogTo(p.logger, err)
 			}
-			p.client.dispatcher.GateKeeper().BlockAddress(p.conn.RemoteAddr())
+			p.blockAddressOnReadFailure(err)
 			return
 		}
 		length := binary.BigEndian.Uint32(lengthBuffer)
@@ -384,7 +446,7 @@ func (p *peer) processIncomingMessages() {
 				if tio.ShouldLogIOError(err) {
 					errs.LogTo(p.logger, err)
 				}
-				p.client.dispatcher.GateKeeper().BlockAddress(p.conn.RemoteAddr())
+				p.blockAddressOnReadFailure(err)
 				return
 			}
 			if !validMessageLength(buffer[0], length) {
@@ -397,10 +459,12 @@ func (p *peer) processIncomingMessages() {
 				p.lock.Lock()
 				p.peerChoking = true
 				p.lock.Unlock()
+				p.suspendDownloads()
 			case unchokeID:
 				p.lock.Lock()
 				p.peerChoking = false
 				p.lock.Unlock()
+				p.resumeDownloads()
 				p.startDownloadIfNeeded()
 			case interestedID:
 				p.lock.Lock()
@@ -468,6 +532,51 @@ func (p *peer) processIncomingMessages() {
 	}
 }
 
+// suspendDownloads stops the deadline on the pieces we're in the middle of downloading from running out while the peer
+// is choking us. Choking is normal protocol behavior — most clients rotate who they upload to — and BEP 3 has the peer
+// discard whatever we've asked for while it is in effect, so time spent choked can't be held against the peer or we'd
+// drop the connection, and the partial piece with it, every time one chokes us mid-piece. The deadline is pushed out
+// rather than removed, since the piece can't stay claimed forever if the peer never unchokes us again.
+func (p *peer) suspendDownloads() {
+	p.lock.RLock()
+	pieces := maps.Clone(p.pieces)
+	p.lock.RUnlock()
+	deadline := time.Now().Add(maxChokedDownloadWait)
+	for _, one := range pieces {
+		one.lock.Lock()
+		one.timeout = deadline
+		one.lock.Unlock()
+	}
+}
+
+// resumeDownloads restarts the deadline on the pieces we're in the middle of downloading and asks again for the chunks
+// that haven't arrived, since a peer that was choking us discarded the requests we'd already made.
+func (p *peer) resumeDownloads() {
+	p.lock.Lock()
+	pieces := maps.Clone(p.pieces)
+	now := time.Now()
+	if len(pieces) != 0 {
+		p.downloadStarted = now
+	}
+	p.lock.Unlock()
+	deadline := now.Add(downloadReadDeadline)
+	for index, one := range pieces {
+		var requests [][]byte
+		one.lock.Lock()
+		one.timeout = deadline
+		for i := 0; i < len(one.buffer); i += chunkSize {
+			size := min(len(one.buffer)-i, chunkSize)
+			if !one.spans.Contains(&spanlist.Span{Start: i, Length: size}) {
+				requests = append(requests, newRequestMessage(index, i, size))
+			}
+		}
+		one.lock.Unlock()
+		for _, buffer := range requests {
+			p.writeQueue <- buffer
+		}
+	}
+}
+
 func (p *peer) startDownloadIfNeeded() {
 	var has *fixedbits.Bits
 	p.lock.RLock()
@@ -483,12 +592,14 @@ func (p *peer) startDownloadIfNeeded() {
 }
 
 func (p *peer) queuePieceDownload(index int) {
-	// Likely need to mark when this was requested and if it goes for too long,
-	// remove from the list of downloading pieces.
 	length := int(p.client.torrentFile.LengthOf(index))
 	p.lock.Lock()
+	// The piece has to be given back if we're already on our way out. Our teardown releases everything it finds in the
+	// map and then leaves for good, so a piece recorded after that would be left marked as being downloaded by a peer
+	// that no longer exists, with nothing to ever release it and no other peer able to take it.
+	bailing := p.bail
 	_, ok := p.pieces[index]
-	if !ok {
+	if !bailing && !ok {
 		now := time.Now()
 		p.pieces[index] = &piece{
 			buffer:  make([]byte, length),
@@ -497,16 +608,13 @@ func (p *peer) queuePieceDownload(index int) {
 		p.downloadStarted = now
 	}
 	p.lock.Unlock()
+	if bailing {
+		p.client.tracker.clearDownload(index, p)
+		return
+	}
 	if !ok {
 		for i := 0; i < length; i += chunkSize {
-			buffer := make([]byte, 17)
-			binary.BigEndian.PutUint32(buffer[:4], 13)
-			buffer[4] = requestID
-			binary.BigEndian.PutUint32(buffer[5:9], uint32(index))
-			binary.BigEndian.PutUint32(buffer[9:13], uint32(i))
-			size := min(length-i, chunkSize)
-			binary.BigEndian.PutUint32(buffer[13:], uint32(size))
-			p.writeQueue <- buffer
+			p.writeQueue <- newRequestMessage(index, i, min(length-i, chunkSize))
 		}
 	}
 }
@@ -518,20 +626,33 @@ func (p *peer) receivedChunk(index, begin int, buffer []byte) error {
 	if !ok {
 		return errs.Newf("received unrequested piece %d", index)
 	}
-	last := begin + len(buffer)
-	if last > len(one.buffer) {
+	// The offset is unverified data from the peer. On a platform where int is 32 bits a large enough one arrives as a
+	// negative number, which would make the range that is checked below smaller than the one that is actually written,
+	// so the sign is checked in its own right and the end of the range is computed without being able to overflow.
+	if begin < 0 || len(buffer) > len(one.buffer) || begin > len(one.buffer)-len(buffer) {
 		p.client.dispatcher.GateKeeper().BlockAddress(p.conn.RemoteAddr())
 		return errs.Newf("piece %d would overrun buffer", index)
 	}
+	last := begin + len(buffer)
+	span := spanlist.Span{Start: begin, Length: len(buffer)}
 	one.lock.Lock()
 	now := time.Now()
 	bailIfNotFinish := one.timeout.Before(now)
-	one.timeout = now.Add(downloadReadDeadline)
+	// A chunk that carries nothing we don't already have makes no progress, so it must not renew either of the
+	// deadlines that decide whether this peer is still delivering the piece it was asked for. A peer that dribbles out
+	// duplicate chunks would otherwise hold onto a piece indefinitely, at almost no cost to itself, and no other peer
+	// could take it.
+	progressed := !one.spans.Contains(&span)
+	if progressed {
+		one.timeout = now.Add(downloadReadDeadline)
+	}
 	copy(one.buffer[begin:last], buffer)
-	one.spans.Insert(&spanlist.Span{Start: begin, Length: len(buffer)})
-	p.lock.Lock()
-	p.lastReceived = now
-	p.lock.Unlock()
+	one.spans.Insert(&span)
+	if progressed {
+		p.lock.Lock()
+		p.lastReceived = now
+		p.lock.Unlock()
+	}
 	if len(one.spans.Spans) == 1 && one.spans.Spans[0].Start == 0 && one.spans.Spans[0].Length == len(one.buffer) {
 		if p.client.torrentFile.Validate(index, one.buffer) {
 			var n int
@@ -544,7 +665,7 @@ func (p *peer) receivedChunk(index, begin int, buffer []byte) error {
 			delete(p.pieces, index)
 			p.lock.Unlock()
 			if err != nil && (!errors.Is(err, io.EOF) || n != len(one.buffer)) {
-				p.client.tracker.clearDownload(index)
+				p.client.tracker.clearDownload(index, p)
 				errs.LogTo(p.logger, errs.NewWithCause("unable to write piece", err), "index", index)
 			} else {
 				p.client.tracker.markBlockValid(index)
@@ -563,9 +684,7 @@ func (p *peer) receivedChunk(index, begin int, buffer []byte) error {
 	} else {
 		one.lock.Unlock()
 		if bailIfNotFinish {
-			p.lock.Lock()
-			p.bail = true
-			p.lock.Unlock()
+			p.bailOut()
 		}
 	}
 	return nil
@@ -755,21 +874,36 @@ func (p *peer) keepAlive(done chan bool) {
 }
 
 func (p *peer) clearExpiredDownloads() {
-	m := make(map[int]*piece)
 	p.lock.RLock()
-	maps.Copy(m, p.pieces)
+	m := maps.Clone(p.pieces)
+	choking := p.peerChoking
 	p.lock.RUnlock()
 	now := time.Now()
+	giveUpOnPeer := false
 	for k, v := range m {
 		v.lock.RLock()
 		remove := v.timeout.Before(now)
 		v.lock.RUnlock()
-		if remove {
-			p.lock.Lock()
-			delete(p.pieces, k)
-			p.bail = true
-			p.lock.Unlock()
-			p.client.tracker.clearDownload(k)
+		if !remove {
+			continue
 		}
+		p.lock.Lock()
+		// Only a piece we still hold is released. The snapshot above may name one our own teardown has already given
+		// up, or one that finished while we were looking, and another peer may have claimed it since: releasing that
+		// would take the piece away from the peer that is actually downloading it.
+		_, ours := p.pieces[k]
+		if ours {
+			delete(p.pieces, k)
+		}
+		p.lock.Unlock()
+		if ours {
+			p.client.tracker.clearDownload(k, p)
+			// A peer that is choking us was told to discard our requests, so having nothing to show for the piece
+			// isn't its fault: give up the piece so another peer can take it, but keep the connection.
+			giveUpOnPeer = giveUpOnPeer || !choking
+		}
+	}
+	if giveUpOnPeer {
+		p.bailOut()
 	}
 }

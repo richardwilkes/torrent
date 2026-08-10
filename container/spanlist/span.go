@@ -40,6 +40,21 @@ type SpanList struct {
 	Spans []Span
 }
 
+// Contains returns true if every position in the span is already covered by the list. A span with no length is
+// contained by definition, since there is nothing in it that could be missing. Note that spans that overlap or abut
+// are merged as they are inserted, so a span that is covered at all is covered by a single entry.
+func (sl *SpanList) Contains(span *Span) bool {
+	if span.Length <= 0 {
+		return true
+	}
+	for _, one := range sl.Spans {
+		if span.Start >= one.Start && span.Start+span.Length <= one.Start+one.Length {
+			return true
+		}
+	}
+	return false
+}
+
 // Insert a span into the list. Returns true if the span overlapped an
 // existing span within the list. Note that the new span may reach past the
 // first span it touches, so every span it is merged with has to be considered,

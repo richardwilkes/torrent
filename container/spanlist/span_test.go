@@ -193,3 +193,34 @@ func TestSpanInsertOutOfOrder(t *testing.T) {
 		c.Equal([]spanlist.Span{{Start: 0, Length: 50}}, list.Spans, "order %v", order)
 	}
 }
+
+// TestSpanContains verifies which ranges are reported as already covered, which is what tells a peer whether a chunk
+// that just arrived carried anything new and which chunks of a piece still have to be asked for.
+func TestSpanContains(t *testing.T) {
+	c := check.New(t)
+	var list spanlist.SpanList
+	c.False(list.Contains(&spanlist.Span{Start: 0, Length: 1}), "an empty list covers nothing")
+	c.True(list.Contains(&spanlist.Span{Start: 0, Length: 0}), "a span with no length has nothing to cover")
+
+	list.Insert(&spanlist.Span{Start: 10, Length: 10})
+	list.Insert(&spanlist.Span{Start: 40, Length: 10})
+	for _, one := range []struct {
+		name    string
+		span    spanlist.Span
+		covered bool
+	}{
+		{name: "exactly a span", span: spanlist.Span{Start: 10, Length: 10}, covered: true},
+		{name: "inside a span", span: spanlist.Span{Start: 12, Length: 5}, covered: true},
+		{name: "the start of a span", span: spanlist.Span{Start: 10, Length: 1}, covered: true},
+		{name: "the end of a span", span: spanlist.Span{Start: 19, Length: 1}, covered: true},
+		{name: "the second span", span: spanlist.Span{Start: 40, Length: 10}, covered: true},
+		{name: "overlapping the front of a span", span: spanlist.Span{Start: 9, Length: 5}, covered: false},
+		{name: "overlapping the end of a span", span: spanlist.Span{Start: 15, Length: 10}, covered: false},
+		{name: "spanning the gap between two spans", span: spanlist.Span{Start: 10, Length: 40}, covered: false},
+		{name: "entirely within the gap", span: spanlist.Span{Start: 25, Length: 5}, covered: false},
+		{name: "ahead of everything", span: spanlist.Span{Start: 0, Length: 5}, covered: false},
+		{name: "beyond everything", span: spanlist.Span{Start: 50, Length: 5}, covered: false},
+	} {
+		c.Equal(one.covered, list.Contains(&one.span), one.name)
+	}
+}
