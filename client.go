@@ -12,7 +12,6 @@ package torrent
 import (
 	"bytes"
 	"crypto/rand"
-	"encoding/binary"
 	"errors"
 	"io"
 	"log/slog"
@@ -509,6 +508,75 @@ type peerData struct {
 	state peerState
 }
 
+// worseForRotation returns true if this peer should be given up before the other one when a connection has to be
+// dropped to make room for an alternate.
+//
+// Each key settles the comparison whenever the two peers differ on it, rather than only being able to answer in one
+// direction. Letting a lower-priority key answer for a pair that a higher-priority one has already decided would make
+// each of the two peers rank ahead of the other, which is not an ordering at all and leaves the sorted result
+// arbitrary. Note also that the byte counts come from the state snapshot taken under the peer's lock rather than from
+// the peer itself, which its own goroutines are concurrently updating.
+func (d *peerData) worseForRotation(other *peerData, now time.Time) bool {
+	if d.state.amInterested != other.state.amInterested {
+		return !d.state.amInterested
+	}
+	if d.state.downloading != other.state.downloading {
+		return !d.state.downloading
+	}
+	if d.state.peerChoking != other.state.peerChoking {
+		return d.state.peerChoking
+	}
+	stalled := d.state.downloadStalled(now)
+	if otherStalled := other.state.downloadStalled(now); stalled != otherStalled {
+		return stalled
+	}
+	if d.state.bytesRead != other.state.bytesRead {
+		return d.state.bytesRead < other.state.bytesRead
+	}
+	return d.peer.created.After(other.peer.created)
+}
+
+// betterForUnchoking returns true if this peer should be preferred over the other one when deciding which peers to
+// unchoke. As with worseForRotation, each key settles the comparison whenever the two peers differ on it.
+func (d *peerData) betterForUnchoking(other *peerData, now time.Time) bool {
+	if d.state.amInterested != other.state.amInterested {
+		return d.state.amInterested
+	}
+	if d.state.downloading != other.state.downloading {
+		return d.state.downloading
+	}
+	if d.state.peerChoking != other.state.peerChoking {
+		return !d.state.peerChoking
+	}
+	if d.state.peerInterested != other.state.peerInterested {
+		return d.state.peerInterested
+	}
+	stalled := d.state.downloadStalled(now)
+	if otherStalled := other.state.downloadStalled(now); stalled != otherStalled {
+		return !stalled
+	}
+	if d.state.bytesRead != other.state.bytesRead {
+		return d.state.bytesRead > other.state.bytesRead
+	}
+	if d.state.bytesWritten != other.state.bytesWritten {
+		return d.state.bytesWritten > other.state.bytesWritten
+	}
+	return d.peer.created.After(other.peer.created)
+}
+
+// worseForDropping returns true if this peer should be dropped before the other one when room has to be made for an
+// incoming connection. Only peers that are neither downloading nor of any interest to us are considered for this, so
+// the keys that would separate those cases aren't needed here.
+func (d *peerData) worseForDropping(other *peerData) bool {
+	if d.state.peerChoking != other.state.peerChoking {
+		return d.state.peerChoking
+	}
+	if d.state.bytesRead != other.state.bytesRead {
+		return d.state.bytesRead < other.state.bytesRead
+	}
+	return d.peer.created.After(other.peer.created)
+}
+
 // connectedHosts returns the set of hosts we already have a connection to.
 func connectedHosts(pd []*peerData) map[string]bool {
 	existing := make(map[string]bool, len(pd))
@@ -549,24 +617,7 @@ func (c *Client) adjustPeers() {
 		count := min(c.peersWanted-len(pd), 4)
 		if count < 1 && len(pd) > 0 {
 			// Find one to disconnect so we can add an alternate
-			sort.Slice(pd, func(i, j int) bool {
-				if !pd[i].state.amInterested && pd[j].state.amInterested {
-					return true
-				}
-				if !pd[i].state.downloading && pd[j].state.downloading {
-					return true
-				}
-				if pd[i].state.peerChoking && !pd[j].state.peerChoking {
-					return true
-				}
-				if pd[i].state.downloadStalled(now) && !pd[j].state.downloadStalled(now) {
-					return true
-				}
-				if pd[i].peer.bytesRead < pd[j].peer.bytesRead {
-					return true
-				}
-				return pd[i].peer.created.After(pd[j].peer.created)
-			})
+			sort.Slice(pd, func(i, j int) bool { return pd[i].worseForRotation(pd[j], now) })
 			xio.CloseIgnoringErrors(pd[0].peer.conn)
 			pd = pd[1:]
 			count = 1
@@ -600,30 +651,7 @@ func (c *Client) adjustPeers() {
 			}
 		}
 	}
-	sort.Slice(pd, func(i, j int) bool {
-		if pd[i].state.amInterested && !pd[j].state.amInterested {
-			return true
-		}
-		if pd[i].state.downloading && !pd[j].state.downloading {
-			return true
-		}
-		if !pd[i].state.peerChoking && pd[j].state.peerChoking {
-			return true
-		}
-		if pd[i].state.peerInterested && !pd[j].state.peerInterested {
-			return true
-		}
-		if !pd[i].state.downloadStalled(now) && pd[j].state.downloadStalled(now) {
-			return true
-		}
-		if pd[i].state.bytesRead > pd[j].state.bytesRead {
-			return true
-		}
-		if pd[i].state.bytesWritten > pd[j].state.bytesWritten {
-			return true
-		}
-		return pd[i].peer.created.After(pd[j].peer.created)
-	})
+	sort.Slice(pd, func(i, j int) bool { return pd[i].betterForUnchoking(pd[j], now) })
 	for i, one := range pd {
 		one.peer.setChoked(i > 3 && !one.state.downloading)
 	}
@@ -631,11 +659,11 @@ func (c *Client) adjustPeers() {
 
 func (c *Client) dropPeerIfPossible() bool {
 	peers := c.currentPeers()
-	pd := make([]peerData, 0, len(peers))
+	pd := make([]*peerData, 0, len(peers))
 	for _, p := range peers {
 		state := p.updateInterest()
 		if !state.downloading && !state.amInterested {
-			pd = append(pd, peerData{peer: p, state: state})
+			pd = append(pd, &peerData{peer: p, state: state})
 		}
 	}
 	switch len(pd) {
@@ -643,15 +671,7 @@ func (c *Client) dropPeerIfPossible() bool {
 		return false
 	case 1:
 	default:
-		sort.Slice(pd, func(i, j int) bool {
-			if pd[i].state.peerChoking && !pd[j].state.peerChoking {
-				return true
-			}
-			if pd[i].peer.bytesRead < pd[j].peer.bytesRead {
-				return true
-			}
-			return pd[i].peer.created.After(pd[j].peer.created)
-		})
+		sort.Slice(pd, func(i, j int) bool { return pd[i].worseForDropping(pd[j]) })
 	}
 	xio.CloseIgnoringErrors(pd[0].peer.conn)
 	return true
@@ -667,12 +687,11 @@ func (c *Client) currentPeers() []*peer {
 	return peers
 }
 
+// informPeersWeHavePiece records the piece for advertisement to each of our peers. This is called from the read
+// goroutine of the peer that completed the piece, so it only records what has to be sent and leaves the delivery to
+// each peer's own goroutine, rather than letting a single peer whose write queue has backed up stall it.
 func (c *Client) informPeersWeHavePiece(index int) {
-	buffer := make([]byte, 9)
-	binary.BigEndian.PutUint32(buffer[:4], 5)
-	buffer[4] = haveID
-	binary.BigEndian.PutUint32(buffer[5:], uint32(index))
 	for _, one := range c.currentPeers() {
-		one.writeQueue <- buffer
+		one.queueHave(index)
 	}
 }

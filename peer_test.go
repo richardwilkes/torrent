@@ -418,15 +418,10 @@ func TestUpdateInterestIsSerialized(t *testing.T) {
 	conn, p := newTestPeer(t, client)
 	defer xio.CloseIgnoringErrors(conn)
 
-	// Collect the message IDs the peer would have written, rather than sending them over the connection
-	var sent []byte
-	drained := make(chan struct{})
-	go func() {
-		defer close(drained)
-		for buffer := range p.writeQueue {
-			sent = append(sent, buffer[4])
-		}
-	}()
+	// Run the goroutine that would normally be delivering the peer's state for it
+	done := make(chan bool)
+	defer close(done)
+	go p.processStateChanges(done)
 
 	// Flip whether the peer has anything we want from several goroutines at once, each following its change with the
 	// interest update that the message handlers and peer management would make
@@ -448,94 +443,129 @@ func TestUpdateInterestIsSerialized(t *testing.T) {
 		})
 	}
 	wg.Wait()
-	close(p.writeQueue)
-	<-drained
 
+	// Collect the message IDs the peer would have written, rather than sending them over the connection. Nothing was
+	// draining the queue while the flips were being made, so the delivery only finishes once we start.
+	sent := collectStateMessages(t, p)
 	c.True(len(sent) > 0, "no interest was ever expressed")
-	for i, id := range sent {
+	for i, buffer := range sent {
 		// We start out uninterested, so the messages must alternate, beginning with an interested one
 		expected := interestedID
 		if i%2 == 1 {
 			expected = notInterestedID
 		}
-		if id != expected {
-			t.Fatalf("message %d was %d, not %d; messages %d through %d were %v", i, id, expected,
-				max(0, i-8), i, sent[max(0, i-8):i+1])
+		if buffer[4] != expected {
+			t.Fatalf("message %d was %d, not %d", i, buffer[4], expected)
 		}
 	}
 	p.lock.RLock()
 	amInterested := p.amInterested
 	p.lock.RUnlock()
-	c.Equal(amInterested, sent[len(sent)-1] == interestedID, "the last message must match the interest we recorded")
+	c.Equal(amInterested, sent[len(sent)-1][4] == interestedID, "the last message must match the interest we recorded")
 }
 
-// TestUpdateInterestDoesNotBlockOnAFullWriteQueue verifies that a peer whose write queue has backed up doesn't hold up
-// the goroutines that only need to reassess our interest in it. Peer management walks every peer in turn, so one peer
-// that can't be written to must not be able to stall the management of all the others.
-func TestUpdateInterestDoesNotBlockOnAFullWriteQueue(t *testing.T) {
-	c := check.New(t)
-	d, err := dispatcher.NewDispatcher()
-	c.NoError(err)
-	defer d.Stop()
-	client := newTestClient(d)
-	conn, p := newTestPeer(t, client)
-	defer xio.CloseIgnoringErrors(conn)
-
-	// Fill the write queue, so that the next message sent to it has nowhere to go
-	for range cap(p.writeQueue) {
-		p.writeQueue <- make([]byte, 4)
-	}
-
-	// The peer has a piece we want, so the first update has an interested message to deliver and blocks on the queue
-	p.lock.Lock()
-	p.has.Set(0)
-	p.lock.Unlock()
-	blocked := make(chan struct{})
-	go func() {
-		defer close(blocked)
-		p.updateInterest()
-	}()
-	waitForInterestDelivery(t, p)
-	select {
-	case <-blocked:
-		t.Fatal("the update should still be blocked on the full write queue")
-	default:
-	}
-
-	// Peer management must still be able to reassess this peer without waiting for the queue to drain
-	waitFor(t, "updateInterest", func() { p.updateInterest() })
-
-	// Draining the queue lets the blocked delivery finish
-	<-p.writeQueue
-	select {
-	case <-blocked:
-	case <-time.After(peerMgmtWait):
-		t.Fatal("the delivery never completed once the queue drained")
-	}
-	p.lock.RLock()
-	interested := p.amInterested
-	told := p.toldInterested
-	p.lock.RUnlock()
-	c.True(interested)
-	c.Equal(interested, told, "the peer must end up knowing what we recorded")
-}
-
-// waitForInterestDelivery fails the test if no goroutine takes on the delivery of the interest messages, which is the
-// point past which it can no longer make progress against a full write queue.
-func waitForInterestDelivery(t *testing.T, p *peer) {
+// collectStateMessages returns the messages the peer's state delivery goroutine has queued up, waiting until what the
+// peer has been told about our interest has caught up with what was recorded. Only safe to call once the goroutines
+// making state changes have finished, since it relies on the interest settling.
+func collectStateMessages(t *testing.T, p *peer) [][]byte {
 	t.Helper()
+	var sent [][]byte
 	deadline := time.Now().Add(peerMgmtWait)
 	for {
 		p.lock.RLock()
-		sending := p.sendingInterest
+		interested := p.amInterested
+		caughtUp := p.toldInterested == interested
 		p.lock.RUnlock()
-		if sending {
-			return
+		select {
+		case buffer := <-p.writeQueue:
+			sent = append(sent, buffer)
+			continue
+		default:
+		}
+		// Nothing can still be in flight once the peer has been told what we recorded, the queue is empty and the last
+		// message we collected says what we recorded, since every message in between would have to be one of those
+		if caughtUp && len(sent) != 0 && (sent[len(sent)-1][4] == interestedID) == interested {
+			return sent
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("the interest message was never taken up for delivery")
+			t.Fatal("the peer was never told about the interest that was recorded")
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestStateChangesDoNotBlockOnAFullWriteQueue verifies that a peer whose write queue has backed up can't hold up the
+// goroutines that only need to record something for it to be told about. Peer management walks every peer in turn and
+// a piece that finishes validating is announced to every peer from the read goroutine of the one that completed it, so
+// a single peer that can't be written to must not be able to stall the handling of all the others.
+func TestStateChangesDoNotBlockOnAFullWriteQueue(t *testing.T) {
+	d, err := dispatcher.NewDispatcher()
+	check.New(t).NoError(err)
+	defer d.Stop()
+	for _, one := range []struct {
+		change   func(client *Client, p *peer)
+		name     string
+		expected []byte
+	}{
+		{
+			name: "interest",
+			change: func(_ *Client, p *peer) {
+				p.lock.Lock()
+				p.has.Set(0)
+				p.lock.Unlock()
+				p.updateInterest()
+			},
+			expected: newStateMessage(interestedID),
+		},
+		{
+			name:     "choking",
+			change:   func(_ *Client, p *peer) { p.setChoked(false) },
+			expected: newStateMessage(unchokeID),
+		},
+		{
+			name:     "have",
+			change:   func(client *Client, _ *peer) { client.informPeersWeHavePiece(2) },
+			expected: newHaveMessage(2),
+		},
+		{
+			name:     "peer adjustment",
+			change:   func(client *Client, _ *peer) { client.adjustPeers() },
+			expected: newStateMessage(unchokeID),
+		},
+	} {
+		t.Run(one.name, func(t *testing.T) {
+			c := check.New(t)
+			client := newTestClient(d)
+			conn, p := newTestPeer(t, client)
+			defer xio.CloseIgnoringErrors(conn)
+
+			// Fill the write queue, so that anything else sent to it has nowhere to go
+			for range cap(p.writeQueue) {
+				p.writeQueue <- make([]byte, 4)
+			}
+			waitFor(t, one.name, func() { one.change(client, p) })
+
+			// The message must still be delivered, once the queue has room for it again
+			done := make(chan bool)
+			defer close(done)
+			go p.processStateChanges(done)
+			for range cap(p.writeQueue) {
+				c.Equal(4, len(nextQueuedMessage(t, p)))
+			}
+			c.Equal(one.expected, nextQueuedMessage(t, p))
+		})
+	}
+}
+
+// nextQueuedMessage returns the next message the peer has queued up for writing, failing the test if none arrives.
+func nextQueuedMessage(t *testing.T, p *peer) []byte {
+	t.Helper()
+	select {
+	case buffer := <-p.writeQueue:
+		return buffer
+	case <-time.After(peerMgmtWait):
+		t.Fatal("no message was queued up for the peer")
+		return nil
 	}
 }
 

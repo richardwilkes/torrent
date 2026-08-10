@@ -71,15 +71,20 @@ type peer struct {
 	has         *fixedbits.Bits
 	requestChan chan *pieceRequest
 	writeQueue  chan []byte
-	pieces      map[int]*piece // protected by lock
-	peerState                  // protected by lock
-	bail        bool           // protected by lock
-	// toldInterested is the interest the peer was last told about, which trails amInterested until the message saying
-	// so has been queued up. sendingInterest is set while a goroutine is delivering those messages, so that the others
-	// leave the delivery to it rather than queueing up behind it. Both are protected by lock.
-	toldInterested  bool
-	sendingInterest bool
-	lock            sync.RWMutex
+	// stateChanged tells the goroutine that delivers our state to the peer that there is something pending. It has a
+	// capacity of one and is only ever sent to without blocking, since all that goroutine needs to know is that
+	// something is waiting for it and it re-reads all of the pending state each time it wakes.
+	stateChanged chan struct{}
+	pieces       map[int]*piece // protected by lock
+	// haveQueue holds the pieces we've acquired that the peer has yet to be told about. Protected by lock.
+	haveQueue []int
+	peerState      // protected by lock
+	bail      bool // protected by lock
+	// toldChoking and toldInterested are what the peer was last told about our choking and our interest. They trail
+	// amChoking and amInterested until the message saying so has been queued up. Both are protected by lock.
+	toldChoking    bool
+	toldInterested bool
+	lock           sync.RWMutex
 }
 
 type pieceRequest struct {
@@ -143,14 +148,18 @@ type piece struct {
 
 func newPeer(client *Client, conn net.Conn, logger *slog.Logger) *peer {
 	return &peer{
-		client:      client,
-		logger:      logger,
-		conn:        conn,
-		created:     time.Now(),
-		has:         fixedbits.New(client.torrentFile.PieceCount()),
-		requestChan: make(chan *pieceRequest),
-		writeQueue:  make(chan []byte, 32),
-		pieces:      make(map[int]*piece),
+		client:       client,
+		logger:       logger,
+		conn:         conn,
+		created:      time.Now(),
+		has:          fixedbits.New(client.torrentFile.PieceCount()),
+		requestChan:  make(chan *pieceRequest),
+		writeQueue:   make(chan []byte, 32),
+		stateChanged: make(chan struct{}, 1),
+		pieces:       make(map[int]*piece),
+		// Both ends of a new connection start out choked and uninterested, so there is nothing to tell the peer about
+		// until one of those changes.
+		toldChoking: true,
 		peerState: peerState{
 			amChoking:   true,
 			peerChoking: true,
@@ -187,8 +196,8 @@ func (s *peerState) downloadStalled(now time.Time) bool {
 
 // updateInterest recomputes whether we're interested in what this peer has, records it, and makes sure the peer gets
 // told about any change. It is called from both the goroutine reading messages from the peer and the one managing
-// peers, so amInterested is only ever recorded while the lock is held and the delivery of the messages is left to
-// sendInterestChanges.
+// peers, so amInterested is only ever recorded while the lock is held and the delivery of the message is left to
+// processStateChanges.
 func (p *peer) updateInterest() peerState {
 	p.clearExpiredDownloads()
 	p.lock.RLock()
@@ -198,64 +207,117 @@ func (p *peer) updateInterest() peerState {
 	interested := downloading || p.client.tracker.isInteresting(has)
 	p.lock.Lock()
 	p.amInterested = interested
+	changed := p.toldInterested != interested
 	ps := p.peerState
 	ps.downloading = downloading
 	p.lock.Unlock()
-	p.sendInterestChanges()
+	if changed {
+		p.signalStateChange()
+	}
 	return ps
 }
 
-// sendInterestChanges brings what the peer has been told about our interest back in line with what updateInterest
-// recorded in amInterested. Only one goroutine delivers these messages at a time, so they can't be sent out of order
-// or in duplicate, which would leave the remote's notion of our interest permanently at odds with ours.
-//
-// A caller that finds another goroutine already delivering simply returns rather than waiting its turn. That is safe
-// because the goroutine doing the delivering re-reads amInterested under the lock before giving up the role, so it
-// picks up the change the caller just recorded. It also matters: sending to the write queue blocks once that queue
-// fills up, and peer management walks every peer in turn, so a caller left waiting here would let one peer that can't
-// be written to stall the management of all the others.
-func (p *peer) sendInterestChanges() {
-	p.lock.Lock()
-	if p.sendingInterest {
-		p.lock.Unlock()
-		return
-	}
-	p.sendingInterest = true
-	for p.toldInterested != p.amInterested {
-		interested := p.amInterested
-		p.toldInterested = interested
-		p.lock.Unlock()
-		buffer := make([]byte, 5)
-		binary.BigEndian.PutUint32(buffer[:4], 1)
-		if interested {
-			buffer[4] = interestedID
-		} else {
-			buffer[4] = notInterestedID
-		}
-		p.writeQueue <- buffer
-		p.lock.Lock()
-	}
-	p.sendingInterest = false
-	p.lock.Unlock()
-}
-
+// setChoked records whether we're choking the peer, leaving the delivery of the message saying so to
+// processStateChanges.
 func (p *peer) setChoked(choked bool) {
 	p.lock.Lock()
-	send := p.amChoking != choked //nolint:ifshort // incorrect assumption that send isn't used later
-	if send {
-		p.amChoking = choked
-	}
+	changed := p.amChoking != choked
+	p.amChoking = choked
 	p.lock.Unlock()
-	if send {
-		buffer := make([]byte, 5)
-		binary.BigEndian.PutUint32(buffer[:4], 1)
-		if choked {
-			buffer[4] = chokeID
-		} else {
-			buffer[4] = unchokeID
-		}
-		p.writeQueue <- buffer
+	if changed {
+		p.signalStateChange()
 	}
+}
+
+// queueHave records that the peer has yet to be told that we now have the given piece, leaving the delivery of the
+// message saying so to processStateChanges.
+func (p *peer) queueHave(index int) {
+	p.lock.Lock()
+	p.haveQueue = append(p.haveQueue, index)
+	p.lock.Unlock()
+	p.signalStateChange()
+}
+
+// signalStateChange lets the goroutine delivering our state to the peer know that something is pending. The signal is
+// never allowed to block: it says nothing more than that there is something to look at, and the delivery goroutine
+// re-reads all of the pending state when it wakes, so a signal that finds one already waiting has nothing to add.
+// That matters because sending to the write queue blocks once that queue fills up: peer management walks every peer in
+// turn and a piece that finishes validating is announced to every peer from the read goroutine of the one that
+// completed it, so a caller left waiting on one peer that can't be written to would stall all of the others.
+func (p *peer) signalStateChange() {
+	select {
+	case p.stateChanged <- struct{}{}:
+	default:
+	}
+}
+
+// processStateChanges delivers the messages that tell the peer about our state: whether we're choking it, whether
+// we're interested in what it has, and which pieces we've acquired. A single goroutine owns their delivery, so they
+// can't be sent out of order or in duplicate, which would leave the remote's notion of our state permanently at odds
+// with ours.
+func (p *peer) processStateChanges(done chan bool) {
+	for {
+		select {
+		case <-p.stateChanged:
+			for buffer := p.nextStateMessage(); buffer != nil; buffer = p.nextStateMessage() {
+				select {
+				case p.writeQueue <- buffer:
+				case <-done:
+					return
+				}
+			}
+		case <-done:
+			return
+		}
+	}
+}
+
+// nextStateMessage returns the next message needed to bring what the peer has been told about our state in line with
+// what it actually is, or nil if the peer is already current.
+func (p *peer) nextStateMessage() []byte {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	switch {
+	case p.toldChoking != p.amChoking:
+		p.toldChoking = p.amChoking
+		if p.amChoking {
+			return newStateMessage(chokeID)
+		}
+		return newStateMessage(unchokeID)
+	case p.toldInterested != p.amInterested:
+		p.toldInterested = p.amInterested
+		if p.amInterested {
+			return newStateMessage(interestedID)
+		}
+		return newStateMessage(notInterestedID)
+	case len(p.haveQueue) != 0:
+		index := p.haveQueue[0]
+		if len(p.haveQueue) == 1 {
+			p.haveQueue = nil
+		} else {
+			p.haveQueue = p.haveQueue[1:]
+		}
+		return newHaveMessage(index)
+	default:
+		return nil
+	}
+}
+
+// newStateMessage creates one of the messages that consists of nothing more than its ID.
+func newStateMessage(id byte) []byte {
+	buffer := make([]byte, 5)
+	binary.BigEndian.PutUint32(buffer[:4], 1)
+	buffer[4] = id
+	return buffer
+}
+
+// newHaveMessage creates the message that tells a peer we have a piece.
+func newHaveMessage(index int) []byte {
+	buffer := make([]byte, 9)
+	binary.BigEndian.PutUint32(buffer[:4], 5)
+	buffer[4] = haveID
+	binary.BigEndian.PutUint32(buffer[5:], uint32(index))
+	return buffer
 }
 
 func (p *peer) processIncomingMessages() {
@@ -288,7 +350,11 @@ func (p *peer) processIncomingMessages() {
 			}
 		}
 	}()
-	go p.processWriteQueue()
+	// done is closed once nothing more can be written to the peer, releasing the goroutines that would otherwise be
+	// left waiting on a write queue that no longer has a reader.
+	done := make(chan bool)
+	go p.processWriteQueue(done)
+	go p.processStateChanges(done)
 	go p.pieceRequestQueue()
 	lengthBuffer := make([]byte, 4)
 	for {
@@ -635,9 +701,8 @@ func (p *peer) processPieceRequests(in chan *pieceRequest) {
 	}
 }
 
-func (p *peer) processWriteQueue() {
+func (p *peer) processWriteQueue(done chan bool) {
 	var lastWriteTime time.Time
-	done := make(chan bool)
 	go p.keepAlive(done)
 	for buffer := range p.writeQueue {
 		var err error

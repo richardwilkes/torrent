@@ -12,6 +12,8 @@ package torrent
 import (
 	"errors"
 	"net"
+	"sort"
+	"sync"
 	"testing"
 	"time"
 
@@ -214,6 +216,204 @@ func TestStalledPeerIsBanned(t *testing.T) {
 	client.adjustPeers()
 	c.True(d.GateKeeper().IsAddressBlocked(p.conn.RemoteAddr()))
 	checkConnOpen(t, conn, false)
+}
+
+// TestPeerOrderingsAreConsistent verifies that each of the orderings used to rank peers is a real ordering: no peer
+// may rank ahead of one that ranks ahead of it, and a peer that ranks ahead of a second must rank ahead of everything
+// that second one ranks ahead of. An ordering that chains its keys such that each of them can only answer in one
+// direction has neither property, and leaves the sorted result arbitrary whenever the peers have mixed states.
+func TestPeerOrderingsAreConsistent(t *testing.T) {
+	now := time.Now()
+	older := &peer{created: now.Add(-time.Hour)}
+	newer := &peer{created: now}
+	for _, one := range []struct {
+		less func(a, b *peerData) bool
+		name string
+	}{
+		{name: "rotation", less: func(a, b *peerData) bool { return a.worseForRotation(b, now) }},
+		{name: "unchoking", less: func(a, b *peerData) bool { return a.betterForUnchoking(b, now) }},
+		{name: "dropping", less: func(a, b *peerData) bool { return a.worseForDropping(b) }},
+	} {
+		t.Run(one.name, func(t *testing.T) {
+			for _, a := range testPeerRankings(now, older, newer) {
+				for _, b := range testPeerRankings(now, older, newer) {
+					if one.less(a, b) && one.less(b, a) {
+						t.Fatalf("%v and %v each rank ahead of the other", a.state, b.state)
+					}
+				}
+			}
+			// The transitivity checks are quadratic in the number of peers they're given, so they use a single
+			// creation time, leaving the last key of each ordering to act as the tie breaker it is
+			all := testPeerRankings(now, newer)
+			for _, a := range all {
+				for _, b := range all {
+					switch {
+					case one.less(a, b):
+						for _, third := range all {
+							if one.less(b, third) && !one.less(a, third) {
+								t.Fatalf("%v ranks ahead of %v, which ranks ahead of %v, but not ahead of %v",
+									a.state, b.state, third.state, third.state)
+							}
+						}
+					case !one.less(b, a): // Neither ranks ahead of the other, so anything tied with one is tied with both
+						for _, third := range all {
+							if one.less(b, third) || one.less(third, b) {
+								continue
+							}
+							if one.less(a, third) || one.less(third, a) {
+								t.Fatalf("%v and %v are tied, as are %v and %v, but %v and %v are not",
+									a.state, b.state, b.state, third.state, a.state, third.state)
+							}
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
+// testPeerRankings returns peer data covering every combination of the states the peer orderings are keyed on, for
+// each of the given peers.
+func testPeerRankings(now time.Time, peers ...*peer) []*peerData {
+	const combinations = 32
+	result := make([]*peerData, 0, combinations*4*len(peers))
+	for i := range combinations {
+		for _, bytesRead := range []int64{0, 1} {
+			for _, bytesWritten := range []int64{0, 1} {
+				for _, one := range peers {
+					state := peerState{
+						amInterested:    i&1 != 0,
+						downloading:     i&2 != 0,
+						peerChoking:     i&4 != 0,
+						peerInterested:  i&8 != 0,
+						bytesRead:       bytesRead,
+						bytesWritten:    bytesWritten,
+						downloadStarted: now,
+					}
+					if i&16 != 0 {
+						state.downloadStarted = now.Add(-2 * maxWaitForChunkDownload)
+					}
+					result = append(result, &peerData{peer: one, state: state})
+				}
+			}
+		}
+	}
+	return result
+}
+
+// TestUnchokeRankingOrder verifies the priority the unchoke ranking gives to each of the things it looks at, since
+// only the peers that come out on top of it are left unchoked.
+func TestUnchokeRankingOrder(t *testing.T) {
+	c := check.New(t)
+	now := time.Now()
+	one := &peer{created: now}
+	best := peerState{amInterested: true, downloading: true, peerInterested: true, bytesRead: 2, downloadStarted: now}
+	// Each of these makes a peer worse than the one before it by exactly one key, in the order the ranking considers
+	// them
+	worsening := []func(state *peerState){
+		func(state *peerState) { state.bytesRead = 1 },
+		func(state *peerState) { state.downloadStarted = now.Add(-2 * maxWaitForChunkDownload) },
+		func(state *peerState) { state.peerInterested = false },
+		func(state *peerState) { state.peerChoking = true },
+		func(state *peerState) { state.downloading = false },
+		func(state *peerState) { state.amInterested = false },
+	}
+	expected := make([]*peerData, 0, len(worsening)+1)
+	expected = append(expected, &peerData{peer: one, state: best})
+	for _, worsen := range worsening {
+		state := expected[len(expected)-1].state
+		worsen(&state)
+		expected = append(expected, &peerData{peer: one, state: state})
+	}
+
+	// Sorting any arrangement of them must restore the expected order
+	actual := make([]*peerData, len(expected))
+	for i := range expected {
+		actual[i] = expected[len(expected)-1-i]
+	}
+	sort.Slice(actual, func(i, j int) bool { return actual[i].betterForUnchoking(actual[j], now) })
+	for i := range expected {
+		c.Equal(expected[i].state, actual[i].state, "peer %d", i)
+	}
+}
+
+// TestLeastUsefulPeerIsRotatedOut verifies that the peer given up to make room for an alternate is one that isn't
+// doing anything for us, rather than one that is in the middle of downloading a piece.
+func TestLeastUsefulPeerIsRotatedOut(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+	client := newTestClient(d)
+
+	// We already have as many peers as we want, so one has to be given up before an alternate can be added
+	client.peersWanted = 2
+	downloadingConn, downloading := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(downloadingConn)
+	idleConn, idle := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(idleConn)
+	downloading.lock.Lock()
+	downloading.peerChoking = false
+	downloading.lock.Unlock()
+	downloading.queuePieceDownload(0)
+	c.True(downloading.updateInterest().downloading)
+	c.False(idle.updateInterest().amInterested)
+
+	client.adjustPeers()
+	checkConnOpen(t, downloadingConn, true)
+	checkConnOpen(t, idleConn, false)
+}
+
+// TestPeerRankingDoesNotRacePeerCounters verifies that the peer rankings take the byte counts from the state snapshot
+// made under each peer's lock, rather than reading them from the peer while its own goroutines are updating them. The
+// race is only detected when the tests are run with -race.
+func TestPeerRankingDoesNotRacePeerCounters(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+	client := newTestClient(d)
+
+	// Fewer peers are wanted than we have, so both the ranking that finds a peer to make room with and the one that
+	// finds a peer to drop have something to sort
+	client.peersWanted = 1
+	peers := make([]*peer, 0, 3)
+	conns := make([]net.Conn, 0, 3)
+	for range cap(peers) {
+		conn, p := newTestPeer(t, client)
+		peers = append(peers, p)
+		conns = append(conns, conn)
+	}
+	defer func() {
+		for _, conn := range conns {
+			xio.CloseIgnoringErrors(conn)
+		}
+	}()
+
+	// Update the counters the way each peer's own read and write goroutines do
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for _, p := range peers {
+		wg.Go(func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				p.lock.Lock()
+				p.bytesRead++
+				p.bytesWritten++
+				p.lock.Unlock()
+			}
+		})
+	}
+	for range 10 {
+		client.adjustPeers()
+		c.True(client.dropPeerIfPossible())
+	}
+	close(stop)
+	wg.Wait()
 }
 
 // TestConnectedHosts verifies that the hosts we're already connected to are collected, so that they aren't connected
