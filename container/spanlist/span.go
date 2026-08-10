@@ -17,6 +17,12 @@ type Span struct {
 	Length int
 }
 
+// overlaps returns true if the two spans have at least one position in common. Spans that merely abut each other do
+// not overlap.
+func (s *Span) overlaps(other *Span) bool {
+	return s.Start < other.Start+other.Length && other.Start < s.Start+s.Length
+}
+
 func (s *Span) merge(other *Span) {
 	e := s.Start + s.Length
 	oe := other.Start + other.Length
@@ -35,7 +41,9 @@ type SpanList struct {
 }
 
 // Insert a span into the list. Returns true if the span overlapped an
-// existing span within the list.
+// existing span within the list. Note that the new span may reach past the
+// first span it touches, so every span it is merged with has to be considered,
+// not just the first one.
 func (sl *SpanList) Insert(span *Span) bool {
 	for i, one := range sl.Spans {
 		// Before
@@ -45,9 +53,10 @@ func (sl *SpanList) Insert(span *Span) bool {
 		}
 		// Overlap or abut
 		if span.Start <= one.Start+one.Length {
-			hadOverlap := span.Start < one.Start+one.Length && span.Start+span.Length > one.Start
+			hadOverlap := span.overlaps(&one)
 			sl.Spans[i].merge(span)
 			for i < len(sl.Spans)-1 && sl.Spans[i].Start+sl.Spans[i].Length >= sl.Spans[i+1].Start {
+				hadOverlap = hadOverlap || span.overlaps(&sl.Spans[i+1])
 				sl.Spans[i].merge(&sl.Spans[i+1])
 				if i == len(sl.Spans)-2 {
 					sl.Spans = sl.Spans[:len(sl.Spans)-1]

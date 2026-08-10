@@ -74,7 +74,12 @@ type peer struct {
 	pieces      map[int]*piece // protected by lock
 	peerState                  // protected by lock
 	bail        bool           // protected by lock
-	lock        sync.RWMutex
+	// toldInterested is the interest the peer was last told about, which trails amInterested until the message saying
+	// so has been queued up. sendingInterest is set while a goroutine is delivering those messages, so that the others
+	// leave the delivery to it rather than queueing up behind it. Both are protected by lock.
+	toldInterested  bool
+	sendingInterest bool
+	lock            sync.RWMutex
 }
 
 type pieceRequest struct {
@@ -180,18 +185,45 @@ func (s *peerState) downloadStalled(now time.Time) bool {
 	return now.Sub(s.lastProgress()) > maxWaitForChunkDownload
 }
 
+// updateInterest recomputes whether we're interested in what this peer has, records it, and makes sure the peer gets
+// told about any change. It is called from both the goroutine reading messages from the peer and the one managing
+// peers, so amInterested is only ever recorded while the lock is held and the delivery of the messages is left to
+// sendInterestChanges.
 func (p *peer) updateInterest() peerState {
 	p.clearExpiredDownloads()
 	p.lock.RLock()
 	has := p.has.Clone()
-	ps := p.peerState
-	ps.downloading = len(p.pieces) > 0
+	downloading := len(p.pieces) > 0
 	p.lock.RUnlock()
-	interested := ps.downloading || p.client.tracker.isInteresting(has)
-	if ps.amInterested != interested {
-		ps.amInterested = interested
-		p.lock.Lock()
-		p.amInterested = interested
+	interested := downloading || p.client.tracker.isInteresting(has)
+	p.lock.Lock()
+	p.amInterested = interested
+	ps := p.peerState
+	ps.downloading = downloading
+	p.lock.Unlock()
+	p.sendInterestChanges()
+	return ps
+}
+
+// sendInterestChanges brings what the peer has been told about our interest back in line with what updateInterest
+// recorded in amInterested. Only one goroutine delivers these messages at a time, so they can't be sent out of order
+// or in duplicate, which would leave the remote's notion of our interest permanently at odds with ours.
+//
+// A caller that finds another goroutine already delivering simply returns rather than waiting its turn. That is safe
+// because the goroutine doing the delivering re-reads amInterested under the lock before giving up the role, so it
+// picks up the change the caller just recorded. It also matters: sending to the write queue blocks once that queue
+// fills up, and peer management walks every peer in turn, so a caller left waiting here would let one peer that can't
+// be written to stall the management of all the others.
+func (p *peer) sendInterestChanges() {
+	p.lock.Lock()
+	if p.sendingInterest {
+		p.lock.Unlock()
+		return
+	}
+	p.sendingInterest = true
+	for p.toldInterested != p.amInterested {
+		interested := p.amInterested
+		p.toldInterested = interested
 		p.lock.Unlock()
 		buffer := make([]byte, 5)
 		binary.BigEndian.PutUint32(buffer[:4], 1)
@@ -201,8 +233,10 @@ func (p *peer) updateInterest() peerState {
 			buffer[4] = notInterestedID
 		}
 		p.writeQueue <- buffer
+		p.lock.Lock()
 	}
-	return ps
+	p.sendingInterest = false
+	p.lock.Unlock()
 }
 
 func (p *peer) setChoked(choked bool) {

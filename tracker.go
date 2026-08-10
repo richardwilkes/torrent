@@ -67,12 +67,21 @@ type trackerLockData struct {
 }
 
 type trackerWire struct { //nolint:govet // We can't change the order of these fields
-	Interval      int    `bencode:"interval"`
-	PeerAddresses any    `bencode:"peers"`
-	Seeders       int    `bencode:"complete"`
-	Leechers      int    `bencode:"incomplete"`
-	TrackerID     string `bencode:"tracker id"`
-	Failure       string `bencode:"failure reason"`
+	Interval int `bencode:"interval"`
+	// PeerAddresses is left as raw bencode because a tracker may answer with either the compact form (a string) or the
+	// dict model (a list of dictionaries), regardless of our request for the compact form.
+	PeerAddresses bencode.RawMessage `bencode:"peers"`
+	Seeders       int                `bencode:"complete"`
+	Leechers      int                `bencode:"incomplete"`
+	TrackerID     string             `bencode:"tracker id"`
+	Failure       string             `bencode:"failure reason"`
+}
+
+// peerWire is one entry of a tracker's dict-model peer list.
+type peerWire struct { //nolint:govet // We can't change the order of these fields
+	ID   string `bencode:"peer id"`
+	IP   string `bencode:"ip"`
+	Port int    `bencode:"port"`
 }
 
 func newTracker(client *Client) *tracker {
@@ -254,6 +263,40 @@ func parseCompactPeers(value, externalAddr string) map[string]int {
 	return peerAddresses
 }
 
+// parsePeers extracts the peer addresses from a tracker's "peers" value. Although we always ask for the compact form,
+// a tracker is free to ignore that and answer with the dict model instead, so both are accepted: a bencoded string is
+// the compact form and a bencoded list is the dict model. A missing or empty value simply yields no peers. Our own
+// address, which the caller passes in, is omitted, as are entries with no port.
+func parsePeers(raw bencode.RawMessage, externalAddr string) (map[string]int, error) {
+	if len(raw) == 0 {
+		return make(map[string]int), nil
+	}
+	switch {
+	case raw[0] >= '0' && raw[0] <= '9': // A bencoded string, so the compact form
+		var compact string
+		if err := bencode.DecodeBytes(raw, &compact); err != nil {
+			return nil, errs.NewWithCause("unable to decode compact peer list", err)
+		}
+		slog.Debug("announce string", "peers_list", compact)
+		return parseCompactPeers(compact, externalAddr), nil
+	case raw[0] == 'l': // A bencoded list, so the dict model
+		var list []peerWire
+		if err := bencode.DecodeBytes(raw, &list); err != nil {
+			return nil, errs.NewWithCause("unable to decode peer list", err)
+		}
+		slog.Debug("announce map", "count", len(list))
+		peerAddresses := make(map[string]int, len(list))
+		for _, one := range list {
+			if one.IP != externalAddr && one.Port != 0 {
+				peerAddresses[one.IP] = one.Port
+			}
+		}
+		return peerAddresses, nil
+	default:
+		return nil, errs.Newf("unknown peer address format: %q", raw[0])
+	}
+}
+
 func (t *tracker) announce(event string) error {
 	slog.Debug("announce", "url", t.announceURL(event))
 	in, err := t.get(t.announceURL(event))
@@ -270,32 +313,9 @@ func (t *tracker) announce(event string) error {
 	if extIP := t.client.ExternalIP(); extIP != nil {
 		externalAddr = extIP.String()
 	}
-	peerAddresses := make(map[string]int)
-	switch value := in.PeerAddresses.(type) {
-	case string:
-		slog.Debug("announce string", "peers_list", value)
-		peerAddresses = parseCompactPeers(value, externalAddr)
-	case []map[string]any:
-		var inPeerAddresses []struct {
-			ID   string `bencode:"peer id"`
-			IP   string `bencode:"ip"`
-			Port int    `bencode:"port"`
-		}
-		var data []byte
-		if data, err = bencode.EncodeBytes(in.PeerAddresses); err != nil {
-			return errs.Wrap(err)
-		}
-		if err = bencode.DecodeBytes(data, &inPeerAddresses); err != nil {
-			return errs.Wrap(err)
-		}
-		slog.Debug("announce map", "count", len(inPeerAddresses))
-		for _, one := range inPeerAddresses {
-			if one.IP != externalAddr && one.Port != 0 {
-				peerAddresses[one.IP] = one.Port
-			}
-		}
-	default:
-		slog.Debug("announce: unknown peer address format", "type", fmt.Sprintf("%T", in.PeerAddresses))
+	peerAddresses, err := parsePeers(in.PeerAddresses, externalAddr)
+	if err != nil {
+		return err
 	}
 	t.lock.Lock()
 	t.interval = in.Interval

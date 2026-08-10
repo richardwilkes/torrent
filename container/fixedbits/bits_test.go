@@ -119,6 +119,58 @@ func TestFirstAvailable(t *testing.T) {
 	c.Equal(-1, FirstAvailable(has, downloading, have))
 }
 
+// TestFirstAvailableExcludesEitherSet verifies the documented contract: an index has to be clear in both 'downloading'
+// and 'have' to be available, so being set in just one of them is enough to rule it out. A piece already being
+// downloaded from some other peer is not something to hand out again.
+func TestFirstAvailableExcludesEitherSet(t *testing.T) {
+	c := check.New(t)
+	const pieceCount = 3
+	for _, one := range []struct {
+		exclude  func(downloading, have *Bits)
+		name     string
+		expected int
+	}{
+		{
+			name:     "nothing excluded",
+			exclude:  func(_, _ *Bits) {},
+			expected: 0,
+		},
+		{
+			name:     "downloading only",
+			exclude:  func(downloading, _ *Bits) { downloading.Set(0) },
+			expected: 1,
+		},
+		{
+			name:     "have only",
+			exclude:  func(_, have *Bits) { have.Set(0) },
+			expected: 1,
+		},
+		{
+			name:     "both",
+			exclude:  func(downloading, have *Bits) { downloading.Set(0); have.Set(0) },
+			expected: 1,
+		},
+		{
+			name: "each index excluded by a different set",
+			exclude: func(downloading, have *Bits) {
+				downloading.Set(0)
+				have.Set(1)
+				downloading.Set(2)
+			},
+			expected: -1,
+		},
+	} {
+		has := New(pieceCount)
+		for i := range pieceCount {
+			has.Set(i)
+		}
+		downloading := New(pieceCount)
+		have := New(pieceCount)
+		one.exclude(downloading, have)
+		c.Equal(one.expected, FirstAvailable(has, downloading, have), one.name)
+	}
+}
+
 // TestFirstAvailableLimitsToLogicalSize verifies that spare bits in the backing storage can't be returned as an
 // available index, which would be beyond the number of pieces in the torrent.
 func TestFirstAvailableLimitsToLogicalSize(t *testing.T) {

@@ -22,6 +22,7 @@ const blockDuration = 5 * time.Minute
 type GateKeeper struct {
 	done      chan bool
 	addresses sync.Map
+	closeOnce sync.Once
 }
 
 // NewGateKeeper creates a new GateKeeper.
@@ -69,20 +70,33 @@ func (r *GateKeeper) prune() {
 	for {
 		select {
 		case <-time.After(blockDuration):
-			r.addresses.Range(func(addr, expires any) bool {
-				if t, ok := expires.(time.Time); ok && t.Before(time.Now()) {
-					r.addresses.Delete(addr)
-					slog.Debug("unblocked peer", "address", addr)
-				}
-				return true
-			})
+			r.pruneExpired()
 		case <-r.done:
 			return
 		}
 	}
 }
 
-// Close shuts this GateKeeper down.
+// pruneExpired removes the addresses whose blocks have run out.
+func (r *GateKeeper) pruneExpired() {
+	r.addresses.Range(func(addr, expires any) bool {
+		r.unblockIfExpired(addr, expires)
+		return true
+	})
+}
+
+// unblockIfExpired removes the address, but only if the expiry we were handed has passed and is still the one on
+// record. Removing it unconditionally would silently unblock an address that a concurrent block replaced with a fresh
+// expiry after we observed the old one.
+func (r *GateKeeper) unblockIfExpired(addr, expires any) {
+	if t, ok := expires.(time.Time); ok && t.Before(time.Now()) {
+		if r.addresses.CompareAndDelete(addr, expires) {
+			slog.Debug("unblocked peer", "address", addr)
+		}
+	}
+}
+
+// Close shuts this GateKeeper down. Calling it more than once is a no-op.
 func (r *GateKeeper) Close() {
-	close(r.done)
+	r.closeOnce.Do(func() { close(r.done) })
 }

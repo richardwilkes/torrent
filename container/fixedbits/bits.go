@@ -30,8 +30,8 @@ func New(numberOfBits int) *Bits {
 	}
 }
 
-// FirstAvailable returns the first index set in 'has' and is not set in both
-// 'downloading' and 'have', or -1 if no such index exists.
+// FirstAvailable returns the first index that is set in 'has' and is set in
+// neither 'downloading' nor 'have', or -1 if no such index exists.
 func FirstAvailable(has, downloading, have *Bits) int {
 	avail := New(min(has.size, downloading.size, have.size))
 	for i := range avail.data {

@@ -405,6 +405,140 @@ func TestPieceRequestFloodIsRejected(t *testing.T) {
 	}
 }
 
+// TestUpdateInterestIsSerialized verifies that concurrent interest updates, which arrive from both the goroutine
+// reading messages from a peer and the one managing peers, yield a single consistent sequence of interested and
+// not-interested messages. Each message must flip our stated interest, and the last one must agree with what we
+// recorded, or the remote's view of our interest ends up permanently at odds with ours.
+func TestUpdateInterestIsSerialized(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+	client := newTestClient(d)
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+
+	// Collect the message IDs the peer would have written, rather than sending them over the connection
+	var sent []byte
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		for buffer := range p.writeQueue {
+			sent = append(sent, buffer[4])
+		}
+	}()
+
+	// Flip whether the peer has anything we want from several goroutines at once, each following its change with the
+	// interest update that the message handlers and peer management would make
+	const goroutines = 8
+	const iterations = 250
+	var wg sync.WaitGroup
+	for i := range goroutines {
+		wg.Go(func() {
+			for j := range iterations {
+				p.lock.Lock()
+				if (i+j)%2 == 0 {
+					p.has.Set(0)
+				} else {
+					p.has.Unset(0)
+				}
+				p.lock.Unlock()
+				p.updateInterest()
+			}
+		})
+	}
+	wg.Wait()
+	close(p.writeQueue)
+	<-drained
+
+	c.True(len(sent) > 0, "no interest was ever expressed")
+	for i, id := range sent {
+		// We start out uninterested, so the messages must alternate, beginning with an interested one
+		expected := interestedID
+		if i%2 == 1 {
+			expected = notInterestedID
+		}
+		if id != expected {
+			t.Fatalf("message %d was %d, not %d; messages %d through %d were %v", i, id, expected,
+				max(0, i-8), i, sent[max(0, i-8):i+1])
+		}
+	}
+	p.lock.RLock()
+	amInterested := p.amInterested
+	p.lock.RUnlock()
+	c.Equal(amInterested, sent[len(sent)-1] == interestedID, "the last message must match the interest we recorded")
+}
+
+// TestUpdateInterestDoesNotBlockOnAFullWriteQueue verifies that a peer whose write queue has backed up doesn't hold up
+// the goroutines that only need to reassess our interest in it. Peer management walks every peer in turn, so one peer
+// that can't be written to must not be able to stall the management of all the others.
+func TestUpdateInterestDoesNotBlockOnAFullWriteQueue(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+	client := newTestClient(d)
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+
+	// Fill the write queue, so that the next message sent to it has nowhere to go
+	for range cap(p.writeQueue) {
+		p.writeQueue <- make([]byte, 4)
+	}
+
+	// The peer has a piece we want, so the first update has an interested message to deliver and blocks on the queue
+	p.lock.Lock()
+	p.has.Set(0)
+	p.lock.Unlock()
+	blocked := make(chan struct{})
+	go func() {
+		defer close(blocked)
+		p.updateInterest()
+	}()
+	waitForInterestDelivery(t, p)
+	select {
+	case <-blocked:
+		t.Fatal("the update should still be blocked on the full write queue")
+	default:
+	}
+
+	// Peer management must still be able to reassess this peer without waiting for the queue to drain
+	waitFor(t, "updateInterest", func() { p.updateInterest() })
+
+	// Draining the queue lets the blocked delivery finish
+	<-p.writeQueue
+	select {
+	case <-blocked:
+	case <-time.After(peerMgmtWait):
+		t.Fatal("the delivery never completed once the queue drained")
+	}
+	p.lock.RLock()
+	interested := p.amInterested
+	told := p.toldInterested
+	p.lock.RUnlock()
+	c.True(interested)
+	c.Equal(interested, told, "the peer must end up knowing what we recorded")
+}
+
+// waitForInterestDelivery fails the test if no goroutine takes on the delivery of the interest messages, which is the
+// point past which it can no longer make progress against a full write queue.
+func waitForInterestDelivery(t *testing.T, p *peer) {
+	t.Helper()
+	deadline := time.Now().Add(peerMgmtWait)
+	for {
+		p.lock.RLock()
+		sending := p.sendingInterest
+		p.lock.RUnlock()
+		if sending {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the interest message was never taken up for delivery")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestPendingRequests(t *testing.T) {
 	c := check.New(t)
 	q := newPendingRequests()

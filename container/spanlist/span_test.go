@@ -96,6 +96,41 @@ func TestSpan(t *testing.T) {
 	c.True(hadOverlap)
 }
 
+// TestSpanInsertOverlapBeyondTheFirstSpan verifies that the reported overlap accounts for every span the new one is
+// merged with, not just the first one it reaches. A span can abut the span it lands on and still overlap the ones that
+// follow it.
+func TestSpanInsertOverlapBeyondTheFirstSpan(t *testing.T) {
+	c := check.New(t)
+
+	// Abuts the first span it reaches and overlaps the second
+	var list spanlist.SpanList
+	c.False(list.Insert(&spanlist.Span{Start: 0, Length: 5}))
+	c.False(list.Insert(&spanlist.Span{Start: 10, Length: 5}))
+	c.True(list.Insert(&spanlist.Span{Start: 5, Length: 10}))
+	c.Equal([]spanlist.Span{{Start: 0, Length: 15}}, list.Spans)
+
+	// Abuts the first span it reaches and overlaps the third
+	list = spanlist.SpanList{}
+	c.False(list.Insert(&spanlist.Span{Start: 0, Length: 5}))
+	c.False(list.Insert(&spanlist.Span{Start: 10, Length: 5}))
+	c.False(list.Insert(&spanlist.Span{Start: 20, Length: 5}))
+	c.True(list.Insert(&spanlist.Span{Start: 5, Length: 18}))
+	c.Equal([]spanlist.Span{{Start: 0, Length: 25}}, list.Spans)
+
+	// Filling a gap exactly abuts the spans on both sides, overlapping neither
+	list = spanlist.SpanList{}
+	c.False(list.Insert(&spanlist.Span{Start: 0, Length: 5}))
+	c.False(list.Insert(&spanlist.Span{Start: 10, Length: 5}))
+	c.False(list.Insert(&spanlist.Span{Start: 5, Length: 5}))
+	c.Equal([]spanlist.Span{{Start: 0, Length: 15}}, list.Spans)
+
+	// A span swallowed whole by an existing one overlaps it
+	list = spanlist.SpanList{}
+	c.False(list.Insert(&spanlist.Span{Start: 0, Length: 20}))
+	c.True(list.Insert(&spanlist.Span{Start: 5, Length: 5}))
+	c.Equal([]spanlist.Span{{Start: 0, Length: 20}}, list.Spans)
+}
+
 func TestSpanInsertIntoGap(t *testing.T) {
 	c := check.New(t)
 
