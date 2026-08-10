@@ -540,6 +540,64 @@ func TestStoppedNotificationIsNotLost(t *testing.T) {
 	}
 }
 
+// TestDownloadCompleteNotification verifies that exactly one download complete notification is delivered.
+func TestDownloadCompleteNotification(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+	client := newTestClient(d)
+	notifier := make(chan *Client, 2)
+	client.downloadCompleteNotifier = notifier
+
+	client.tracker.setState(Seeding)
+	c.Equal(client, <-notifier)
+
+	// Leaving the seeding state and returning to it must not produce a second notification
+	client.tracker.setState(Downloading)
+	client.tracker.setState(Seeding)
+	select {
+	case <-notifier:
+		t.Fatal("a second download complete notification was delivered")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// TestDownloadCompleteNotificationDoesNotBlockForever verifies that a consumer that isn't listening can't strand the
+// goroutine reporting the completed download. That goroutine is either the client's run goroutine, which would never
+// finish starting, or a peer's read goroutine, which would leave finish() waiting on it forever, so the client could
+// never stop.
+func TestDownloadCompleteNotificationDoesNotBlockForever(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+	client := newTestClient(d)
+	client.downloadCompleteNotifier = make(chan *Client) // Unbuffered, with nothing listening
+
+	waitFor(t, "setState", func() { client.tracker.setState(Seeding) })
+}
+
+// TestDownloadCompleteNotificationReachesALateConsumer verifies that the notification isn't thrown away just because
+// the consumer wasn't waiting at the moment the download completed.
+func TestDownloadCompleteNotificationReachesALateConsumer(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+	client := newTestClient(d)
+	notifier := make(chan *Client) // Unbuffered, with nothing listening yet
+	client.downloadCompleteNotifier = notifier
+
+	waitFor(t, "setState", func() { client.tracker.setState(Seeding) })
+	select {
+	case one := <-notifier:
+		c.Equal(client, one)
+	case <-time.After(peerMgmtWait):
+		t.Fatal("the download complete notification was lost")
+	}
+}
+
 // TestStorageIsNotClearedOutFromUnderPeers verifies that a peer still serving piece requests as the client finishes
 // doesn't race with the storage file being closed, and stops serving once it is gone rather than dereferencing a nil
 // file. The race is only detected when the tests are run with -race.

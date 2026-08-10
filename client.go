@@ -39,6 +39,9 @@ const (
 	// stoppedNotifyTimeout is how long we'll hold onto the stopped notification waiting for it to be accepted. A
 	// buffered channel is expected, so this only comes into play for a consumer that has stopped listening.
 	stoppedNotifyTimeout = time.Minute
+	// downloadCompleteNotifyTimeout is how long the goroutine delivering the download complete notification will wait
+	// for it to be accepted before giving up, for a consumer that isn't listening when it arrives.
+	downloadCompleteNotifyTimeout = time.Minute
 )
 
 const urlQuerySafeBytes = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_.~"
@@ -70,6 +73,7 @@ type Client struct {
 	stopRequested            bool // protected by lock
 	stopped                  bool // protected by lock
 	stoppedNotified          bool // protected by lock
+	downloadCompleteNotified bool // protected by lock
 	peerMgmtStopping         bool // protected by peerMgmtLock
 }
 
@@ -184,6 +188,34 @@ func (c *Client) notifyStopped(wait time.Duration) {
 	select {
 	case c.stoppedNotifier <- c:
 	case <-time.After(wait):
+	}
+}
+
+// notifyDownloadComplete delivers the download complete notification, if one was asked for and one hasn't been
+// delivered already. The callers are the client's run goroutine and the peers' read goroutines, neither of which may
+// be left blocked on a consumer that isn't listening: doing so would keep the client from ever finishing its startup,
+// or leave finish() waiting on a peer that can never return. Delivery therefore falls back to a goroutine with a
+// bounded wait whenever it can't be completed immediately.
+func (c *Client) notifyDownloadComplete() {
+	if c.downloadCompleteNotifier == nil {
+		return
+	}
+	c.lock.Lock()
+	if c.downloadCompleteNotified {
+		c.lock.Unlock()
+		return
+	}
+	c.downloadCompleteNotified = true
+	c.lock.Unlock()
+	select {
+	case c.downloadCompleteNotifier <- c:
+	default:
+		go func() {
+			select {
+			case c.downloadCompleteNotifier <- c:
+			case <-time.After(downloadCompleteNotifyTimeout):
+			}
+		}()
 	}
 }
 

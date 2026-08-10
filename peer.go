@@ -523,6 +523,7 @@ func (p *peer) processIncomingMessages() {
 		p.lock.Lock()
 		p.bytesRead += int64(length + 4)
 		p.lock.Unlock()
+		p.client.tracker.addDownloadedBytes(int64(length + 4))
 		if err := <-p.client.InRate.Use(int(length + 4)); err != nil {
 			if tio.ShouldLogIOError(err) {
 				errs.LogTo(p.logger, err)
@@ -858,6 +859,7 @@ func (p *peer) processWriteQueue(done chan bool) {
 		p.lock.Lock()
 		p.bytesWritten += int64(len(buffer))
 		p.lock.Unlock()
+		p.client.tracker.addUploadedBytes(int64(len(buffer)))
 	}
 	close(done)
 }

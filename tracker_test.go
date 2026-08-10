@@ -10,9 +10,18 @@
 package torrent
 
 import (
+	"fmt"
+	"math"
+	"net/http"
+	"net/http/httptest"
+	"runtime"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/richardwilkes/toolbox/v2/check"
+	"github.com/richardwilkes/torrent/dispatcher"
 	"github.com/zeebo/bencode"
 )
 
@@ -109,6 +118,207 @@ func TestParsePeersMalformed(t *testing.T) {
 	// A list holding something other than peer dictionaries
 	_, err = parsePeers(decodeTestTrackerResponse(t, []any{"10.0.0.1"}).PeerAddresses, "<unknown>")
 	c.HasError(err)
+}
+
+// TestAnnounceIntervalIsBounded verifies the wait between announces stays within sane limits no matter what the
+// tracker asks for. A value large enough to overflow the conversion to a time.Duration yields a negative delay, whose
+// timer fires immediately and turns the periodic announce into a tight loop of HTTP round trips.
+func TestAnnounceIntervalIsBounded(t *testing.T) {
+	for _, one := range []struct {
+		name     string
+		seconds  int
+		expected time.Duration
+	}{
+		{name: "unset", seconds: 0, expected: minAnnounceInterval},
+		{name: "negative", seconds: -1, expected: minAnnounceInterval},
+		{name: "hugely negative", seconds: math.MinInt, expected: minAnnounceInterval},
+		{name: "too frequent", seconds: 60, expected: minAnnounceInterval},
+		{name: "at the minimum", seconds: int(minAnnounceInterval / time.Second), expected: minAnnounceInterval},
+		{name: "reasonable", seconds: 1800, expected: 30 * time.Minute},
+		{name: "at the maximum", seconds: int(maxAnnounceInterval / time.Second), expected: maxAnnounceInterval},
+		{name: "beyond the maximum", seconds: 30 * 24 * 60 * 60, expected: maxAnnounceInterval},
+		{name: "overflows a duration", seconds: math.MaxInt, expected: maxAnnounceInterval},
+		{name: "just past the overflow point", seconds: math.MaxInt64/int(time.Second) + 1, expected: maxAnnounceInterval},
+	} {
+		t.Run(one.name, func(t *testing.T) {
+			c := check.New(t)
+			var tr tracker
+			tr.interval = one.seconds
+			actual := tr.announceInterval()
+			c.Equal(one.expected, actual)
+			c.True(actual >= minAnnounceInterval, "an interval of %d yielded %v", one.seconds, actual)
+		})
+	}
+}
+
+// TestCheckBencode verifies the structural check applied to a tracker's response before the decoder sees it. The
+// decoder allocates a string's declared length before reading it, so a length that isn't backed by actual data has to
+// be caught here.
+func TestCheckBencode(t *testing.T) {
+	c := check.New(t)
+	for _, one := range []struct {
+		name string
+		data string
+	}{
+		{name: "empty", data: ""},
+		{name: "empty dict", data: "de"},
+		{name: "typical response", data: "d8:intervali1800e5:peers12:" + strings.Repeat("x", 12) + "e"},
+		{name: "dict model peers", data: "d5:peersld2:ip8:10.0.0.14:porti6881eeee"},
+		{name: "negative integer", data: "d8:intervali-1ee"},
+		{name: "empty string", data: "d9:trackerid0:e"},
+	} {
+		c.NoError(checkBencode([]byte(one.data)), one.name)
+	}
+
+	for _, one := range []struct {
+		name string
+		data string
+	}{
+		{name: "string length with no data behind it", data: "d5:peers2147483646:"},
+		{name: "string one byte longer than the data", data: "d5:peers4:abe"},
+		{name: "string length that isn't a number", data: "d5:peers99999999999999999999:abe"},
+		{name: "unterminated string length", data: "d5:peers12"},
+		{name: "unterminated integer", data: "d8:intervali1800"},
+		{name: "unmatched end marker", data: "dee"},
+		{name: "truncated dict", data: "d8:intervali1800e"},
+		{name: "unexpected byte", data: "d8:intervalx1800ee"},
+		{name: "nested too deeply", data: strings.Repeat("l", maxBencodeDepth+1) + strings.Repeat("e", maxBencodeDepth+1)},
+	} {
+		c.HasError(checkBencode([]byte(one.data)), one.name)
+	}
+
+	// Nesting right up to the limit is still accepted
+	c.NoError(checkBencode([]byte(strings.Repeat("l", maxBencodeDepth) + strings.Repeat("e", maxBencodeDepth))))
+}
+
+// TestTrackerResponseIsBounded verifies that a tracker, which is an untrusted source, can neither hand us an
+// unbounded response nor talk us into a huge allocation with a few bytes.
+func TestTrackerResponseIsBounded(t *testing.T) {
+	c := check.New(t)
+	var body string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, body)
+	}))
+	defer srv.Close()
+	var tr tracker
+
+	// A response declaring a 2GB string, with nothing behind it, must not be allocated for
+	body = "d5:peers2147483646:"
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	_, err := tr.get(srv.URL)
+	runtime.ReadMemStats(&after)
+	c.HasError(err)
+	const allowed = 64 * 1024 * 1024
+	c.True(after.TotalAlloc-before.TotalAlloc < allowed, "allocated %d bytes for a %d byte response",
+		after.TotalAlloc-before.TotalAlloc, len(body))
+
+	// A response larger than the cap is refused rather than read into memory
+	body = "d5:peers" + strconv.Itoa(2*maxTrackerResponseSize) + ":" + strings.Repeat("x", 2*maxTrackerResponseSize) + "e"
+	_, err = tr.get(srv.URL)
+	c.HasError(err)
+
+	// A normal response still decodes
+	body = "d8:intervali1800e8:completei2e10:incompletei1e5:peers6:" + string([]byte{10, 0, 0, 1, 0x1A, 0xE1}) + "e"
+	in, err := tr.get(srv.URL)
+	c.NoError(err)
+	c.Equal(1800, in.Interval)
+	c.Equal(2, in.Seeders)
+	c.Equal(1, in.Leechers)
+	peers, err := parsePeers(in.PeerAddresses, "<unknown>")
+	c.NoError(err)
+	c.Equal(6881, peers["10.0.0.1"])
+}
+
+// TestAnnounceReportsTransferTotals verifies that the bytes moved on this torrent's behalf reach the tracker. Every
+// announce reporting zero misreports the transfer and breaks ratio accounting on trackers that use the values.
+func TestAnnounceReportsTransferTotals(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+	client := newTestClient(d)
+
+	c.Contains(client.tracker.announceURL(startedMsg), "&uploaded=0&downloaded=0")
+	client.tracker.addUploadedBytes(4096)
+	client.tracker.addDownloadedBytes(16397)
+	client.tracker.addDownloadedBytes(3)
+	c.Contains(client.tracker.announceURL(""), "&uploaded=4096&downloaded=16400")
+}
+
+// TestAnnounceToleratesTheShutdownResponse verifies that a tracker answering the stopped announce minimally doesn't
+// produce a spurious error, and that we stop considering ourselves started either way. The response to that announce
+// is never used — the stop was delivered by the request itself.
+func TestAnnounceToleratesTheShutdownResponse(t *testing.T) {
+	for _, one := range []struct {
+		name string
+		body string
+	}{
+		{name: "empty dict", body: "de"},
+		{name: "no interval", body: "d8:completei2ee"},
+		{name: "zero interval", body: "d8:intervali0ee"},
+		{name: "failure reason", body: "d14:failure reason9:not founde"},
+	} {
+		t.Run(one.name, func(t *testing.T) {
+			c := check.New(t)
+			d, err := dispatcher.NewDispatcher()
+			c.NoError(err)
+			defer d.Stop()
+			client, body := newTestTrackerClient(t, d)
+			*body = one.body
+			client.tracker.lock.Lock()
+			client.tracker.started = true
+			client.tracker.lock.Unlock()
+
+			c.NoError(client.tracker.announce(stoppedMsg))
+			c.False(client.tracker.hasStarted(), "the stop was delivered, so we are no longer started")
+
+			// The same response is still not enough to start with, since the periodic announce needs an interval
+			c.HasError(client.tracker.announce(startedMsg))
+			c.False(client.tracker.hasStarted())
+		})
+	}
+}
+
+// TestAnnounceKeepsTheIntervalWhenOneIsNotReturned verifies that an update or completion announce answered without an
+// interval isn't treated as a failure and doesn't disturb the interval already in hand.
+func TestAnnounceKeepsTheIntervalWhenOneIsNotReturned(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+	client, body := newTestTrackerClient(t, d)
+	*body = "d8:intervali1800e5:peers0:e"
+
+	c.NoError(client.tracker.announce(startedMsg))
+	c.True(client.tracker.hasStarted())
+	c.Equal(30*time.Minute, client.tracker.announceInterval())
+
+	*body = "d5:peers0:e"
+	c.NoError(client.tracker.announce("completed"))
+	c.Equal(30*time.Minute, client.tracker.announceInterval())
+
+	// A failure reason is still an error for anything but the shutdown announce
+	*body = "d14:failure reason9:not founde"
+	c.HasError(client.tracker.announce(""))
+}
+
+// newTestTrackerClient returns a client whose announces go to a stub tracker, along with a pointer to the response
+// body that stub will return. The peer ID is filled in with query-safe bytes, which is what NewClient does and what
+// the announce URL relies on.
+func newTestTrackerClient(t *testing.T, d *dispatcher.Dispatcher) (client *Client, body *string) {
+	t.Helper()
+	body = new(string)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, *body)
+	}))
+	t.Cleanup(srv.Close)
+	client = newTestClient(d)
+	client.torrentFile.Announce = srv.URL
+	for i := range client.id {
+		client.id[i] = urlQuerySafeBytes[i%len(urlQuerySafeBytes)]
+	}
+	return client, body
 }
 
 // testPeerDict builds one entry of a tracker's dict-model peer list. The keys are spelled out the way a tracker would

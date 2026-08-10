@@ -127,6 +127,46 @@ func TestWellFormedMessagesAreAccepted(t *testing.T) {
 	}
 }
 
+// TestTransferTotalsReachTheTracker verifies that the bytes a peer moves are recorded for the tracker, which reports
+// them in every announce. Counters that never leave the peer leave every announce claiming nothing was transferred.
+func TestTransferTotalsReachTheTracker(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+	client := newTestClient(d)
+	c.Equal(int64(0), client.tracker.downloadedBytes.Load())
+	c.Equal(int64(0), client.tracker.uploadedBytes.Load())
+
+	conn, _, _ := startTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+
+	// Tell the peer we have piece 0, which it answers with an interested message
+	message := newTestMessage(haveID, 0, 0, 0, 0)
+	_, err = conn.Write(message)
+	c.NoError(err)
+	c.NoError(conn.SetReadDeadline(time.Now().Add(msgReadDeadline)))
+	response := make([]byte, 5)
+	_, err = io.ReadFull(conn, response)
+	c.NoError(err)
+	c.Equal(newTestMessage(interestedID), response)
+
+	// The counters are updated once each transfer completes, so they may not have caught up yet
+	deadline := time.Now().Add(peerMgmtWait)
+	for {
+		downloaded := client.tracker.downloadedBytes.Load()
+		uploaded := client.tracker.uploadedBytes.Load()
+		if downloaded >= int64(len(message)) && uploaded >= int64(len(response)) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the tracker was told of %d bytes downloaded and %d uploaded, expected at least %d and %d",
+				downloaded, uploaded, len(message), len(response))
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // TestBitFieldSpareBitsAreIgnored verifies that a peer that sets the spare bits at the end of its bit field, which
 // correspond to pieces that don't exist, can't get us to request a piece index beyond the end of the torrent. Doing so
 // would panic when the piece it returned was validated against the piece hashes.
