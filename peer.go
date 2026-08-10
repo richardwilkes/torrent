@@ -45,6 +45,10 @@ const (
 	maxPendingPieceRequests = 512
 )
 
+// errStorageClosed is returned when a peer tries to read or write the torrent's storage after the client has closed
+// it, which can happen for the peer goroutines that outlive the client's peer wait group.
+var errStorageClosed = errors.New("torrent storage has been closed")
+
 const (
 	chokeID byte = iota
 	unchokeID
@@ -429,7 +433,11 @@ func (p *peer) receivedChunk(index, begin int, buffer []byte) error {
 	p.lock.Unlock()
 	if len(one.spans.Spans) == 1 && one.spans.Spans[0].Start == 0 && one.spans.Spans[0].Length == len(one.buffer) {
 		if p.client.torrentFile.Validate(index, one.buffer) {
-			n, err := p.client.file.WriteAt(one.buffer, p.client.torrentFile.OffsetOf(index))
+			var n int
+			err := errStorageClosed
+			if f := p.client.storageFile(); f != nil {
+				n, err = f.WriteAt(one.buffer, p.client.torrentFile.OffsetOf(index))
+			}
 			one.lock.Unlock()
 			p.lock.Lock()
 			delete(p.pieces, index)
@@ -567,7 +575,13 @@ func (p *peer) processPieceRequests(in chan *pieceRequest) {
 		buffer[4] = pieceID
 		binary.BigEndian.PutUint32(buffer[5:9], uint32(req.index))
 		binary.BigEndian.PutUint32(buffer[9:13], uint32(req.begin))
-		if _, err := p.client.file.ReadAt(buffer[13:], p.client.torrentFile.OffsetOf(req.index)+int64(req.begin)); err != nil {
+		// This goroutine isn't tracked by the client's peer wait group, so it can still be draining requests after the
+		// client has closed the storage file.
+		err := errStorageClosed
+		if f := p.client.storageFile(); f != nil {
+			_, err = f.ReadAt(buffer[13:], p.client.torrentFile.OffsetOf(req.index)+int64(req.begin))
+		}
+		if err != nil {
 			errs.LogTo(p.logger, errs.NewWithCause("unable to read piece", err), "index", req.index, "begin", req.begin, "length", req.length)
 			xio.CloseIgnoringErrors(p.conn)
 			process = false

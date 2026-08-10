@@ -130,6 +130,15 @@ func (c *Client) TorrentFile() *tfs.File {
 	return c.torrentFile
 }
 
+// storageFile returns the file the torrent's data is stored in, or nil if it has already been closed. Peer goroutines
+// that aren't tracked by the peer wait group can still be draining work while the client shuts down, so the file must
+// only ever be reached through this.
+func (c *Client) storageFile() *os.File {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+	return c.file
+}
+
 // Stop the torrent. Does not return until the torrent has stopped or the
 // timeout has been hit.
 func (c *Client) Stop(timeout time.Duration) {
@@ -230,7 +239,9 @@ func (c *Client) prepareFile() error {
 	if err != nil {
 		return errs.Wrap(err)
 	}
+	c.lock.Lock()
 	c.file = f
+	c.lock.Unlock()
 	fi, err := f.Stat()
 	if err != nil {
 		return errs.Wrap(err)
@@ -327,15 +338,18 @@ func (c *Client) HandleConnection(conn net.Conn, logger *slog.Logger, _ dispatch
 			return
 		}
 	}
-	c.lock.Lock()
-	c.peers[conn] = p
-	c.lock.Unlock()
+	// The peer is registered while holding the peer management lock so that it is either fully tracked before the stop
+	// begins, and therefore closed by closeAllPeers, or not added at all. Adding it to the map first would leave a
+	// stale entry behind, with a write queue nothing would ever drain, when the client is already stopping.
 	c.peerMgmtLock.Lock()
 	if c.peerMgmtStopping {
 		c.peerMgmtLock.Unlock()
 		return
 	}
 	c.peerWaitGroup.Add(1)
+	c.lock.Lock()
+	c.peers[conn] = p
+	c.lock.Unlock()
 	c.peerMgmtLock.Unlock()
 	defer func() {
 		xio.CloseIgnoringErrors(conn)
@@ -399,14 +413,22 @@ func (c *Client) finish(err error) {
 	if err = c.tracker.announceStopped(); err != nil {
 		errs.LogTo(c.logger, err)
 	}
-	if c.file != nil {
-		if err = c.file.Close(); err != nil {
+	// Peer goroutines that the wait group doesn't track can still be draining work at this point, so take the file
+	// away under the lock rather than clearing the field out from under them.
+	c.lock.Lock()
+	f := c.file
+	c.file = nil
+	c.lock.Unlock()
+	if f != nil {
+		if err = f.Close(); err != nil {
 			errs.LogTo(c.logger, err)
 		}
-		c.file = nil
 	}
 	c.closeRateLimiters()
 	c.tracker.setState(state)
+	c.lock.Lock()
+	c.stopped = true
+	c.lock.Unlock()
 }
 
 // closeRateLimiters releases our rate limiters from the dispatcher's limiter tree, which would otherwise continue to
@@ -443,14 +465,23 @@ func (c *Client) startPeerManagement() {
 	c.peerMgmtLock.Lock()
 	c.peerMgmtDone = done
 	c.peerMgmtLock.Unlock()
-	go c.managePeers(ready, done)
+	// Tickers, rather than a fresh timer on each pass through the loop, since restarting the timers every time around
+	// would mean the longer of the two intervals could never elapse.
+	clearExpired := time.NewTicker(peerClearExpiredDownloadsInterval)
+	adjust := time.NewTicker(peerAdjustmentInterval)
+	go func() {
+		defer clearExpired.Stop()
+		defer adjust.Stop()
+		c.managePeers(ready, done, clearExpired.C, adjust.C)
+	}()
 	<-ready
 }
 
-// managePeers periodically adjusts our peers until the client is stopped. 'ready' is closed once the initial
-// adjustment has been made and 'done' is closed once peer management has stopped. Note that c.peerMgmtStop is only
-// ever closed, never replaced, so it may be used without holding the lock.
-func (c *Client) managePeers(ready, done chan struct{}) {
+// managePeers periodically adjusts our peers until the client is stopped. Expired downloads are cleared each time
+// 'clearExpired' ticks and peers are adjusted each time 'adjust' ticks. 'ready' is closed once the initial adjustment
+// has been made and 'done' is closed once peer management has stopped. Note that c.peerMgmtStop is only ever closed,
+// never replaced, so it may be used without holding the lock.
+func (c *Client) managePeers(ready, done chan struct{}, clearExpired, adjust <-chan time.Time) {
 	defer close(done)
 	select {
 	case <-c.peerMgmtStop:
@@ -461,11 +492,11 @@ func (c *Client) managePeers(ready, done chan struct{}) {
 	close(ready)
 	for {
 		select {
-		case <-time.After(peerClearExpiredDownloadsInterval):
+		case <-clearExpired:
 			for _, p := range c.currentPeers() {
 				p.clearExpiredDownloads()
 			}
-		case <-time.After(peerAdjustmentInterval):
+		case <-adjust:
 			c.adjustPeers()
 		case <-c.peerMgmtStop:
 			return

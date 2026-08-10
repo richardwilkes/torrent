@@ -340,6 +340,180 @@ func TestStoppedNotificationIsNotLost(t *testing.T) {
 	}
 }
 
+// TestStorageIsNotClearedOutFromUnderPeers verifies that a peer still serving piece requests as the client finishes
+// doesn't race with the storage file being closed, and stops serving once it is gone rather than dereferencing a nil
+// file. The race is only detected when the tests are run with -race.
+func TestStorageIsNotClearedOutFromUnderPeers(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+	client := newTestClient(d)
+	client.file = newTestStorage(t, client)
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+
+	// Drain whatever the peer queues up for writing, so that it never blocks on a full queue
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		for range p.writeQueue { //nolint:revive // Draining the queue is all that is wanted
+		}
+	}()
+
+	// processPieceRequests isn't tracked by the client's peer wait group, so it is still running when the client
+	// closes the storage file
+	requests := make(chan *pieceRequest)
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		p.processPieceRequests(requests)
+	}()
+	fed := make(chan struct{})
+	go func() {
+		defer close(fed)
+		defer close(requests)
+		for client.storageFile() != nil {
+			requests <- &pieceRequest{index: 1, length: chunkSize}
+		}
+	}()
+
+	client.finish(errStopRequested)
+	c.Nil(client.storageFile())
+	<-fed
+	<-served
+	close(p.writeQueue)
+	<-drained
+}
+
+// TestStopIsIdempotentOnceStopped verifies that the stopped state is actually recorded, so that a Stop arriving after
+// the client has already stopped returns immediately rather than running the shutdown path a second time.
+func TestStopIsIdempotentOnceStopped(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+	client := newTestClient(d)
+	c.False(clientStopped(client))
+
+	client.finish(errStopRequested)
+	c.True(clientStopped(client))
+
+	// Nothing will ever close the stopped channel now, so a Stop that ignored the stopped state would block for the
+	// full timeout
+	waitFor(t, "Stop", func() { client.Stop(time.Minute) })
+	client.lock.RLock()
+	requested := client.stopRequested
+	client.lock.RUnlock()
+	c.False(requested, "Stop must not re-run the shutdown path once the client has stopped")
+}
+
+// TestPeerIsNotLeftBehindWhileStopping verifies that a connection arriving while the client is stopping doesn't leave
+// a peer behind in the map, since nothing would ever drain its write queue or close its connection.
+func TestPeerIsNotLeftBehindWhileStopping(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+	client := newTestClient(d)
+	client.closeAllPeers()
+
+	conn, remote := newTestConnPair(t)
+	defer xio.CloseIgnoringErrors(conn)
+	defer xio.CloseIgnoringErrors(remote)
+	var peerID dispatcher.PeerID
+	_, err = conn.Write(peerID[:])
+	c.NoError(err)
+
+	var extensions dispatcher.ProtocolExtensions
+	waitFor(t, "HandleConnection", func() {
+		client.HandleConnection(remote, client.logger, extensions, client.torrentFile.InfoHash, false)
+	})
+	c.Equal(0, len(client.currentPeers()))
+}
+
+// TestPeerManagementIntervalsAreIndependent verifies that each of peer management's two periodic tasks is driven by
+// its own timer. Restarting both timers on every pass through the loop leaves the longer of the two intervals unable
+// to ever elapse, making its task unreachable.
+func TestPeerManagementIntervalsAreIndependent(t *testing.T) {
+	for _, one := range []struct {
+		pick func(clearExpired, adjust chan time.Time) chan time.Time
+		name string
+	}{
+		{
+			name: "clear expired downloads",
+			pick: func(clearExpired, _ chan time.Time) chan time.Time { return clearExpired },
+		},
+		{
+			name: "adjust peers",
+			pick: func(_, adjust chan time.Time) chan time.Time { return adjust },
+		},
+	} {
+		t.Run(one.name, func(t *testing.T) {
+			c := check.New(t)
+			d, err := dispatcher.NewDispatcher()
+			c.NoError(err)
+			defer d.Stop()
+			client := newTestClient(d)
+			conn, p := newTestPeer(t, client)
+			defer xio.CloseIgnoringErrors(conn)
+
+			ready := make(chan struct{})
+			done := make(chan struct{})
+			client.peerMgmtLock.Lock()
+			client.peerMgmtDone = done
+			client.peerMgmtLock.Unlock()
+			clearExpired := make(chan time.Time)
+			adjust := make(chan time.Time)
+			go client.managePeers(ready, done, clearExpired, adjust)
+			<-ready
+
+			// Only the tick under test is ever delivered, so it is the only thing that can clear the expired download
+			p.lock.Lock()
+			p.pieces[0] = &piece{buffer: make([]byte, chunkSize), timeout: time.Now().Add(-time.Minute)}
+			p.lock.Unlock()
+			select {
+			case one.pick(clearExpired, adjust) <- time.Now():
+			case <-time.After(peerMgmtWait):
+				t.Fatal("the " + one.name + " tick was not accepted")
+			}
+			waitForDownloadsCleared(t, p)
+
+			waitFor(t, "closeAllPeers", func() { client.closeAllPeers() })
+			select {
+			case <-done:
+			case <-time.After(peerMgmtWait):
+				t.Fatal("peer management goroutine leaked after the client was stopped")
+			}
+		})
+	}
+}
+
+// clientStopped returns whether the client has recorded that it finished stopping.
+func clientStopped(c *Client) bool {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+	return c.stopped
+}
+
+// waitForDownloadsCleared fails the test if the peer's expired downloads aren't cleared promptly.
+func waitForDownloadsCleared(t *testing.T, p *peer) {
+	t.Helper()
+	deadline := time.Now().Add(peerMgmtWait)
+	for {
+		p.lock.RLock()
+		count := len(p.pieces)
+		p.lock.RUnlock()
+		if count == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the expired download was not cleared")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // peerManagementDone returns the channel that will be closed when peer management has stopped.
 func peerManagementDone(c *Client) chan struct{} {
 	c.peerMgmtLock.Lock()
