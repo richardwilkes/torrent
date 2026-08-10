@@ -82,25 +82,65 @@ func main() {
 		torrent.SeedDuration(*seedDuration))
 	xos.ExitIfErr(err)
 
-	t := time.NewTimer(time.Second)
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	m := &monitor{
+		status:   c.Status,
+		extract:  func() { extractFiles(c.TorrentFile()) },
+		remove:   func() { xos.ExitIfErr(os.Remove(f.StoragePath())) },
+		complete: completeNotifier,
+		stopped:  stoppedNotifier,
+		tick:     t.C,
+	}
+	m.run()
+	xos.Exit(0)
+}
+
+// monitor acts on a client's notifications until it stops. The side effects are supplied by the caller, rather than
+// reached through the client, so that the handling of the notifications can be tested on its own.
+type monitor struct {
+	status    func() *torrent.Status
+	extract   func()
+	remove    func()
+	complete  <-chan *torrent.Client
+	stopped   <-chan *torrent.Client
+	tick      <-chan time.Time
+	extracted bool
+}
+
+// run processes notifications until the client stops.
+func (m *monitor) run() {
 	for {
 		select {
-		case <-completeNotifier:
+		case <-m.complete:
 			slog.Info("complete")
-			extractFiles(c.TorrentFile())
-		case <-stoppedNotifier:
-			switch c.Status().State {
+			m.extractIfNeeded()
+		case <-m.stopped:
+			switch m.status().State {
 			case torrent.Errored:
 				slog.Error("stopped with error")
 			case torrent.Done:
 				slog.Info("stopped")
-				xos.ExitIfErr(os.Remove(f.StoragePath()))
+				// The client sends the completion and stopped notifications in quick succession when seeding ends,
+				// and it may not even have sent the completion one yet, so the files may still be waiting to be
+				// extracted. They have to be, since the storage they came from is about to be removed.
+				m.extractIfNeeded()
+				if m.extracted {
+					m.remove()
+				}
 			}
-			xos.Exit(0)
-		case <-t.C:
-			slog.Info(c.Status().String())
-			t.Reset(time.Second)
+			return
+		case <-m.tick:
+			slog.Info(m.status().String())
 		}
+	}
+}
+
+// extractIfNeeded extracts the torrent's files if the download has finished and they haven't been extracted already.
+func (m *monitor) extractIfNeeded() {
+	if !m.extracted && m.status().RemainingBytes == 0 {
+		m.extract()
+		m.extracted = true
 	}
 }
 
