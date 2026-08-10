@@ -748,6 +748,10 @@ func newTestConnPair(t *testing.T) (local, remote net.Conn) {
 	if !ok {
 		t.Fatal("unable to accept the connection")
 	}
+	t.Cleanup(func() {
+		xio.CloseIgnoringErrors(local)
+		xio.CloseIgnoringErrors(remote)
+	})
 	return local, remote
 }
 

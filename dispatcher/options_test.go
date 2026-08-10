@@ -48,7 +48,7 @@ func TestGlobalRateCapsTooSmallForAPieceMessageAreRejected(t *testing.T) {
 
 // TestMinimumGlobalRateCapPermitsAPieceMessage verifies that a client's limiter, which is subordinate to the
 // dispatcher's, can pass a whole piece message when the global cap is at the minimum, and that a global cap one byte
-// below it leaves that same request stuck forever, which is what makes the minimum necessary.
+// below it can never carry that same request, which is what makes the minimum necessary.
 func TestMinimumGlobalRateCapPermitsAPieceMessage(t *testing.T) {
 	c := check.New(t)
 	d, err := NewDispatcher()
@@ -64,12 +64,13 @@ func TestMinimumGlobalRateCapPermitsAPieceMessage(t *testing.T) {
 		t.Fatal("a piece message could not be sent at the minimum global cap")
 	}
 
-	// A cap the limiter tree can never satisfy doesn't fail the request, it simply never completes it, leaving the
-	// peer that made it blocked for good
+	// A request the limiter tree can never satisfy is refused outright, rather than being left queued for capacity
+	// that will never come, so the peer that made it is disconnected instead of stalling for good
 	d.OutRate.SetCap(MinimumRateCap - 1)
 	select {
-	case <-client.Use(MaxPieceMessageLength):
-		t.Fatal("a piece message should not be possible below the minimum global cap")
+	case uerr := <-client.Use(MaxPieceMessageLength):
+		c.HasError(uerr, "a piece message must not be possible below the minimum global cap")
 	case <-time.After(rateSettleTime):
+		t.Fatal("a piece message below the minimum global cap was neither refused nor sent")
 	}
 }

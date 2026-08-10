@@ -11,6 +11,7 @@ package dispatcher
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -38,6 +39,11 @@ const (
 	// Failures are cached for much less time than successes so that a transient outage doesn't hide our address for an
 	// hour, while still preventing every caller from triggering its own network probe while the failure persists.
 	externalIPFailureCacheDuration = time.Minute
+	// minAcceptRetryDelay and maxAcceptRetryDelay bound how long the accept loop pauses after a failure that isn't the
+	// listener being closed. Backing off keeps a condition that persists, such as having run out of file descriptors,
+	// from turning into a tight loop, while still recovering from it promptly once it clears.
+	minAcceptRetryDelay = 5 * time.Millisecond
+	maxAcceptRetryDelay = time.Second
 )
 
 // ConnectionHandler defines the interface for handling torrent connections.
@@ -97,8 +103,8 @@ func NewDispatcher(options ...func(*Dispatcher) error) (*Dispatcher, error) {
 			}
 		}
 		if !success {
-			return nil, d.abandon(errs.Newf("unable to listen on any port in the range %d to %d", d.internalPort,
-				d.externalPort))
+			return nil, d.abandon(errs.NewWithCausef(err, "unable to listen on any port in the range %d to %d",
+				d.internalPort, d.externalPort))
 		}
 	}
 	d.externalPort = d.internalPort
@@ -110,14 +116,18 @@ func NewDispatcher(options ...func(*Dispatcher) error) (*Dispatcher, error) {
 // the construction to fail, with any errors encountered during the cleanup appended to it.
 func (d *Dispatcher) abandon(err error) error {
 	d.gatekeeper.Close()
-	d.InRate.Close()
-	d.OutRate.Close()
+	d.closeRateLimiters()
 	if d.listener != nil {
 		if closeErr := d.listener.Close(); closeErr != nil {
 			return errs.Append(err, closeErr)
 		}
 	}
 	return err
+}
+
+func (d *Dispatcher) closeRateLimiters() {
+	d.InRate.Close()
+	d.OutRate.Close()
 }
 
 // portFromAddr extracts the port from a network address of the form "host:port".
@@ -162,6 +172,7 @@ func (d *Dispatcher) Stop() {
 	if err := d.listener.Close(); err != nil {
 		errs.LogTo(d.logger, err)
 	}
+	d.closeRateLimiters()
 }
 
 // Register a connection handler with this dispatcher.
@@ -217,15 +228,39 @@ func (d *Dispatcher) cachedExternalIP() (net.IP, bool) {
 }
 
 func (d *Dispatcher) listen() {
-	d.logger.Info("listening", "port", d.InternalPort(), "external_ip", d.ExternalIP(), "external_port", d.ExternalPort())
+	// The startup message is logged from its own goroutine because determining our external IP address consults
+	// outside sites, which can take many seconds when the network is unreachable. Waiting for that before entering the
+	// accept loop leaves the first inbound connections sitting unanswered in the kernel's backlog, long enough for the
+	// peers that made them to time out their handshakes.
+	go d.logListening()
+	var retryDelay time.Duration
 	for {
 		conn, err := d.listener.Accept()
 		if err != nil {
-			d.logger.Info("stopped listening", "port", d.InternalPort())
-			return
+			// Only the listener being closed means we're done. Everything else, such as having run out of file
+			// descriptors, is transient, and giving up on it would leave the listener open with nothing accepting from
+			// it, so remotes would go on connecting into a backlog that is never serviced for the life of the process.
+			if errors.Is(err, net.ErrClosed) {
+				d.logger.Info("stopped listening", "port", d.InternalPort())
+				return
+			}
+			if retryDelay == 0 {
+				retryDelay = minAcceptRetryDelay
+			} else {
+				retryDelay = min(2*retryDelay, maxAcceptRetryDelay)
+			}
+			errs.LogTo(d.logger, errs.NewWithCause("unable to accept connection", err), "retry_in", retryDelay)
+			time.Sleep(retryDelay)
+			continue
 		}
+		retryDelay = 0
 		go d.dispatch(conn)
 	}
+}
+
+// logListening reports the address we're accepting connections on.
+func (d *Dispatcher) logListening() {
+	d.logger.Info("listening", "port", d.InternalPort(), "external_ip", d.ExternalIP(), "external_port", d.ExternalPort())
 }
 
 func (d *Dispatcher) dispatch(conn net.Conn) {

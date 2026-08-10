@@ -11,9 +11,15 @@ package dispatcher
 
 import (
 	"context"
+	"errors"
+	"io"
+	"log/slog"
 	"net"
 	"runtime"
+	"strconv"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -67,20 +73,185 @@ func TestNewDispatcherOptionFailureCleansUp(t *testing.T) {
 // reports an error and doesn't leave the gatekeeper's prune goroutine running.
 func TestNewDispatcherPortRangeFailureCleansUp(t *testing.T) {
 	c := check.New(t)
-	// Bind on all interfaces, since that is what the dispatcher will attempt to do
-	listener, err := net.Listen("tcp", ":0") //nolint:gosec // Must match what the dispatcher does to force a conflict
-	c.NoError(err)
+	port, listener := occupiedPort(t)
 	defer xio.CloseIgnoringErrors(listener)
-	var port uint32
-	port, err = portFromAddr(listener.Addr().String())
-	c.NoError(err)
 
 	before := runtime.NumGoroutine()
-	var d *Dispatcher
-	d, err = NewDispatcher(PortRange(port, port))
+	d, err := NewDispatcher(PortRange(port, port))
 	c.HasError(err)
 	c.Nil(d)
 	waitForGoroutines(t, before)
+}
+
+// TestPortRangeFailureReportsWhyItFailed verifies that the reason no port in the range could be listened on is passed
+// along, rather than being dropped in favor of a message that says only that none of them worked.
+func TestPortRangeFailureReportsWhyItFailed(t *testing.T) {
+	c := check.New(t)
+	port, listener := occupiedPort(t)
+	defer xio.CloseIgnoringErrors(listener)
+
+	_, err := NewDispatcher(PortRange(port, port))
+	c.HasError(err)
+	var opErr *net.OpError
+	c.True(errors.As(err, &opErr), "the underlying listen failure must be preserved: %v", err)
+	c.Equal("listen", opErr.Op)
+	c.Contains(err.Error(), opErr.Error())
+}
+
+// occupiedPort returns a port that is already being listened on, along with the listener holding it, which the caller
+// is responsible for closing.
+func occupiedPort(t *testing.T) (uint32, net.Listener) {
+	t.Helper()
+	// Bind on all interfaces, since that is what the dispatcher will attempt to do
+	listener, err := net.Listen("tcp", ":0") //nolint:gosec // Must match what the dispatcher does to force a conflict
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := portFromAddr(listener.Addr().String())
+	if err != nil {
+		xio.CloseIgnoringErrors(listener)
+		t.Fatal(err)
+	}
+	return port, listener
+}
+
+// TestStopReleasesResources verifies that stopping a dispatcher leaves nothing of it behind. Each rate limiter owns a
+// goroutine and a ticker, so a dispatcher that doesn't close them leaks both on every create and stop cycle.
+func TestStopReleasesResources(t *testing.T) {
+	c := check.New(t)
+	before := runtime.NumGoroutine()
+	d, err := NewDispatcher(stubExternalIP(nil))
+	c.NoError(err)
+	d.Stop()
+	c.True(d.InRate.Closed(), "the inbound rate limiter must be closed")
+	c.True(d.OutRate.Closed(), "the outbound rate limiter must be closed")
+	waitForGoroutines(t, before)
+
+	// Stopping a second time must neither panic nor block
+	d.Stop()
+}
+
+// TestListenerAcceptsWhileTheExternalIPIsBeingDetermined verifies that connections are accepted without waiting on the
+// external IP lookup, which consults outside sites and can take many seconds to give up when the network is
+// unreachable.
+func TestListenerAcceptsWhileTheExternalIPIsBeingDetermined(t *testing.T) {
+	c := check.New(t)
+	release := make(chan struct{})
+	probing := make(chan struct{}, 1)
+	d, err := NewDispatcher(func(one *Dispatcher) error {
+		one.lookupExternalIP = func(_ context.Context, _ time.Duration) net.IP {
+			probing <- struct{}{}
+			<-release
+			return nil
+		}
+		return nil
+	})
+	c.NoError(err)
+	defer d.Stop()
+	defer close(release)
+
+	// The lookup is now under way and will not be completing
+	select {
+	case <-probing:
+	case <-time.After(goroutineWait):
+		t.Fatal("the external IP was never looked up")
+	}
+
+	conn, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(d.InternalPort()))))
+	c.NoError(err)
+	defer xio.CloseIgnoringErrors(conn)
+
+	// A handshake that doesn't start with the protocol identifier is refused and the connection closed, which can only
+	// happen if the connection was accepted
+	c.NoError(conn.SetDeadline(time.Now().Add(goroutineWait)))
+	_, err = conn.Write(make([]byte, len(protocolIdentifier)))
+	c.NoError(err)
+	_, err = conn.Read(make([]byte, 1))
+	c.True(errors.Is(err, io.EOF), "the connection was never accepted: %v", err)
+}
+
+// TestAcceptRetriesTransientErrors verifies that the accept loop doesn't treat every failure as a shutdown. Accept
+// returns transient errors, such as having run out of file descriptors, and abandoning the loop for one of those would
+// leave the listener open with nothing accepting from it, silently losing inbound connectivity for good.
+func TestAcceptRetriesTransientErrors(t *testing.T) {
+	c := check.New(t)
+	local, remote := net.Pipe()
+	defer xio.CloseIgnoringErrors(local)
+	listener := &scriptedListener{script: []acceptResult{
+		{err: syscall.EMFILE},
+		{err: syscall.ENFILE},
+		{conn: remote},
+	}}
+	d := &Dispatcher{
+		listener:         listener,
+		logger:           slog.New(slog.DiscardHandler),
+		gatekeeper:       NewGateKeeper(),
+		lookupExternalIP: func(_ context.Context, _ time.Duration) net.IP { return nil },
+	}
+	defer d.gatekeeper.Close()
+
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		d.listen()
+	}()
+
+	// The connection accepted after the transient failures must still be dispatched, which closes it
+	c.NoError(local.SetDeadline(time.Now().Add(goroutineWait)))
+	_, err := local.Read(make([]byte, 1))
+	c.HasError(err, "the connection accepted after the transient failures was never dispatched")
+
+	// Only the listener being closed, which the script reports once it has been used up, ends the loop
+	select {
+	case <-stopped:
+	case <-time.After(goroutineWait):
+		t.Fatal("the accept loop never stopped")
+	}
+	c.Equal(len(listener.script)+1, listener.accepts(), "every scripted result must have been consumed")
+}
+
+// scriptedListener hands out a canned sequence of accept results, then reports that it has been closed.
+type scriptedListener struct {
+	script []acceptResult
+	next   int
+	lock   sync.Mutex
+}
+
+type acceptResult struct {
+	conn net.Conn
+	err  error
+}
+
+func (l *scriptedListener) Accept() (net.Conn, error) {
+	l.lock.Lock()
+	defer l.lock.Unlock()
+	if l.next >= len(l.script) {
+		l.next++
+		return nil, net.ErrClosed
+	}
+	one := l.script[l.next]
+	l.next++
+	return one.conn, one.err
+}
+
+func (l *scriptedListener) Close() error { return nil }
+
+func (l *scriptedListener) Addr() net.Addr { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)} }
+
+// accepts returns the number of times Accept has been called.
+func (l *scriptedListener) accepts() int {
+	l.lock.Lock()
+	defer l.lock.Unlock()
+	return l.next
+}
+
+// stubExternalIP replaces the external IP lookup with one that answers immediately, so that a test neither issues real
+// network requests nor leaves a probe goroutine running behind it.
+func stubExternalIP(ip net.IP) func(*Dispatcher) error {
+	return func(d *Dispatcher) error {
+		d.lookupExternalIP = func(_ context.Context, _ time.Duration) net.IP { return ip }
+		return nil
+	}
 }
 
 // TestExternalIPDoesNotSerializeCallers verifies that a caller arriving while a lookup is in progress isn't blocked
