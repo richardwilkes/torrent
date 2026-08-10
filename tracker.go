@@ -379,6 +379,13 @@ func (t *tracker) clearDownload(index int) {
 	t.lock.Unlock()
 }
 
+// hasPiece returns true if the piece with the given index has been downloaded and verified.
+func (t *tracker) hasPiece(index int) bool {
+	t.lock.RLock()
+	defer t.lock.RUnlock()
+	return t.have.IsSet(index)
+}
+
 func (t *tracker) isInteresting(has *fixedbits.Bits) bool {
 	t.lock.RLock()
 	i := fixedbits.FirstAvailable(has, t.downloading, t.have)

@@ -13,14 +13,16 @@ import (
 	"time"
 
 	"github.com/richardwilkes/toolbox/v2/errs"
+	"github.com/richardwilkes/torrent/dispatcher"
 )
 
 // DownloadCap sets the maximum download speed of the client, subject to the
-// dispatcher's overall limit. Default is no limit.
+// dispatcher's overall limit. Must be at least dispatcher.MinimumRateCap.
+// Default is no limit.
 func DownloadCap(bytesPerSecond int) func(*Client) error {
 	return func(c *Client) error {
-		if bytesPerSecond < 1 {
-			return errs.New("DownloadCap must be at least 1")
+		if bytesPerSecond < dispatcher.MinimumRateCap {
+			return errs.Newf("DownloadCap must be at least %d", dispatcher.MinimumRateCap)
 		}
 		c.InRate.SetCap(bytesPerSecond)
 		return nil
@@ -28,11 +30,12 @@ func DownloadCap(bytesPerSecond int) func(*Client) error {
 }
 
 // UploadCap sets the maximum upload speed of the client, subject to the
-// dispatcher's overall limit. Default is no limit.
+// dispatcher's overall limit. Must be at least dispatcher.MinimumRateCap.
+// Default is no limit.
 func UploadCap(bytesPerSecond int) func(*Client) error {
 	return func(c *Client) error {
-		if bytesPerSecond < 1 {
-			return errs.New("UploadCap must be at least 1")
+		if bytesPerSecond < dispatcher.MinimumRateCap {
+			return errs.Newf("UploadCap must be at least %d", dispatcher.MinimumRateCap)
 		}
 		c.OutRate.SetCap(bytesPerSecond)
 		return nil

@@ -15,24 +15,24 @@ import (
 	"github.com/richardwilkes/toolbox/v2/errs"
 )
 
-// GlobalDownloadCap sets the maximum download speed of the dispatcher.
-// Default is no limit.
+// GlobalDownloadCap sets the maximum download speed of the dispatcher, which also caps every client using it. Must be
+// at least MinimumRateCap. Default is no limit.
 func GlobalDownloadCap(bytesPerSecond int) func(*Dispatcher) error {
 	return func(d *Dispatcher) error {
-		if bytesPerSecond < 1 {
-			return errs.New("GlobalDownloadCap must be at least 1")
+		if bytesPerSecond < MinimumRateCap {
+			return errs.Newf("GlobalDownloadCap must be at least %d", MinimumRateCap)
 		}
 		d.InRate.SetCap(bytesPerSecond)
 		return nil
 	}
 }
 
-// GlobalUploadCap sets the maximum upload speed of the dispatcher. Default
-// is no limit.
+// GlobalUploadCap sets the maximum upload speed of the dispatcher, which also caps every client using it. Must be at
+// least MinimumRateCap. Default is no limit.
 func GlobalUploadCap(bytesPerSecond int) func(*Dispatcher) error {
 	return func(d *Dispatcher) error {
-		if bytesPerSecond < 1 {
-			return errs.New("GlobalUploadCap must be at least 1")
+		if bytesPerSecond < MinimumRateCap {
+			return errs.Newf("GlobalUploadCap must be at least %d", MinimumRateCap)
 		}
 		d.OutRate.SetCap(bytesPerSecond)
 		return nil

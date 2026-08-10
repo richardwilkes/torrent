@@ -289,6 +289,7 @@ func TestValidPieceRequestIsServed(t *testing.T) {
 	defer d.Stop()
 	client := newTestClient(d)
 	client.file = newTestStorage(t, client)
+	markTestPiecesAvailable(client, 1)
 	conn, p, done := startTestPeer(t, client)
 	defer xio.CloseIgnoringErrors(conn)
 
@@ -321,6 +322,53 @@ func TestValidPieceRequestIsServed(t *testing.T) {
 	}
 }
 
+// TestPieceRequestForPieceWeDontHaveIsIgnored verifies that a request for a piece we haven't downloaded yet is never
+// answered, since the storage holds nothing but whatever it was initialized with for that range and the remote would
+// treat the response as a corrupt piece and ban us.
+func TestPieceRequestForPieceWeDontHaveIsIgnored(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+	client := newTestClient(d)
+	client.file = newTestStorage(t, client)
+
+	// We have the second piece, but not the first
+	markTestPiecesAvailable(client, 1)
+	conn, p, done := startTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+
+	// Let the peer know it isn't choked, so that it will serve requests
+	p.setChoked(false)
+	c.NoError(conn.SetReadDeadline(time.Now().Add(msgReadDeadline)))
+	buffer := make([]byte, 5)
+	_, err = io.ReadFull(conn, buffer)
+	c.NoError(err)
+	c.Equal(newTestMessage(unchokeID), buffer)
+
+	// Ask for the piece we don't have, then the one we do. Requests are served in the order they arrive, so the
+	// response to the second request coming back first proves the first was never served.
+	_, err = conn.Write(newTestPieceRequest(requestID, 0, 0, chunkSize))
+	c.NoError(err)
+	_, err = conn.Write(newTestPieceRequest(requestID, 1, 0, chunkSize))
+	c.NoError(err)
+
+	buffer = make([]byte, dispatcher.MaxPieceMessageLength)
+	_, err = io.ReadFull(conn, buffer)
+	c.NoError(err)
+	c.Equal(uint32(9+chunkSize), binary.BigEndian.Uint32(buffer[:4]))
+	c.Equal(pieceID, buffer[4])
+	c.Equal(uint32(1), binary.BigEndian.Uint32(buffer[5:9]), "the piece we don't have must not have been served")
+	c.Equal(uint32(0), binary.BigEndian.Uint32(buffer[9:13]))
+	c.Equal(testStorageBytes(1, 0, chunkSize), buffer[13:])
+
+	select {
+	case <-done:
+		t.Fatal("peer closed the connection for a valid piece request")
+	default:
+	}
+}
+
 // TestPieceRequestFloodIsRejected verifies that a peer that asks for far more than we can deliver is disconnected
 // rather than allowed to grow the pending request queue without bound.
 func TestPieceRequestFloodIsRejected(t *testing.T) {
@@ -330,6 +378,7 @@ func TestPieceRequestFloodIsRejected(t *testing.T) {
 	defer d.Stop()
 	client := newTestClient(d)
 	client.file = newTestStorage(t, client)
+	markTestPiecesAvailable(client, 0, 1, 2, 3)
 	conn, p, done := startTestPeer(t, client)
 	defer xio.CloseIgnoringErrors(conn)
 
@@ -431,6 +480,17 @@ func nextReadDeadline(t *testing.T, conn *deadlineConn) time.Duration {
 	case <-time.After(msgReadDeadline):
 		t.Fatal("no read deadline was set")
 		return 0
+	}
+}
+
+// markTestPiecesAvailable marks the given pieces of the test torrent as ones we have, so that requests for them will
+// be served. Intended to be called before any peers have been added, since it deliberately bypasses the notification
+// that would otherwise be sent to them.
+func markTestPiecesAvailable(client *Client, indexes ...int) {
+	client.tracker.lock.Lock()
+	defer client.tracker.lock.Unlock()
+	for _, index := range indexes {
+		client.tracker.have.Set(index)
 	}
 }
 

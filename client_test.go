@@ -350,6 +350,7 @@ func TestStorageIsNotClearedOutFromUnderPeers(t *testing.T) {
 	defer d.Stop()
 	client := newTestClient(d)
 	client.file = newTestStorage(t, client)
+	markTestPiecesAvailable(client, 1)
 	conn, p := newTestPeer(t, client)
 	defer xio.CloseIgnoringErrors(conn)
 

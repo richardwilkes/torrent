@@ -23,6 +23,7 @@ import (
 	"github.com/richardwilkes/toolbox/v2/xio"
 	"github.com/richardwilkes/torrent/container/fixedbits"
 	"github.com/richardwilkes/torrent/container/spanlist"
+	"github.com/richardwilkes/torrent/dispatcher"
 	"github.com/richardwilkes/torrent/tio"
 )
 
@@ -35,7 +36,7 @@ const (
 	keepAlivePeriod         = 2 * time.Minute
 	downloadReadDeadline    = 10 * time.Second
 	maxWaitForChunkDownload = 20 * time.Second
-	chunkSize               = 16384
+	chunkSize               = dispatcher.ChunkSize
 	// maxMessageLength is the largest message we'll accept from a peer, not counting the length prefix. The largest
 	// message we ever expect is a piece message, which is 9 bytes plus a chunk, but bit field messages grow with the
 	// number of pieces in the torrent, so allow a generous amount beyond that.
@@ -568,6 +569,15 @@ func (p *peer) processPieceRequests(in chan *pieceRequest) {
 	process := true
 	for req := range in {
 		if !process {
+			continue
+		}
+		if !p.client.tracker.hasPiece(req.index) {
+			// We only ever tell peers about the pieces we have, so this is a broken or hostile peer. Serving the
+			// request anyway would hand it whatever the storage happens to hold for a piece we haven't downloaded
+			// yet, which the remote would rightly treat as corrupt data and ban us for. There is no way to refuse a
+			// request in the base protocol, so it is simply ignored.
+			p.logger.Warn("ignoring request for a piece we don't have", "index", req.index, "begin", req.begin,
+				"length", req.length)
 			continue
 		}
 		buffer := make([]byte, 13+req.length)
