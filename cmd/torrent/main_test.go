@@ -10,11 +10,15 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/richardwilkes/toolbox/v2/check"
 	"github.com/richardwilkes/torrent"
+	"github.com/richardwilkes/torrent/tfs"
+	"github.com/zeebo/bencode"
 )
 
 const (
@@ -23,6 +27,9 @@ const (
 
 	extractAction = "extract"
 	removeAction  = "remove"
+
+	lengthKey = "length"
+	fileB     = "b.txt"
 )
 
 // TestMonitorStop verifies what is done when the client stops. The completion and stopped notifications are sent in
@@ -121,4 +128,76 @@ func TestMonitorCompleteThenStop(t *testing.T) {
 	}()
 	m.run()
 	c.Equal([]string{extractAction, removeAction}, actions)
+}
+
+// newTorrentFile builds a torrent whose storage lives in the current directory and holds the supplied content.
+func newTorrentFile(t *testing.T, info map[string]any, content string) *tfs.File {
+	t.Helper()
+	c := check.New(t)
+	data, err := bencode.EncodeBytes(map[string]any{"info": info})
+	c.NoError(err)
+	f, err := tfs.NewFileFromBytes(data)
+	c.NoError(err)
+	c.NoError(os.WriteFile(f.StoragePath(), []byte(content), 0o600))
+	return f
+}
+
+// TestExtractFiles verifies that a torrent's files land on disk with their full virtual paths intact. The file info
+// the torrent carries holds only base names, so the paths have to come from walking the tree.
+func TestExtractFiles(t *testing.T) {
+	c := check.New(t)
+	t.Chdir(t.TempDir())
+
+	tf := newTorrentFile(t, map[string]any{
+		"name":         "example",
+		"piece length": int64(16),
+		"pieces":       make([]byte, 40),
+		"files": []any{
+			map[string]any{lengthKey: int64(12), "path": []any{"sub", "a.txt"}},
+			map[string]any{lengthKey: int64(8), "path": []any{fileB}},
+		},
+	}, "0123456789abcdefghij")
+	extractFiles(tf)
+
+	data, err := os.ReadFile(filepath.Join("example", "sub", "a.txt"))
+	c.NoError(err)
+	c.Equal("0123456789ab", string(data))
+	data, err = os.ReadFile(filepath.Join("example", fileB))
+	c.NoError(err)
+	c.Equal("cdefghij", string(data))
+}
+
+// TestExtractFilesSingle verifies that a single-file torrent lands in the current directory rather than in a
+// wrapping directory of its own.
+func TestExtractFilesSingle(t *testing.T) {
+	c := check.New(t)
+	t.Chdir(t.TempDir())
+
+	tf := newTorrentFile(t, map[string]any{
+		"name":         "example.bin",
+		"piece length": int64(16),
+		"pieces":       make([]byte, 40),
+		lengthKey:      int64(20),
+	}, "0123456789abcdefghij")
+	extractFiles(tf)
+
+	data, err := os.ReadFile("example.bin")
+	c.NoError(err)
+	c.Equal("0123456789abcdefghij", string(data))
+}
+
+func TestSanitizePath(t *testing.T) {
+	c := check.New(t)
+	for _, one := range []struct {
+		in   string
+		want []string
+	}{
+		{in: "a/" + fileB, want: []string{"a", fileB}},
+		{in: "./a/../" + fileB, want: []string{fileB}},
+		{in: "a//" + fileB, want: []string{"a", fileB}},
+		{in: "a/:" + fileB, want: []string{"a", "@6" + fileB}},
+		{in: ".", want: nil},
+	} {
+		c.Equal(filepath.Join(one.want...), sanitizePath(one.in), one.in)
+	}
 }

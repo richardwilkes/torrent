@@ -11,13 +11,13 @@ package tfs
 
 import (
 	"io"
+	"io/fs"
 	"os"
 )
 
 type vdir struct {
 	owner  *vfs
 	next   int
-	done   bool
 	closed bool
 }
 
@@ -37,26 +37,53 @@ func (v *vdir) ReadAt(_ []byte, _ int64) (int, error) {
 	return 0, os.ErrInvalid
 }
 
+// Readdir mimics the os.File method of the same name: with count > 0 it returns at most count entries and reports
+// io.EOF once none remain, while with count <= 0 it returns everything left, which may legitimately be an empty
+// slice, and never reports io.EOF.
 func (v *vdir) Readdir(count int) ([]os.FileInfo, error) {
+	entries, err := v.read(count)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]os.FileInfo, len(entries))
+	for i, one := range entries {
+		result[i] = one
+	}
+	return result, nil
+}
+
+// ReadDir implements the fs.ReadDirFile interface, which uses the same count conventions as Readdir. Without this,
+// fs.ReadDir and fs.WalkDir can't traverse the tree.
+func (v *vdir) ReadDir(count int) ([]fs.DirEntry, error) {
+	entries, err := v.read(count)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]fs.DirEntry, len(entries))
+	for i, one := range entries {
+		result[i] = one
+	}
+	return result, nil
+}
+
+// read returns the next batch of children, advancing the read position.
+func (v *vdir) read(count int) ([]*vfs, error) {
 	if v.closed {
 		return nil, os.ErrClosed
 	}
-	if v.done {
-		return nil, io.EOF
+	remaining := len(v.owner.children) - v.next
+	if count > 0 {
+		if remaining == 0 {
+			return nil, io.EOF
+		}
+		if count > remaining {
+			count = remaining
+		}
+	} else {
+		count = remaining
 	}
-	maximum := len(v.owner.children) - v.next
-	if count < 1 {
-		count = maximum
-	}
-	if count > maximum {
-		count = maximum
-	}
-	result := make([]os.FileInfo, count)
-	for i := range result {
-		result[i] = v.owner.children[v.next+i]
-	}
+	result := v.owner.children[v.next : v.next+count]
 	v.next += count
-	v.done = v.next == len(v.owner.children)
 	return result, nil
 }
 

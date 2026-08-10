@@ -12,14 +12,17 @@ package main
 import (
 	"flag"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/richardwilkes/toolbox/v2/xfilepath"
 	"github.com/richardwilkes/toolbox/v2/xflag"
+	"github.com/richardwilkes/toolbox/v2/xio"
 	"github.com/richardwilkes/toolbox/v2/xos"
 	"github.com/richardwilkes/toolbox/v2/xslog"
 	"github.com/richardwilkes/torrent"
@@ -145,39 +148,55 @@ func (m *monitor) extractIfNeeded() {
 }
 
 func extractFiles(tf *tfs.File) {
-	files := tf.EmbeddedFiles()
 	dir := "."
-	if len(files) > 1 {
+	if len(tf.EmbeddedFiles()) > 1 {
 		dir = filepath.Join(dir, sanitizePath(tf.Info.Name))
 	}
-	for _, file := range files {
-		path := filepath.Join(dir, sanitizePath(file.Name()))
-		if file.IsDir() {
-			slog.Info("extract", "dir", path)
-			xos.ExitIfErr(os.Mkdir(path, 0o750))
-		} else {
-			slog.Info("extract", "file", path)
-			r, err := tf.Open(file.Name())
-			xos.ExitIfErr(err)
-			if d, _ := filepath.Split(path); d != "" {
-				xos.ExitIfErr(os.MkdirAll(d, 0o750))
-			}
-			var f *os.File
-			f, err = os.Create(path)
-			xos.ExitIfErr(err)
-			_, err = io.Copy(f, r)
-			xos.ExitIfErr(err)
-			xos.ExitIfErr(f.Close())
-			xos.ExitIfErr(r.Close())
+	// The torrent's info only carries the base name of each entry, so walk the tree to recover the paths that Open
+	// expects and that determine where each file lands on disk.
+	xos.ExitIfErr(fs.WalkDir(tf, ".", func(p string, d fs.DirEntry, err error) error {
+		if err != nil || p == "." {
+			return err
 		}
-	}
+		target := filepath.Join(dir, sanitizePath(p))
+		if d.IsDir() {
+			slog.Info("extract", "dir", target)
+			return os.MkdirAll(target, 0o750)
+		}
+		slog.Info("extract", "file", target)
+		return extractFile(tf, p, target)
+	}))
 }
 
-func sanitizePath(path string) string {
-	parts := strings.Split(filepath.Clean(path), string(os.PathSeparator))
+// extractFile copies a single file out of the torrent's storage and into the local filesystem at target.
+func extractFile(tf *tfs.File, p, target string) error {
+	r, err := tf.Open(p)
+	if err != nil {
+		return err
+	}
+	defer xio.CloseIgnoringErrors(r)
+	if d, _ := filepath.Split(target); d != "" {
+		if err = os.MkdirAll(d, 0o750); err != nil {
+			return err
+		}
+	}
+	f, err := os.Create(target)
+	if err != nil {
+		return err
+	}
+	if _, err = io.Copy(f, r); err != nil {
+		xio.CloseIgnoringErrors(f) // The copy failure is the more meaningful error, so keep it
+		return err
+	}
+	return f.Close()
+}
+
+// sanitizePath makes each component of a slash-separated virtual path safe to use as a local filesystem path.
+func sanitizePath(p string) string {
+	parts := strings.Split(path.Clean(p), "/")
 	list := make([]string, 0, len(parts))
 	for _, part := range parts {
-		if part != "" {
+		if part != "" && part != "." {
 			list = append(list, xfilepath.SanitizeName(part))
 		}
 	}

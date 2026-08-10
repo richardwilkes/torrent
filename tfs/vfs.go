@@ -13,16 +13,22 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"time"
 
 	"github.com/richardwilkes/toolbox/v2/errs"
 )
 
-var _ fs.File = &vfile{}
+var (
+	_ fs.File        = &vfile{}
+	_ fs.ReadDirFile = &vdir{}
+	_ fs.FileInfo    = &vfs{}
+	_ fs.DirEntry    = &vfs{}
+)
 
 type vfs struct {
 	storage  string
-	name     string
+	path     string // The full, slash-separated, fs.ValidPath-conforming path of this node; the root is "."
 	modTime  time.Time
 	children []*vfs
 	offset   int64
@@ -30,8 +36,20 @@ type vfs struct {
 	mode     os.FileMode
 }
 
+// Name implements the fs.FileInfo and fs.DirEntry interfaces, both of which require the base name of the entry
+// rather than the full path.
 func (v *vfs) Name() string {
-	return v.name
+	return path.Base(v.path)
+}
+
+// Type implements the fs.DirEntry interface.
+func (v *vfs) Type() fs.FileMode {
+	return v.mode.Type()
+}
+
+// Info implements the fs.DirEntry interface.
+func (v *vfs) Info() (fs.FileInfo, error) {
+	return v, nil
 }
 
 func (v *vfs) Size() int64 {
@@ -60,7 +78,7 @@ func (v *vfs) open() (fs.File, error) {
 	}
 	f, err := os.Open(v.storage)
 	if err != nil {
-		return nil, errs.NewWithCausef(err, "unable to open %s", v.name)
+		return nil, errs.NewWithCausef(err, "unable to open %s", v.path)
 	}
 	return &vfile{
 		owner: v,
