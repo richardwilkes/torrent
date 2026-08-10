@@ -10,13 +10,12 @@
 package tfs
 
 import (
+	"errors"
 	"io"
 	"io/fs"
 	"os"
 	"path"
 	"time"
-
-	"github.com/richardwilkes/toolbox/v2/errs"
 )
 
 var (
@@ -78,7 +77,13 @@ func (v *vfs) open() (fs.File, error) {
 	}
 	f, err := os.Open(v.storage)
 	if err != nil {
-		return nil, errs.NewWithCausef(err, "unable to open %s", v.path)
+		// The fs.FS contract calls for an *fs.PathError naming the path that was opened. The one os.Open produced
+		// names the on-disk storage file, which isn't part of this filesystem's namespace, so only its underlying
+		// cause is carried over.
+		if pathErr, ok := errors.AsType[*fs.PathError](err); ok {
+			err = pathErr.Err
+		}
+		return nil, &fs.PathError{Op: openOp, Path: v.path, Err: err}
 	}
 	return &vfile{
 		owner: v,

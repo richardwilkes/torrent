@@ -10,14 +10,20 @@
 package tfs_test
 
 import (
+	"bytes"
+	"crypto/sha1" //nolint:gosec // The spec requires sha1
 	"errors"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
+	"strings"
 	"testing"
 	"testing/fstest"
+	"unicode/utf8"
 
 	"github.com/richardwilkes/toolbox/v2/check"
 	"github.com/richardwilkes/torrent/tfs"
@@ -27,11 +33,15 @@ import (
 const (
 	sha1Size = 20
 
+	// maxStorageNameLength mirrors the limit tfs applies to a single path element of the storage path.
+	maxStorageNameLength = 255
+
 	lengthKey = "length"
 	pathKey   = "path"
 	subDir    = "sub"
 	fileA     = "a.txt"
 	fileB     = "b.txt"
+	coverName = "cover.jpg"
 )
 
 // readdirFile is the legacy, os.File-style directory reading interface that an opened directory also provides.
@@ -152,6 +162,27 @@ func TestNewFileFromBytesRejectsBadFileLists(t *testing.T) {
 				map[string]any{lengthKey: int64(8), pathKey: []any{fileB}},
 			},
 		},
+		{
+			name: "file that a later entry uses as a directory",
+			files: []any{
+				map[string]any{lengthKey: int64(12), pathKey: []any{subDir}},
+				map[string]any{lengthKey: int64(8), pathKey: []any{subDir, fileB}},
+			},
+		},
+		{
+			name: "directory that a later entry uses as a file",
+			files: []any{
+				map[string]any{lengthKey: int64(12), pathKey: []any{subDir, fileB}},
+				map[string]any{lengthKey: int64(8), pathKey: []any{subDir}},
+			},
+		},
+		{
+			name: "file that a later entry uses as an ancestor directory",
+			files: []any{
+				map[string]any{lengthKey: int64(12), pathKey: []any{subDir}},
+				map[string]any{lengthKey: int64(8), pathKey: []any{subDir, "deeper", fileB}},
+			},
+		},
 	} {
 		t.Run(one.name, func(t *testing.T) {
 			info := multiFileInfo()
@@ -177,6 +208,195 @@ func TestNewFileFromBytesAcceptsValidMetadata(t *testing.T) {
 	c.Equal(2, f.PieceCount())
 	c.Equal(int64(20), f.Size())
 	c.Equal(int64(4), f.LengthOf(1))
+
+	// Entries that merely share a directory are not a file/directory collision.
+	info := multiFileInfo()
+	info["files"] = []any{
+		map[string]any{lengthKey: int64(12), pathKey: []any{subDir, fileA}},
+		map[string]any{lengthKey: int64(8), pathKey: []any{subDir, fileB}},
+	}
+	f, err = tfs.NewFileFromBytes(encodeTorrent(t, info))
+	c.NoError(err)
+	c.Equal(int64(20), f.Size())
+}
+
+// TestNewFileFromBytesRejectsAnOversizedPieceLength guards the allocation sites that do
+// make([]byte, Info.PieceLength): a self-consistent torrent declaring an absurd piece length would otherwise drive
+// those to a terabyte-scale allocation the moment verification or a piece download starts.
+func TestNewFileFromBytesRejectsAnOversizedPieceLength(t *testing.T) {
+	for _, one := range []struct {
+		name        string
+		pieceLength int64
+	}{
+		{name: "one byte too large", pieceLength: tfs.MaxPieceLength + 1},
+		{name: "absurdly large", pieceLength: int64(1) << 40},
+		{name: "larger than math.MaxInt32", pieceLength: int64(math.MaxInt32) + 1},
+	} {
+		t.Run(one.name, func(t *testing.T) {
+			c := check.New(t)
+			info := singleFileInfo()
+			info["piece length"] = one.pieceLength
+			// The piece count is made consistent with the declared piece length, so only the bound itself can
+			// reject this.
+			info["pieces"] = hashes(1)
+			_, err := tfs.NewFileFromBytes(encodeTorrent(t, info))
+			c.HasError(err)
+		})
+	}
+
+	// The largest permitted piece length is still accepted.
+	c := check.New(t)
+	info := singleFileInfo()
+	info["piece length"] = int64(tfs.MaxPieceLength)
+	info["pieces"] = hashes(1)
+	f, err := tfs.NewFileFromBytes(encodeTorrent(t, info))
+	c.NoError(err)
+	c.Equal(int64(tfs.MaxPieceLength), f.Info.PieceLength)
+	c.Equal(int64(20), f.LengthOf(0))
+}
+
+// bstr returns the bencoded form of a string.
+func bstr(s string) string {
+	return strconv.Itoa(len(s)) + ":" + s
+}
+
+// torrentWithUnsortedInfoKeys returns a bencoded torrent whose info dictionary carries its keys in an order other
+// than the sorted one, along with the exact bytes of that dictionary. Decoders accept it as-is, but re-encoding the
+// decoded form sorts the keys, changing the bytes an info hash would be taken over.
+func torrentWithUnsortedInfoKeys() (torrent, info []byte) {
+	var infoBuf bytes.Buffer
+	infoBuf.WriteString("d")
+	infoBuf.WriteString(bstr(lengthKey) + "i20e")
+	infoBuf.WriteString(bstr("piece length") + "i16e")
+	infoBuf.WriteString(bstr("pieces") + strconv.Itoa(2*sha1Size) + ":")
+	infoBuf.Write(hashes(2))
+	infoBuf.WriteString(bstr("name") + bstr("example.bin"))
+	infoBuf.WriteString("e")
+
+	var buf bytes.Buffer
+	buf.WriteString("d")
+	buf.WriteString(bstr("announce") + bstr("http://example.com/announce"))
+	buf.WriteString(bstr("info"))
+	buf.Write(infoBuf.Bytes())
+	buf.WriteString("e")
+	return buf.Bytes(), infoBuf.Bytes()
+}
+
+// TestInfoHashComesFromTheRawInfoDictionary verifies the hash is taken over the info dictionary exactly as it
+// appeared in the file. A hash taken over a re-encoding would differ for any torrent that wasn't already canonically
+// encoded, and every announce and handshake for it would fail.
+func TestInfoHashComesFromTheRawInfoDictionary(t *testing.T) {
+	c := check.New(t)
+	data, info := torrentWithUnsortedInfoKeys()
+	f, err := tfs.NewFileFromBytes(data)
+	c.NoError(err)
+	c.Equal(tfs.InfoHash(sha1.Sum(info)), f.InfoHash) //nolint:gosec // The spec requires sha1
+
+	// The round trip through the decoder sorts the keys, so hashing that form would have yielded a different hash.
+	var m map[string]any
+	c.NoError(bencode.DecodeBytes(data, &m))
+	reencoded, err := bencode.EncodeBytes(m["info"])
+	c.NoError(err)
+	c.NotEqual(info, reencoded)
+	c.NotEqual(tfs.InfoHash(sha1.Sum(reencoded)), f.InfoHash) //nolint:gosec // The spec requires sha1
+
+	// A canonically encoded torrent hashes to the same value either way.
+	data = encodeTorrent(t, singleFileInfo())
+	f, err = tfs.NewFileFromBytes(data)
+	c.NoError(err)
+	c.NoError(bencode.DecodeBytes(data, &m))
+	reencoded, err = bencode.EncodeBytes(m["info"])
+	c.NoError(err)
+	c.Equal(tfs.InfoHash(sha1.Sum(reencoded)), f.InfoHash) //nolint:gosec // The spec requires sha1
+}
+
+// TestStoragePathStaysAValidFilename covers names long enough to require truncation: the cut may not split a
+// multi-byte rune or one of SanitizeName's two-character escapes, since the result has to be a name the filesystem
+// will actually create.
+func TestStoragePathStaysAValidFilename(t *testing.T) {
+	for _, one := range []struct {
+		label string
+		name  string
+	}{
+		{label: "multi-byte runes", name: strings.Repeat("é", 200)},
+		{label: "escaped characters", name: strings.Repeat("@", 200)},
+		{label: "both", name: strings.Repeat("日@", 100)},
+		{label: "ascii", name: strings.Repeat("a", 400)},
+	} {
+		t.Run(one.label, func(t *testing.T) {
+			c := check.New(t)
+			info := singleFileInfo()
+			info["name"] = one.name
+			f, err := tfs.NewFileFromBytes(encodeTorrent(t, info))
+			c.NoError(err)
+			f.Path = filepath.Join(t.TempDir(), f.Path)
+
+			base := filepath.Base(f.StoragePath())
+			c.True(len(base) <= maxStorageNameLength, "%d bytes exceeds the limit", len(base))
+			c.True(utf8.ValidString(base), "storage name must be valid UTF-8")
+			c.True(strings.HasSuffix(base, tfs.DownloadExt))
+			// A trailing '@' would be the orphaned first half of an escape pair.
+			c.False(strings.HasSuffix(strings.TrimSuffix(base, tfs.DownloadExt), "@"))
+
+			// The real test of all of the above: the filesystem accepts the name.
+			file, err := os.OpenFile(f.StoragePath(), os.O_CREATE|os.O_RDWR, 0o600)
+			c.NoError(err)
+			c.NoError(file.Close())
+		})
+	}
+
+	// Names short enough to fit are left alone.
+	c := check.New(t)
+	f, err := tfs.NewFileFromBytes(encodeTorrent(t, singleFileInfo()))
+	c.NoError(err)
+	c.Equal("example"+tfs.DownloadExt, f.StoragePath())
+}
+
+// TestEmbeddedFilesOrderIsStable verifies the order doesn't shift from call to call. The input order comes from map
+// iteration, so files whose base names compare equal need the full path as a tie-breaker to stay put.
+func TestEmbeddedFilesOrderIsStable(t *testing.T) {
+	c := check.New(t)
+	info := multiFileInfo()
+	info["files"] = []any{
+		map[string]any{lengthKey: int64(5), pathKey: []any{"y", coverName}},
+		map[string]any{lengthKey: int64(7), pathKey: []any{"x", coverName}},
+		map[string]any{lengthKey: int64(8), pathKey: []any{fileB}},
+	}
+	data := encodeTorrent(t, info)
+
+	// Only base names are exposed, so the sizes stand in as the identity of the two cover images: x's comes first,
+	// since the full path breaks the tie between their equal names.
+	expected := []string{fileB + ":8", coverName + ":7", coverName + ":5"}
+	for i := range 25 {
+		f, err := tfs.NewFileFromBytes(data)
+		c.NoError(err)
+		for range 2 {
+			actual := make([]string, 0, len(expected))
+			for _, one := range f.EmbeddedFiles() {
+				actual = append(actual, one.Name()+":"+strconv.FormatInt(one.Size(), 10))
+			}
+			c.Equal(expected, actual, "iteration %d", i)
+		}
+	}
+}
+
+// TestOpenReportsMissingStorageAsAPathError checks the fs.FS contract for the one failure that isn't decided by the
+// virtual tree: the backing storage file not being openable.
+func TestOpenReportsMissingStorageAsAPathError(t *testing.T) {
+	c := check.New(t)
+	f, err := tfs.NewFileFromBytes(encodeTorrent(t, multiFileInfo()))
+	c.NoError(err)
+	f.Path = filepath.Join(t.TempDir(), f.Path) // The storage file is never created.
+
+	_, err = f.Open(fileB)
+	c.HasError(err)
+	var pathErr *fs.PathError
+	c.True(errors.As(err, &pathErr), "must yield an *fs.PathError")
+	c.Equal("open", pathErr.Op)
+	// The path must name the virtual file, not the on-disk storage file behind it.
+	c.Equal(fileB, pathErr.Path)
+	c.True(errors.Is(err, fs.ErrNotExist))
+	c.NotContains(err.Error(), tfs.DownloadExt)
 }
 
 // TestLengthOfStaysPositive guards the allocation sites that do make([]byte, LengthOf(i)): validation must make it
