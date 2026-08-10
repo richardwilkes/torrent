@@ -10,6 +10,7 @@
 package fixedbits
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/richardwilkes/toolbox/v2/check"
@@ -141,4 +142,121 @@ func TestFirstAvailableLimitsToLogicalSize(t *testing.T) {
 	c.Equal(-1, FirstAvailable(has, downloading, shortHave))
 	has.Set(2)
 	c.Equal(2, FirstAvailable(has, downloading, shortHave))
+}
+
+// TestByteLength verifies the storage size reported for a given number of bits, which peer.go relies on to validate the
+// length of an incoming bit field message.
+func TestByteLength(t *testing.T) {
+	c := check.New(t)
+	for _, one := range []struct {
+		bits  int
+		bytes int
+	}{
+		{bits: -8, bytes: 0},
+		{bits: -1, bytes: 0},
+		{bits: 0, bytes: 0},
+		{bits: 1, bytes: 1},
+		{bits: 7, bytes: 1},
+		{bits: 8, bytes: 1},
+		{bits: 9, bytes: 2},
+		{bits: 15, bytes: 2},
+		{bits: 16, bytes: 2},
+		{bits: 17, bytes: 3},
+		{bits: 1000, bytes: 125},
+		{bits: 1001, bytes: 126},
+	} {
+		bm := New(one.bits)
+		c.Equal(one.bytes, bm.ByteLength(), "%d bits", one.bits)
+		c.Equal(one.bytes, len(bm.data), "%d bits", one.bits)
+		c.Equal(max(one.bits, 0), bm.Length(), "%d bits", one.bits)
+		c.Equal(one.bytes, bm.Clone().ByteLength(), "%d bits", one.bits)
+
+		// Filling the storage doesn't change how much of it there is
+		bm.SetBytes(bytes.Repeat([]byte{0xFF}, one.bytes))
+		c.Equal(one.bytes, bm.ByteLength(), "%d bits", one.bits)
+	}
+}
+
+// TestAnySet verifies both outcomes of AnySet, including for bits that live outside the first byte.
+func TestAnySet(t *testing.T) {
+	c := check.New(t)
+	c.False(New(0).AnySet())
+	c.False(New(20).AnySet())
+
+	bm := New(20)
+	for _, i := range []int{0, 7, 8, 15, 19} {
+		bm.Set(i)
+		c.True(bm.AnySet(), "bit %d", i)
+		bm.Unset(i)
+		c.False(bm.AnySet(), "bit %d", i)
+	}
+
+	// Out of range indexes never register
+	bm.Set(-1)
+	bm.Set(20)
+	bm.Set(1000)
+	c.False(bm.AnySet())
+
+	// Only bits within the logical size count, since SetBytes discards the spare ones
+	bm.SetBytes([]byte{0, 0, 0x0F})
+	c.False(bm.AnySet())
+	bm.SetBytes([]byte{0, 0, 0x10})
+	c.True(bm.AnySet())
+}
+
+// TestClone verifies the clone is an independent copy rather than a second view onto the same storage.
+func TestClone(t *testing.T) {
+	c := check.New(t)
+	bm := New(20)
+	bm.Set(3)
+	bm.Set(19)
+	clone := bm.Clone()
+	c.Equal(bm.Length(), clone.Length())
+	c.Equal(bm.ByteLength(), clone.ByteLength())
+	c.Equal(bm.data, clone.data)
+
+	// Mutating the clone must leave the original alone...
+	clone.Set(10)
+	clone.Unset(3)
+	c.True(clone.IsSet(10))
+	c.False(bm.IsSet(10))
+	c.False(clone.IsSet(3))
+	c.True(bm.IsSet(3))
+
+	// ...and mutating the original must leave the clone alone
+	bm.Set(0)
+	bm.Unset(19)
+	c.True(bm.IsSet(0))
+	c.False(clone.IsSet(0))
+	c.False(bm.IsSet(19))
+	c.True(clone.IsSet(19))
+
+	// Replacing the whole of one's storage must not disturb the other
+	clone.SetBytes([]byte{0xFF, 0xFF, 0xFF})
+	c.Equal(-1, clone.NextUnset(0))
+	c.Equal(1, bm.NextUnset(0))
+
+	// An empty set of bits clones without incident
+	empty := New(0).Clone()
+	c.Equal(0, empty.Length())
+	c.Equal(0, empty.ByteLength())
+	c.False(empty.AnySet())
+}
+
+// TestSetBytesWithOversizedBuffer verifies that a buffer holding more than the backing storage can accept is truncated
+// rather than growing the storage, since the buffer comes from a remote peer.
+func TestSetBytesWithOversizedBuffer(t *testing.T) {
+	c := check.New(t)
+	bm := New(4)
+	bm.SetBytes([]byte{0xF0, 0xFF, 0xFF})
+	c.Equal(1, bm.ByteLength())
+	c.Equal(4, bm.Length())
+	c.Equal(uint8(0xF0), bm.data[0])
+	c.Equal(-1, bm.NextUnset(0))
+
+	// An empty set of bits accepts anything and retains nothing
+	bm = New(0)
+	bm.SetBytes([]byte{0xFF, 0xFF})
+	c.Equal(0, bm.ByteLength())
+	c.False(bm.AnySet())
 }

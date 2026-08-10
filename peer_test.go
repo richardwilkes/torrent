@@ -332,6 +332,12 @@ func TestPieceRequestFloodIsRejected(t *testing.T) {
 	client.file = newTestStorage(t, client)
 	conn, p, done := startTestPeer(t, client)
 	defer xio.CloseIgnoringErrors(conn)
+
+	// Throttle what may be written before unchoking. Without this, the responses drain out of the pending queue and
+	// into the kernel's socket buffers as fast as the requests arrive, so whether the queue ever reaches its limit
+	// depends on how much the machine happens to buffer for a loopback connection. The cap has to leave room for a
+	// whole piece message, since the rate limiter refuses any single amount larger than the cap outright.
+	client.OutRate.SetCap(2 * chunkSize)
 	p.setChoked(false)
 
 	// Ask for more than will be held onto, without ever reading the responses
