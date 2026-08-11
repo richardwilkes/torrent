@@ -1432,8 +1432,21 @@ func TestSimultaneousConnectionsCannotOverfillThePeerSlots(t *testing.T) {
 	defer xio.CloseIgnoringErrors(existing)
 
 	const arriving = 4
+	// Each arriving connection is decided either by being registered as a peer or by its HandleConnection returning
+	// without having been, which is what the wait below watches for
+	type arrival struct {
+		remote   net.Conn
+		finished chan struct{}
+		decided  bool
+	}
+	arrivals := make([]*arrival, 0, arriving)
 	var wg sync.WaitGroup
 	var extensions dispatcher.ProtocolExtensions
+	// The connections are all set up before any of them is handled and the goroutines are held at a barrier until they
+	// have been, since it is connections arriving at once that the serialization is there for: started as they were
+	// built, each has finished being admitted or refused well before the next one is under way and the interleaving
+	// this is about never happens at all.
+	start := make(chan struct{})
 	for i := range arriving {
 		conn, remote := newTestConnPair(t)
 		var peerID dispatcher.PeerID
@@ -1443,26 +1456,67 @@ func TestSimultaneousConnectionsCannotOverfillThePeerSlots(t *testing.T) {
 		}
 		_, err := conn.Write(peerID[:])
 		c.NoError(err)
+		one := &arrival{remote: remote, finished: make(chan struct{})}
+		arrivals = append(arrivals, one)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer close(one.finished)
+			<-start
 			client.HandleConnection(remote, client.logger, extensions, client.torrentFile.InfoHash, false, nil)
 		}()
 		t.Cleanup(func() { xio.CloseIgnoringErrors(conn) })
 	}
+	close(start)
 
-	// The ones that lost their slot again are still unwinding, so the count is given a moment to settle
+	// Nothing is counted until every one of the admissions has run. Sampling before then makes the assertions say
+	// nothing at all — with none of them admitted yet the count is trivially within the limit, and the close below then
+	// refuses whatever was still pending, so an admission that had stopped being serialized would pass all the same —
+	// and sampling part way through can land in the window inside admitPeer between the peer given up being dropped and
+	// the new one being registered, where the count is momentarily zero.
 	deadline := time.Now().Add(peerMgmtWait)
-	count := len(client.currentPeers())
-	for count > client.peersWanted && !time.Now().After(deadline) {
+	for {
+		undecided := 0
+		for _, one := range arrivals {
+			switch {
+			case one.decided:
+			case peerRegistered(client, one.remote):
+				// An admitted connection stays inside HandleConnection for the whole of its peer session, so being
+				// registered is what says its admission is over. It is latched, since a peer that is itself given up to
+				// make room for a later arrival goes back out of the map.
+				one.decided = true
+			default:
+				select {
+				case <-one.finished:
+					one.decided = true
+				default:
+					undecided++
+				}
+			}
+		}
+		if undecided == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d of the %d arriving connections were neither admitted nor refused", undecided, arriving)
+		}
 		time.Sleep(time.Millisecond)
-		count = len(client.currentPeers())
 	}
+
+	count := len(client.currentPeers())
 	c.True(count <= client.peersWanted, "%d peers were admitted, but only %d were wanted", count, client.peersWanted)
 	c.Equal(1, count, "a connection that had room made for it must still be taken on")
 
 	client.closeAllPeers(peerMgmtStopWait)
 	wg.Wait()
+}
+
+// peerRegistered reports whether the connection has been taken on as one of the client's peers.
+func peerRegistered(c *Client, conn net.Conn) bool {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+	_, ok := c.peers[conn]
+	return ok
 }
 
 // TestDroppingAPeerFreesItsSlotAtOnce verifies that the peer given up to make room leaves the map where it is dropped

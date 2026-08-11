@@ -72,11 +72,15 @@ type Client struct {
 	peerMgmtDone             chan struct{}      // protected by peerMgmtLock
 	peers                    map[net.Conn]*peer // protected by lock
 	dialing                  map[string]bool    // protected by lock
-	stoppedChan              chan bool          // protected by lock
-	concurrentDownloads      int
-	peersWanted              int
-	seedDuration             time.Duration
-	peerMgmtLock             sync.Mutex
+	// stoppedChan is closed by run() as it returns, which is what Stop waits on. Unlike peerMgmtDone, which is
+	// replaced each time peer management is started and so has to be read under the lock that guards the replacement,
+	// this is assigned once at construction and never again: the channel itself does the synchronizing, so neither the
+	// close nor the receive holds the client's lock.
+	stoppedChan         chan bool
+	concurrentDownloads int
+	peersWanted         int
+	seedDuration        time.Duration
+	peerMgmtLock        sync.Mutex
 	// admitLock serializes taking a connection on as a peer, so that the check for room, the drop that makes it and
 	// the registration that takes it can't interleave with another connection doing the same.
 	admitLock                sync.Mutex

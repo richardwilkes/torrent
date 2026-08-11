@@ -435,10 +435,27 @@ func (a peerAddr) isSelf(externalAddr string, externalPort int) bool {
 	return a.ip == externalAddr && a.port == externalPort
 }
 
+// isDialable returns true if the entry names a host that could be a peer. The port is left to the callers, which read
+// it from formats whose ranges differ; what is checked here is the host, which the compact form always fills in but
+// which the dict model takes verbatim from the tracker.
+//
+// A peer list is unverified data, and an entry naming no host in particular is what a hostile tracker uses to point us
+// at ourselves: an empty "ip" makes net.JoinHostPort produce ":6881", and the unspecified address — which both formats
+// can carry — produces "0.0.0.0:6881". Either dials our own machine, so what receives our BitTorrent handshakes is
+// whatever local service happens to be listening on the port the tracker chose rather than a peer. Anything else that
+// isn't an address is left alone: BEP 3 lets the dict model carry a DNS name, and resolving it is the dial's business.
+func (a peerAddr) isDialable() bool {
+	if a.ip == "" {
+		return false
+	}
+	ip := net.ParseIP(a.ip)
+	return ip == nil || !ip.IsUnspecified()
+}
+
 // parseCompactPeers extracts the peer addresses from the compact peer list format, which is a series of 6-byte
 // entries, each holding a 4-byte IPv4 address followed by a 2-byte port. A tracker response is unverified data, so a
 // trailing partial entry is ignored rather than allowed to run off the end of the list. Our own address is omitted, as
-// are entries with no port.
+// are entries with no port and entries naming no host.
 func parseCompactPeers(value, externalAddr string, externalPort int) []peerAddr {
 	peerAddresses := make([]peerAddr, 0, len(value)/6)
 	for i := 0; i+6 <= len(value); i += 6 {
@@ -446,7 +463,7 @@ func parseCompactPeers(value, externalAddr string, externalPort int) []peerAddr 
 			ip:   net.IPv4(value[i], value[i+1], value[i+2], value[i+3]).String(),
 			port: int(binary.BigEndian.Uint16([]byte(value[i+4 : i+6]))),
 		}
-		if one.port != 0 && !one.isSelf(externalAddr, externalPort) {
+		if one.port != 0 && one.isDialable() && !one.isSelf(externalAddr, externalPort) {
 			peerAddresses = append(peerAddresses, one)
 		}
 	}
@@ -456,8 +473,8 @@ func parseCompactPeers(value, externalAddr string, externalPort int) []peerAddr 
 // parsePeers extracts the peer addresses from a tracker's "peers" value. Although we always ask for the compact form,
 // a tracker is free to ignore that and answer with the dict model instead, so both are accepted: a bencoded string is
 // the compact form and a bencoded list is the dict model. A missing or empty value simply yields no peers. Our own
-// address is omitted, as are entries whose port isn't one that can be dialed. What was found is logged to the caller's
-// logger, since a peer list is per-torrent detail that belongs wherever the rest of that client's logging goes.
+// address is omitted, as are entries whose port or host isn't one that can be dialed. What was found is logged to the
+// caller's logger, since a peer list is per-torrent detail that belongs wherever the rest of that client's logging goes.
 //
 // The result is a list rather than a map keyed by IP, since several peers of a swarm sharing one IP is the ordinary
 // state of affairs behind a NAT: keyed that way, all but the last of them are lost.
@@ -487,7 +504,7 @@ func parsePeers(logger *slog.Logger, raw bencode.RawMessage, externalAddr string
 			// pass until the next announce replaces the list.
 			if one.Port > 0 && one.Port <= math.MaxUint16 {
 				entry := peerAddr{ip: one.IP, port: one.Port}
-				if !entry.isSelf(externalAddr, externalPort) {
+				if entry.isDialable() && !entry.isSelf(externalAddr, externalPort) {
 					peerAddresses = append(peerAddresses, entry)
 				}
 			}
@@ -552,8 +569,15 @@ func (t *tracker) announce(ctx context.Context, event string) error {
 	}
 	// An announce the shutdown overtook has nothing left to say. What it came back with describes a swarm we are on
 	// our way out of, and letting the peer list, the interval and the counts we report land after the stopped event
-	// would leave all of them belonging to a client that no longer exists. The start announce is exempt: it is what
-	// decides whether a stopped event is owed at all, and it completes before any stop can be signaled.
+	// would leave all of them belonging to a client that no longer exists.
+	//
+	// The start announce is exempt, and not because a stop can't overlap it: Client.Stop cancels this very context from
+	// another goroutine precisely so that a start announce parked on a slow tracker is cut short, so a response that
+	// beats the cancellation is applied with the stop already under way. It is exempt because it is the announce the
+	// rest of the startup is built on — announceStart goes on to start the periodic announce at the interval recorded
+	// below, which is the one value a start announce is required to carry — and because applying it late costs nothing.
+	// What the shutdown owes the tracker was settled above, by the started flag recorded the moment the tracker
+	// answered, and the peer list and counts go down with the client that is on its way out.
 	if event != startedMsg && t.announceStopping() {
 		return nil
 	}

@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"syscall"
 	"testing"
 	"time"
@@ -25,6 +26,10 @@ import (
 // testDeadlineWait is how long the other end of a connection is made to wait before answering, which has to be long
 // enough that a deadline left over from an earlier call would have expired well before it does.
 const testDeadlineWait = 50 * time.Millisecond
+
+// bareMessagePrefix is what the net package puts in front of the reason a connection operation failed, which is all
+// that is left of an error whose errno an intervening layer stripped away.
+const bareMessagePrefix = "read tcp 10.0.0.1:6881->10.0.0.2:51413: "
 
 // TestReadWithNoDeadlineClearsAPreviousOne verifies that a read asking for no deadline clears whatever an earlier call
 // armed on the connection instead of leaving it in place. A deadline stays on the connection until it is replaced, so
@@ -127,6 +132,73 @@ func wrappedOpError(op string, err error) error {
 	return errs.Wrap(&net.OpError{Op: op, Net: "tcp", Err: &os.SyscallError{Syscall: op, Err: err}})
 }
 
+// wrappedTextError builds the error a connection hands back for a condition that survived only as its wording, the
+// errno having been stripped by some intervening layer, inside the same wrapping a real one arrives in.
+func wrappedTextError(msg string) error {
+	return errs.Wrap(&net.OpError{Op: "read", Net: "tcp", Err: errs.New(msg)})
+}
+
+// TestShouldLogIOErrorIgnoresPOSIXPeerErrorWordings verifies that the text fallback recognizes the routine peer
+// departures as the POSIX systems actually word them, which is all an error carries once it has crossed a boundary that
+// kept only the message. Wording a condition by its own name is a guess rather than a rule — ECONNABORTED is "software
+// caused connection abort" and never "connection aborted" — and the two systems don't even agree with each other, since
+// ETIMEDOUT is "operation timed out" on darwin and "connection timed out" on linux, so every wording has to be listed
+// for the fallback to cover the platforms this builds for.
+func TestShouldLogIOErrorIgnoresPOSIXPeerErrorWordings(t *testing.T) {
+	for _, one := range []struct {
+		name string
+		msg  string
+	}{
+		{name: "peer gone mid-write by POSIX wording", msg: "broken pipe"},
+		{name: "peer reset by POSIX wording", msg: "connection reset by peer"},
+		{name: "dial refused by POSIX wording", msg: "connection refused"},
+		{name: "connection aborted by POSIX wording", msg: "software caused connection abort"},
+		{name: "host unreachable by POSIX wording", msg: "no route to host"},
+		{name: "network unreachable by POSIX wording", msg: "network is unreachable"},
+		{name: "network down by POSIX wording", msg: "network is down"},
+		{name: "timed out by the darwin wording", msg: "operation timed out"},
+		{name: "timed out by the linux wording", msg: "connection timed out"},
+	} {
+		t.Run(one.name, func(t *testing.T) {
+			c := check.New(t)
+			c.False(ShouldLogIOError(errs.New(bareMessagePrefix+one.msg)), "the bare message: %s", one.msg)
+			c.False(ShouldLogIOError(wrappedTextError(one.msg)), "the wrapped message: %s", one.msg)
+		})
+	}
+}
+
+// TestShouldLogIOErrorIgnoresThisPlatformsErrorWordings verifies the same against the wordings this platform itself
+// puts on those conditions, so that a system whose phrasing the list above doesn't anticipate is caught here rather
+// than by the log filling up with routine peer departures. Windows is left out because the POSIX errno values it
+// defines are synthetic ones nothing ever returns, so the messages they carry there describe nothing the platform
+// produces; the Winsock codes and wordings it does produce are covered by the tests below.
+func TestShouldLogIOErrorIgnoresThisPlatformsErrorWordings(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the POSIX errno values are synthetic on Windows")
+	}
+	for _, one := range []struct {
+		name  string
+		errno syscall.Errno
+	}{
+		{name: "peer gone mid-write as worded here", errno: syscall.EPIPE},
+		{name: "peer reset as worded here", errno: syscall.ECONNRESET},
+		{name: "dial refused as worded here", errno: syscall.ECONNREFUSED},
+		{name: "connection aborted as worded here", errno: syscall.ECONNABORTED},
+		{name: "host unreachable as worded here", errno: syscall.EHOSTUNREACH},
+		{name: "network unreachable as worded here", errno: syscall.ENETUNREACH},
+		{name: "network down as worded here", errno: syscall.ENETDOWN},
+		{name: "timed out as worded here", errno: syscall.ETIMEDOUT},
+	} {
+		t.Run(one.name, func(t *testing.T) {
+			// The errno is deliberately dropped, leaving only what it was worded as: with it still attached the
+			// sentinel checks would answer and the fallback this is about would never be consulted.
+			msg := one.errno.Error()
+			check.New(t).False(ShouldLogIOError(errs.New(bareMessagePrefix+msg)),
+				"%s is worded %q here, which the fallback doesn't recognize", one.name, msg)
+		})
+	}
+}
+
 // TestShouldLogIOErrorIgnoresWindowsPeerErrors verifies that the routine peer errors stay out of the log on Windows
 // too, which reports them with neither the errno nor the wording the POSIX systems use. A Windows socket fails with a
 // Winsock code, while the syscall.ECONNRESET and friends that exist on Windows are synthetic values nothing ever
@@ -186,11 +258,7 @@ func TestShouldLogIOErrorIgnoresWindowsPeerErrorWordings(t *testing.T) {
 		t.Run(one.name, func(t *testing.T) {
 			c := check.New(t)
 			c.False(ShouldLogIOError(errs.New("wsarecv: "+one.msg)), "the bare message: %s", one.msg)
-			c.False(ShouldLogIOError(errs.Wrap(&net.OpError{
-				Op:  "read",
-				Net: "tcp",
-				Err: errs.New(one.msg),
-			})), "the wrapped message: %s", one.msg)
+			c.False(ShouldLogIOError(wrappedTextError(one.msg)), "the wrapped message: %s", one.msg)
 		})
 	}
 }

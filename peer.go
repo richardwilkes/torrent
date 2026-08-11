@@ -796,6 +796,12 @@ func (p *peer) processIncomingMessages() {
 				p.has.SetBytes(buffer[1:])
 				p.lock.Unlock()
 				p.updateInterest()
+				// A download is started here for the same reason the have above starts one: this is one of the two ways
+				// we learn what a peer has, and nothing else would. A peer that unchoked us before telling us what it
+				// held has no piece claimed and no further nudge coming — adjustPeers and updateInterest never start a
+				// download, and startDownloadsOnOtherPeers only fires when some piece is given back — so in a small
+				// swarm we would sit interested and idle against it for as long as the torrent ran.
+				p.startDownloadIfNeeded()
 			case requestID:
 				req := newPieceRequest(buffer, false)
 				if !p.validPieceRequest(req) {
@@ -1351,17 +1357,7 @@ func (p *peer) clearExpiredDownloads() {
 		if !remove {
 			continue
 		}
-		p.lock.Lock()
-		// Only a piece we still hold is released. The snapshot above may name one our own teardown has already given
-		// up, or one that finished while we were looking, and another peer may have claimed it since: releasing that
-		// would take the piece away from the peer that is actually downloading it.
-		_, ours := p.pieces[k]
-		if ours {
-			delete(p.pieces, k)
-		}
-		p.lock.Unlock()
-		if ours {
-			p.client.tracker.clearDownload(k, p)
+		if p.releaseIfStillOurs(k, v) {
 			released = true
 			// A peer that is choking us was told to discard our requests, so having nothing to show for the piece
 			// isn't its fault: give up the piece so another peer can take it, but keep the connection. Neither is a
@@ -1375,4 +1371,30 @@ func (p *peer) clearExpiredDownloads() {
 	if giveUpOnPeer {
 		p.bailOut()
 	}
+}
+
+// releaseIfStillOurs gives the index back, both here and to the tracker, but only if it is still claimed by the very
+// piece the caller decided about, and reports whether it was. The re-check is the same one dropSettledChunkRequests
+// makes, and for the same reason: the caller decided from a snapshot taken before the lock was released, so the index
+// may name a piece our own teardown has already given up, one that finished while it was being looked at, or one
+// another peer has claimed since, and releasing any of those takes the piece away from whoever is actually downloading
+// it.
+//
+// Presence alone isn't enough. clearExpiredDownloads runs concurrently with itself as a matter of course — the peer
+// management tick, the adjustPeers pass every fifteen seconds and the read goroutine's handling of every have and
+// bitfield message all reach it — so two passes can hold a snapshot of the same expired piece at once. Once the first
+// has released it and the index has been re-claimed for a fresh piece, a second pass that only asked whether something
+// was there would throw that fresh piece and its partial download away, clear a tracker claim that isn't the one it
+// decided about, and, with a stale requested flag behind it, close the connection of a peer that had just unchoked us.
+func (p *peer) releaseIfStillOurs(index int, one *piece) bool {
+	p.lock.Lock()
+	ours := p.pieces[index] == one
+	if ours {
+		delete(p.pieces, index)
+	}
+	p.lock.Unlock()
+	if ours {
+		p.client.tracker.clearDownload(index, p)
+	}
+	return ours
 }

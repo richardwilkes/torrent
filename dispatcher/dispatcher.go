@@ -52,6 +52,16 @@ const (
 	// disk I/O along with the accept loop. The slot is therefore held for all of that, not just the part of the
 	// handshake the dispatcher reads itself, which would leave the rest counted against no limit at all.
 	maxPendingHandshakes = 128
+	// maxPendingHandshakesPerAddress is how many of those slots any one remote address may hold at once. The total on
+	// its own bounds only the file descriptors, which leaves every slot available to whoever asks first: a single host
+	// trickling handshake bytes holds each connection for the seconds above without ever having to name a torrent we
+	// serve, so at a few connections a second it keeps the whole bound occupied and every legitimate inbound peer is
+	// refused for as long as it cares to keep it up. Outbound dials still work, but nothing can reach us. Sharing an
+	// address is ordinary — a swarm commonly has several peers behind one NAT — so this is a share of the bound rather
+	// than a block: the address goes on being served, just not to the exclusion of everyone else. Blocking it through
+	// the gatekeeper would take those NAT-mates down with the offender, and a handshake that is merely slow is not by
+	// itself evidence of one.
+	maxPendingHandshakesPerAddress = 8
 )
 
 // ConnectionHandler defines the interface for handling torrent connections.
@@ -75,14 +85,81 @@ type Dispatcher struct {
 	handlers            sync.Map
 	lastExternalIPCheck time.Time // protected by lock
 	externalIP          net.IP    // protected by lock
-	// pendingHandshakes counts the accepted connections that have yet to finish handshaking. It is an atomic rather
-	// than lock-protected state because the accept loop touches it for every connection and each dispatch goroutine
-	// touches it again on its way out.
-	pendingHandshakes atomic.Int32
+	// pendingHandshakes accounts for the accepted connections that have yet to finish handshaking, both in total and
+	// per remote address. It carries a lock of its own rather than sharing the dispatcher's, since the accept loop
+	// takes a slot for every connection and each dispatch goroutine gives one back on its way out, neither of which
+	// has any other reason to wait behind the external IP lookup's bookkeeping.
+	pendingHandshakes pendingHandshakes
 	internalPort      uint32
 	externalPort      uint32
 	externalIPProbing bool // protected by lock
 	lock              sync.Mutex
+}
+
+// pendingHandshakes is the accounting behind maxPendingHandshakes and maxPendingHandshakesPerAddress.
+type pendingHandshakes struct {
+	byAddress map[string]int
+	total     int
+	lock      sync.Mutex
+}
+
+// acquire takes a pending handshake slot for a connection from the given address, returning whether there was one to
+// take. A slot that is taken must be given back with release.
+func (p *pendingHandshakes) acquire(addr string) bool {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	if p.total >= maxPendingHandshakes || p.byAddress[addr] >= maxPendingHandshakesPerAddress {
+		return false
+	}
+	if p.byAddress == nil {
+		p.byAddress = make(map[string]int)
+	}
+	p.byAddress[addr]++
+	p.total++
+	return true
+}
+
+// release gives back a slot taken for a connection from the given address. The last one an address holds takes its
+// entry with it, so that the addresses that have come and gone don't accumulate for the life of the process.
+func (p *pendingHandshakes) release(addr string) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	switch count := p.byAddress[addr]; {
+	case count > 1:
+		p.byAddress[addr] = count - 1
+	case count == 1:
+		delete(p.byAddress, addr)
+	default:
+		return
+	}
+	p.total--
+}
+
+// count returns how many connections are working through their handshake right now.
+func (p *pendingHandshakes) count() int {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	return p.total
+}
+
+// countFor returns how many connections from the given address are working through their handshake right now.
+func (p *pendingHandshakes) countFor(addr string) int {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	return p.byAddress[addr]
+}
+
+// handshakeSlotKey returns what an address's pending handshake slots are counted against, which is the host alone: a
+// remote is free to make each of its connections from a port of its own, so counting the two together would leave the
+// per-address bound meaning nothing at all. An address that can't be split is counted whole rather than pooled with
+// every other unparsable one.
+func handshakeSlotKey(addr net.Addr) string {
+	full := addr.String()
+	host, _, err := net.SplitHostPort(full)
+	if err != nil {
+		return full
+	}
+	return host
 }
 
 // NewDispatcher creates a new dispatcher and starts listening for
@@ -278,17 +355,20 @@ func (d *Dispatcher) listen() {
 			continue
 		}
 		retryDelay = 0
-		if d.pendingHandshakes.Add(1) > maxPendingHandshakes {
-			// We're already holding as many un-handshaken connections as we're willing to. Hanging up returns the
-			// descriptor immediately and leaves the remote free to try again, which is a great deal better than
-			// letting connections that may never say anything accumulate until nothing else can open a file either.
-			d.pendingHandshakes.Add(-1)
+		addr := handshakeSlotKey(conn.RemoteAddr())
+		if !d.pendingHandshakes.acquire(addr) {
+			// Either we're already holding as many un-handshaken connections as we're willing to, or this address is,
+			// which is the same refusal for a different reason: the first bounds what a flood costs us, the second
+			// keeps one host from being the whole of it. Hanging up returns the descriptor immediately and leaves the
+			// remote free to try again, which is a great deal better than letting connections that may never say
+			// anything accumulate until nothing else can open a file either.
 			d.logger.Debug("refused connection", "remote_addr", conn.RemoteAddr().String(),
-				"pending_handshakes", maxPendingHandshakes)
+				"pending_handshakes", d.pendingHandshakes.count(), "pending_handshakes_for_address",
+				d.pendingHandshakes.countFor(addr))
 			xio.CloseIgnoringErrors(conn)
 			continue
 		}
-		go d.dispatch(conn)
+		go d.dispatch(conn, addr)
 	}
 }
 
@@ -304,11 +384,14 @@ func (d *Dispatcher) logListening() {
 // the peer session, which keep-alives sustain for as long as the remote likes, so a slot held until then would turn
 // the bound on connections that haven't handshaken into a cap on how many inbound peers we may ever have at once. The
 // slot is given back here as well, so that a handler which fails, or which never reports at all, can't strand it.
-func (d *Dispatcher) dispatch(conn net.Conn) {
+//
+// The address the slot was taken under is passed in rather than derived again from the connection, so that the release
+// can't be charged to a different address than the acquisition was, whatever the connection reports by then.
+func (d *Dispatcher) dispatch(conn net.Conn, addr string) {
 	logger := d.logger.With("remote_addr", conn.RemoteAddr().String())
 	defer xio.CloseIgnoringErrors(conn)
 	var once sync.Once
-	handshakeDone := func() { once.Do(func() { d.pendingHandshakes.Add(-1) }) }
+	handshakeDone := func() { once.Do(func() { d.pendingHandshakes.release(addr) }) }
 	defer handshakeDone()
 	handler, extensions, infoHash := d.handshake(conn, logger)
 	if handler == nil {

@@ -425,7 +425,7 @@ func TestExtractFiles(t *testing.T) {
 			map[string]any{lengthKey: int64(8), pathKey: []any{fileB}},
 		},
 	})
-	c.NoError(extractFiles(tf))
+	c.NoError(extractFiles(tf, nil))
 
 	data, err := os.ReadFile(filepath.Join(torrentName, "sub", "a.txt"))
 	c.NoError(err)
@@ -442,7 +442,7 @@ func TestExtractFilesSingle(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	tf := newTorrentFile(t, "example.bin", map[string]any{lengthKey: int64(20)})
-	c.NoError(extractFiles(tf))
+	c.NoError(extractFiles(tf, nil))
 
 	data, err := os.ReadFile("example.bin")
 	c.NoError(err)
@@ -459,7 +459,7 @@ func TestExtractFilesMultiFileWithOneEntry(t *testing.T) {
 	tf := newTorrentFile(t, torrentName, map[string]any{
 		filesKey: []any{map[string]any{lengthKey: int64(20), pathKey: []any{fileB}}},
 	})
-	c.NoError(extractFiles(tf))
+	c.NoError(extractFiles(tf, nil))
 
 	data, err := os.ReadFile(filepath.Join(torrentName, fileB))
 	c.NoError(err)
@@ -481,7 +481,7 @@ func TestExtractFilesWithANameThatSanitizesAway(t *testing.T) {
 	tf := newTorrentFile(t, ".", map[string]any{
 		filesKey: []any{map[string]any{lengthKey: int64(20), pathKey: []any{fileB}}},
 	})
-	c.NoError(extractFiles(tf))
+	c.NoError(extractFiles(tf, nil))
 
 	data, err := os.ReadFile(filepath.Join(sanitizePath(tf.Info.Name), fileB))
 	c.NoError(err)
@@ -502,7 +502,7 @@ func TestExtractFileRefusesToWriteOverTheStorageFile(t *testing.T) {
 	const content = torrentName + ".bin"
 
 	tf := newTorrentFile(t, content, map[string]any{lengthKey: int64(len(sampleContent))})
-	c.HasError(extractFile(tf, content, tf.StoragePath()),
+	c.HasError(extractFile(tf, content, tf.StoragePath(), nil),
 		"extracting a torrent over its own storage file must be refused")
 
 	data, err := os.ReadFile(tf.StoragePath())
@@ -521,7 +521,7 @@ func TestExtractFilesOfATorrentNamedLikeItsStorage(t *testing.T) {
 
 	tf := newTorrentFile(t, content, map[string]any{lengthKey: int64(len(sampleContent))})
 	c.NotEqual(content, tf.StoragePath(), "a torrent must not be able to name its content onto its own storage file")
-	c.NoError(extractFiles(tf))
+	c.NoError(extractFiles(tf, nil))
 
 	data, err := os.ReadFile(content)
 	c.NoError(err)
@@ -539,7 +539,7 @@ func TestExtractFilesDoesNotOverwriteAnExistingFile(t *testing.T) {
 	c.NoError(os.WriteFile(target, []byte(existing), 0o600))
 
 	tf := newTorrentFile(t, target, map[string]any{lengthKey: int64(len(sampleContent))})
-	c.HasError(extractFiles(tf), "a file already at the target must not be overwritten")
+	c.HasError(extractFiles(tf, nil), "a file already at the target must not be overwritten")
 
 	data, err := os.ReadFile(target)
 	c.NoError(err)
@@ -606,7 +606,7 @@ func TestUnpackRefusesStorageThatIsNotComplete(t *testing.T) {
 			})
 			c.NoError(os.WriteFile(tf.StoragePath(), []byte(one.content), 0o600))
 
-			err := unpack(tf)
+			err := unpack(tf, nil)
 			if one.content == sampleContent {
 				c.NoError(err)
 				data, rerr := os.ReadFile(filepath.Join(torrentName, fileB))
@@ -619,6 +619,145 @@ func TestUnpackRefusesStorageThatIsNotComplete(t *testing.T) {
 			c.HasError(err, "nothing may be extracted from storage that isn't complete")
 		})
 	}
+}
+
+// TestUnpackStopsWhenInterrupted verifies that an unpack the program's exit cut short stops where it is and leaves
+// nothing behind. Without this the -unpack path had no exit handling at all, so a Ctrl-C during what runs to minutes
+// for a large torrent killed the process mid-copy, and the truncated file that left at the target — indistinguishable
+// from a completed extraction, and, since the target is created exclusively, a "file exists" failure for every run that
+// followed — is exactly what the extraction's own cleanup exists to prevent.
+func TestUnpackStopsWhenInterrupted(t *testing.T) {
+	// Both halves of an unpack read the whole of a torrent's storage, so both take minutes over a large one and both
+	// have to give an exit that is waiting on them a way through
+	for _, one := range []struct {
+		run  func(tf *tfs.File, interrupt <-chan struct{}) error
+		name string
+	}{
+		{name: "while the storage is being verified", run: unpack},
+		{name: "while the files are being extracted", run: extractFiles},
+	} {
+		t.Run(one.name, func(t *testing.T) {
+			c := check.New(t)
+			t.Chdir(t.TempDir())
+			tf := newTorrentFile(t, torrentName, map[string]any{
+				filesKey:  []any{map[string]any{lengthKey: int64(len(sampleContent)), pathKey: []any{fileB}}},
+				piecesKey: samplePieceHashes(),
+			})
+			c.NoError(os.WriteFile(tf.StoragePath(), []byte(sampleContent), 0o600))
+
+			interrupt := make(chan struct{})
+			close(interrupt)
+			c.True(errors.Is(one.run(tf, interrupt), errInterrupted), "an interrupted unpack must report as much")
+			_, err := os.Stat(filepath.Join(torrentName, fileB))
+			c.True(os.IsNotExist(err), "an interrupted unpack must not leave a partial file behind: %v", err)
+
+			// And with nothing in the way, the retry the interruption leaves room for succeeds
+			c.NoError(unpack(tf, nil))
+			data, err := os.ReadFile(filepath.Join(torrentName, fileB))
+			c.NoError(err)
+			c.Equal(sampleContent, string(data))
+		})
+	}
+}
+
+// TestAnInterruptedCopyRemovesWhatItWrote verifies that the interrupt reaches a copy that is already under way rather
+// than only being looked for between files. A single file of a large torrent takes minutes to copy on its own, so an
+// exit that could only interrupt between them would be no better than one that couldn't interrupt at all.
+func TestAnInterruptedCopyRemovesWhatItWrote(t *testing.T) {
+	c := check.New(t)
+	t.Chdir(t.TempDir())
+	const target = "interrupted.bin"
+
+	// The interrupt is signaled once the copy has written some of the file, which is where a real one arrives
+	interrupt := make(chan struct{})
+	source := &interruptingReader{content: sampleContent, interrupt: interrupt}
+	err := copyToNewFile(target, &interruptibleReader{r: source, interrupt: interrupt})
+	c.True(errors.Is(err, errInterrupted), "an interrupted copy must be reported: %v", err)
+	c.True(source.read != 0, "the copy must have been under way when it was interrupted")
+	_, err = os.Stat(target)
+	c.True(os.IsNotExist(err), "an interrupted copy must not be left behind: %v", err)
+}
+
+// interruptingReader hands back the first few bytes of its content and then signals the interrupt, standing in for the
+// exit arriving while a copy is running.
+type interruptingReader struct {
+	interrupt chan struct{}
+	content   string
+	read      int
+}
+
+func (r *interruptingReader) Read(p []byte) (int, error) {
+	if r.read != 0 || len(p) == 0 {
+		return 0, errors.New("the storage cannot be read")
+	}
+	n := copy(p, r.content[:min(len(r.content), 4)])
+	r.read = n
+	close(r.interrupt)
+	return n, nil
+}
+
+// TestInterruptAtExitStopsTheUnpackAndWaitsForIt verifies that what is registered to run when the program exits tells
+// the unpack to stop and then waits for it, rather than letting the exit run ahead of the cleanup the interruption is
+// there to make room for.
+func TestInterruptAtExitStopsTheUnpackAndWaitsForIt(t *testing.T) {
+	interrupt := make(chan struct{})
+	finished := make(chan struct{})
+	registered := registerInterruptAtExit(t, interrupt, finished, time.Hour)
+
+	returned := make(chan struct{})
+	go func() {
+		registered()
+		close(returned)
+	}()
+	select {
+	case <-interrupt:
+	case <-time.After(notifyWait):
+		t.Fatal("the unpack was never told to stop")
+	}
+	select {
+	case <-returned:
+		t.Fatal("the exit did not wait for the interrupted unpack to clean up after itself")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(finished)
+	select {
+	case <-returned:
+	case <-time.After(notifyWait):
+		t.Fatal("the exit did not resume once the unpack had stopped")
+	}
+}
+
+// TestInterruptAtExitGivesUpWaitingForTheUnpack verifies that the wait for the interrupted unpack is bounded. Storage
+// that has genuinely wedged must not leave someone who pressed Ctrl-C with a program that never exits.
+func TestInterruptAtExitGivesUpWaitingForTheUnpack(t *testing.T) {
+	registered := registerInterruptAtExit(t, make(chan struct{}), make(chan struct{}), time.Millisecond)
+
+	returned := make(chan struct{})
+	go func() {
+		registered()
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(notifyWait):
+		t.Fatal("the exit never gave up waiting for the interrupted unpack")
+	}
+}
+
+// registerInterruptAtExit registers the unpack's exit handling with a stand-in registrar and returns what was
+// registered with it.
+func registerInterruptAtExit(t *testing.T, interrupt chan struct{}, finished <-chan struct{}, wait time.Duration) func() {
+	t.Helper()
+	var registered func()
+	interruptAtExit(func(f func()) int {
+		registered = f
+		return 1
+	}, interrupt, finished, wait)
+	if registered == nil {
+		// Fatal, since calling what wasn't registered would panic and take the whole test binary down with it
+		t.Fatal("nothing was registered to run when the program exits")
+	}
+	return registered
 }
 
 // samplePieceHashes returns the piece hashes for a torrent whose storage holds sampleContent, at the piece length

@@ -259,8 +259,10 @@ func TestPendingHandshakesAreBounded(t *testing.T) {
 	const beyondTheLimit = 4
 	script := make([]acceptResult, 0, maxPendingHandshakes+beyondTheLimit)
 	locals := make([]net.Conn, 0, maxPendingHandshakes+beyondTheLimit)
-	for range maxPendingHandshakes + beyondTheLimit {
-		local, remote := newAddressedPipe(t)
+	for i := range maxPendingHandshakes + beyondTheLimit {
+		// Each connection comes from an address of its own, so that what refuses the last of them is the total the
+		// accept loop is willing to hold rather than the share any one address is allowed of it
+		local, remote := newAddressedPipeFrom(t, i+1)
 		locals = append(locals, local)
 		script = append(script, acceptResult{conn: remote})
 	}
@@ -271,7 +273,7 @@ func TestPendingHandshakesAreBounded(t *testing.T) {
 	// returns. None of the accepted connections can have finished with its slot, since each is parked waiting for a
 	// handshake that is never written.
 	d.listen()
-	c.Equal(int32(maxPendingHandshakes), d.pendingHandshakes.Load())
+	c.Equal(maxPendingHandshakes, d.pendingHandshakes.count())
 
 	// Only a handful of the connections that were kept are checked, since proving one is still open costs a read
 	// deadline's worth of waiting apiece
@@ -281,6 +283,66 @@ func TestPendingHandshakesAreBounded(t *testing.T) {
 	for i := maxPendingHandshakes; i < len(locals); i++ {
 		c.True(hungUpOn(locals[i]), "connection %d was past the limit and must have been refused", i)
 	}
+}
+
+// TestPendingHandshakesAreBoundedPerAddress verifies that one remote can't hold every pending handshake slot. A slot is
+// held for the tens of seconds a connection may take over its handshake, and holding it costs the remote nothing but
+// the occasional byte and requires it to know no info hash we serve, so a total bound that any one host may fill
+// entirely is a bound a single host can sit on: at a few connections a second it keeps the accept loop refusing every
+// legitimate inbound peer for as long as it cares to, and nothing can reach us at all.
+func TestPendingHandshakesAreBoundedPerAddress(t *testing.T) {
+	c := check.New(t)
+	const flooder = 1
+	const legitimate = 2
+	const beyondTheShare = 3
+	script := make([]acceptResult, 0, maxPendingHandshakesPerAddress+beyondTheShare+1)
+	locals := make([]net.Conn, 0, cap(script))
+	for range maxPendingHandshakesPerAddress + beyondTheShare {
+		local, remote := newAddressedPipeFrom(t, flooder)
+		locals = append(locals, local)
+		script = append(script, acceptResult{conn: remote})
+	}
+	// One peer that has done nothing wrong, arriving after the flood has taken everything it is going to get
+	honest, honestRemote := newAddressedPipeFrom(t, legitimate)
+	locals = append(locals, honest)
+	script = append(script, acceptResult{conn: honestRemote})
+
+	d := newScriptedDispatcher(&scriptedListener{script: script})
+	defer d.gatekeeper.Close()
+
+	// The loop runs to the end of the script, so every decision about every connection has been made by the time it
+	// returns. None of the accepted connections can have finished with its slot, since each is parked waiting for a
+	// handshake that is never written.
+	d.listen()
+	c.Equal(maxPendingHandshakesPerAddress+1, d.pendingHandshakes.count(),
+		"the flooding address must hold its share and no more, leaving the rest of the bound free")
+	c.Equal(maxPendingHandshakesPerAddress, d.pendingHandshakes.countFor(testHostIP(flooder).String()))
+
+	// Only a handful of the connections that were kept are checked, since proving one is still open costs a read
+	// deadline's worth of waiting apiece
+	for i := range 3 {
+		c.False(hungUpOn(locals[i]), "connection %d must still be working through its handshake", i)
+	}
+	for i := maxPendingHandshakesPerAddress; i < len(locals)-1; i++ {
+		c.True(hungUpOn(locals[i]), "connection %d was past the address's share and must have been refused", i)
+	}
+	c.False(hungUpOn(honest), "a peer at another address must not be refused for what the flooding address is doing")
+}
+
+// TestPendingHandshakeSlotsAreCountedByHostAlone verifies that the per-address share is charged to the host rather than
+// to the host and port together. A remote picks its own source port and gets a fresh one for every connection, so
+// counted together every connection is its own address and the share bounds nothing at all.
+func TestPendingHandshakeSlotsAreCountedByHostAlone(t *testing.T) {
+	c := check.New(t)
+	first := &net.TCPAddr{IP: testHostIP(1), Port: 51413}
+	second := &net.TCPAddr{IP: testHostIP(1), Port: 51414}
+	c.Equal(handshakeSlotKey(first), handshakeSlotKey(second),
+		"connections from one host must share a slot key however they numbered their source ports")
+	c.Equal("203.0.113.1", handshakeSlotKey(first))
+
+	// An address that can't be split into a host and a port is counted whole rather than pooled with every other one
+	// that couldn't be split either, which would have them share a single address's share between them
+	c.Equal("/tmp/peer.sock", handshakeSlotKey(&net.UnixAddr{Name: "/tmp/peer.sock", Net: "unix"}))
 }
 
 // TestPendingHandshakeSlotCoversTheHandlersHandshake verifies that the slot an accepted connection takes is still held
@@ -299,16 +361,16 @@ func TestPendingHandshakeSlotCoversTheHandlersHandshake(t *testing.T) {
 	defer d.gatekeeper.Close()
 
 	infoHash := tfs.InfoHash{1, 2, 3}
-	type counts struct{ duringHandshake, duringSession int32 }
+	type counts struct{ duringHandshake, duringSession int }
 	observed := make(chan counts, 1)
 	release := make(chan struct{})
 	d.Register(infoHash, handlerFunc(func(_ net.Conn, _ *slog.Logger, _ ProtocolExtensions, _ tfs.InfoHash, _ bool,
 		handshakeDone func(),
 	) {
 		var one counts
-		one.duringHandshake = d.pendingHandshakes.Load()
+		one.duringHandshake = d.pendingHandshakes.count()
 		handshakeDone() // Stands in for the handshake write and peer ID read having completed
-		one.duringSession = d.pendingHandshakes.Load()
+		one.duringSession = d.pendingHandshakes.count()
 		observed <- one
 		<-release // Stands in for a peer session the remote holds open with keep-alives
 	}))
@@ -326,9 +388,9 @@ func TestPendingHandshakeSlotCoversTheHandlersHandshake(t *testing.T) {
 
 	select {
 	case one := <-observed:
-		c.Equal(int32(1), one.duringHandshake,
+		c.Equal(1, one.duringHandshake,
 			"the handshake slot must still be held while the handler finishes the handshake")
-		c.Equal(int32(0), one.duringSession,
+		c.Equal(0, one.duringSession,
 			"the handshake slot must be given back before the peer session is handed the connection")
 	case <-time.After(goroutineWait):
 		t.Fatal("the connection was never dispatched to its handler")
@@ -377,9 +439,9 @@ func TestPendingHandshakeSlotIsReleasedByAHandlerThatNeverReports(t *testing.T) 
 
 	// The handler has been entered, so the release, which its return triggers, may not have happened yet
 	deadline := time.Now().Add(goroutineWait)
-	for d.pendingHandshakes.Load() != 0 {
+	for d.pendingHandshakes.count() != 0 {
 		if time.Now().After(deadline) {
-			t.Fatalf("the handshake slot was never given back: %d still pending", d.pendingHandshakes.Load())
+			t.Fatalf("the handshake slot was never given back: %d still pending", d.pendingHandshakes.count())
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -419,12 +481,26 @@ func hungUpOn(conn net.Conn) bool {
 // fail-closed branch refuses it before any handshake is attempted and none of the dispatch path runs.
 func newAddressedPipe(t *testing.T) (local, remote net.Conn) {
 	t.Helper()
+	return newAddressedPipeFrom(t, 1)
+}
+
+// newAddressedPipeFrom does the same for a connection that has to be told apart from the others by where it came from,
+// which is what the per-address bound on pending handshakes is decided by. The host is 203.0.113.n, from the range
+// reserved for documentation, so nothing a test makes up can be an address that actually exists.
+func newAddressedPipeFrom(t *testing.T, host int) (local, remote net.Conn) {
+	t.Helper()
 	local, other := net.Pipe()
 	t.Cleanup(func() {
 		xio.CloseIgnoringErrors(local)
 		xio.CloseIgnoringErrors(other)
 	})
-	return local, &addressedConn{Conn: other, addr: &net.TCPAddr{IP: net.IPv4(203, 0, 113, 1), Port: 6881}}
+	return local, &addressedConn{Conn: other, addr: &net.TCPAddr{IP: testHostIP(host), Port: 6881}}
+}
+
+// testHostIP returns the address newAddressedPipeFrom hands out for the given host, which is also the key the pending
+// handshake accounting counts that host's connections against.
+func testHostIP(host int) net.IP {
+	return net.IPv4(203, 0, 113, byte(host))
 }
 
 // addressedConn is a connection reporting a remote address other than the one it actually has, which also ignores the

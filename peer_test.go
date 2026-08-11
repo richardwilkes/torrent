@@ -1125,7 +1125,7 @@ func TestChunkRequestsResumeFromTheStartAfterAChoke(t *testing.T) {
 	client := newTestClientForTorrent(d, newTestTorrentFileWithChunksPerPiece(chunks, testPieceCount))
 	conn, p := newTestPeer(t, client)
 	defer xio.CloseIgnoringErrors(conn)
-	startChunkRequestDelivery(t, p)
+	stopDelivery := startChunkRequestDelivery(t, p)
 
 	p.queuePieceDownload(0)
 	for i := range chunks {
@@ -1138,11 +1138,21 @@ func TestChunkRequestsResumeFromTheStartAfterAChoke(t *testing.T) {
 	c.Equal(chunks, one.inFlight, "every chunk of the piece is waiting to be answered")
 	one.lock.RUnlock()
 
+	// The delivery goroutine is stopped for the wind-back itself, and not restarted until it has been looked at.
+	// Resuming ends by telling that goroutine to ask for everything again, which puts the count straight back up: left
+	// running, it races the read below and the assertion would be deciding what it saw by how the scheduler felt.
+	stopDelivery()
 	p.resumeDownloads()
 	one.lock.RLock()
 	inFlightAfterResume := one.inFlight
+	askedTo := one.askedTo
 	one.lock.RUnlock()
 	c.Equal(0, inFlightAfterResume, "what a choking peer discarded may not go on counting against the pipeline")
+	c.Equal(0, askedTo, "the piece must be asked for again from its beginning")
+
+	// The signal the resume made is still waiting, so the chunks are asked for again as soon as there is a goroutine to
+	// do it
+	startChunkRequestDelivery(t, p)
 	for i := range chunks {
 		c.Equal(newTestPieceRequest(requestID, 0, uint32(i*chunkSize), chunkSize), nextQueuedMessage(t, p),
 			"chunk %d after the resume", i)
@@ -2265,6 +2275,93 @@ func TestExpiredDownloadsLeaveAnotherPeersClaimAlone(t *testing.T) {
 	c.False(downloading)
 }
 
+// TestAnExpiredDownloadReleaseOnlyGivesUpThePieceItDecidedAbout verifies that giving an expired piece back releases the
+// very piece the decision was made about rather than whatever the index holds by the time the release happens. Passes
+// over the expired downloads run concurrently with each other as a matter of course — the peer management tick, the
+// adjustPeers pass and the read goroutine's handling of every have and bitfield message all reach them — so two of them
+// can be holding a snapshot of the same expired piece at once, and once the first has released it the index is free to
+// be claimed for a fresh one. A second pass that asked only whether something was there would throw that fresh piece's
+// partial download away and hand its tracker claim back with it.
+func TestAnExpiredDownloadReleaseOnlyGivesUpThePieceItDecidedAbout(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+
+	// The piece a first pass decided about, which it gives back
+	c.Equal(0, client.tracker.selectForDownloading(p, everyTestPiece()))
+	p.queuePieceDownload(0)
+	p.lock.RLock()
+	expired := p.pieces[0]
+	p.lock.RUnlock()
+	c.NotNil(expired)
+	c.True(p.releaseIfStillOurs(0, expired), "the piece the decision was made about must be given up")
+	p.lock.RLock()
+	held := len(p.pieces)
+	p.lock.RUnlock()
+	c.Equal(0, held)
+	client.tracker.lock.RLock()
+	downloading := client.tracker.downloading.IsSet(0)
+	client.tracker.lock.RUnlock()
+	c.False(downloading, "the piece given up must be left available for another peer")
+
+	// The index is claimed again for a piece of its own, which a second pass still holding the old snapshot must leave
+	// exactly where it is
+	c.Equal(0, client.tracker.selectForDownloading(p, everyTestPiece()))
+	p.queuePieceDownload(0)
+	p.lock.RLock()
+	fresh := p.pieces[0]
+	p.lock.RUnlock()
+	c.NotNil(fresh)
+	c.True(fresh != expired, "the re-claim must have produced a piece of its own")
+	c.False(p.releaseIfStillOurs(0, expired), "a piece that is no longer the one at the index must not be given up")
+	p.lock.RLock()
+	stillHeld := p.pieces[0]
+	p.lock.RUnlock()
+	c.True(stillHeld == fresh, "the freshly claimed piece must survive a release decided about the piece before it")
+	client.tracker.lock.RLock()
+	downloading = client.tracker.downloading.IsSet(0)
+	who := client.tracker.who[0]
+	client.tracker.lock.RUnlock()
+	c.True(downloading, "the freshly claimed piece must keep its tracker claim")
+	c.Equal(p, who)
+}
+
+// TestABitFieldStartsADownloadOnAPeerThatUnchokedFirst verifies that learning what a peer has starts a download even
+// when the unchoke arrived before the bit field did. A bit field is accepted at any point in the session, so a peer
+// that unchokes first leaves us with nothing claimed and nothing else coming that would claim anything: neither
+// adjustPeers nor an interest update starts a download, and a freed piece only nudges the other peers. In a small or
+// single-peer swarm we would sit interested and idle against it for as long as the torrent ran.
+func TestABitFieldStartsADownloadOnAPeerThatUnchokedFirst(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	conn, p, _ := startTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+	c.NoError(conn.SetDeadline(time.Now().Add(peerMgmtWait)))
+
+	// The peer unchokes us before saying what it holds, so there is nothing yet that we could ask it for
+	_, err := conn.Write(newTestMessage(unchokeID))
+	c.NoError(err)
+	waitForMessagesToBeProcessed(t, conn, p)
+	p.lock.RLock()
+	held := len(p.pieces)
+	choking := p.peerChoking
+	p.lock.RUnlock()
+	c.False(choking)
+	c.Equal(0, held, "a peer that hasn't said what it holds has nothing for us to ask it for")
+
+	// Its bit field arrives, which is the last thing that could start the download
+	_, err = conn.Write(newBitFieldMessage(everyTestPiece().Bytes()))
+	c.NoError(err)
+	waitForMessagesToBeProcessed(t, conn, p)
+	p.lock.RLock()
+	claimed := slices.Sorted(maps.Keys(p.pieces))
+	p.lock.RUnlock()
+	c.Equal([]int{0}, claimed, "a bit field arriving after the unchoke must start a download")
+}
+
 // TestAFreedPieceNudgesTheOtherPeers verifies that a peer giving up an expired claim tells the rest of them to look
 // for something to download. Nothing else does: an already connected, unchoked and idle peer is never revisited by
 // peer management or by an interest update, so in a small or static swarm the freed piece would otherwise sit
@@ -2579,11 +2676,28 @@ func startTestPeer(t *testing.T, client *Client) (conn net.Conn, p *peer, done c
 // startChunkRequestDelivery starts the goroutine that puts the messages asking for the chunks we still need onto the
 // peer's write queue, and stops it once the test is over. A peer whose read loop is running starts it for itself; one
 // a test built directly has to have it started, since without it the requests a piece is queued for never go out.
-func startChunkRequestDelivery(t *testing.T, p *peer) {
+//
+// The stop that is returned doesn't come back until the goroutine has actually returned, so that a test which makes
+// assertions about the state that goroutine maintains — what a piece has in flight, how far it has been asked for —
+// can be sure nothing is still moving underneath it. Calling it more than once, which the cleanup makes routine, is a
+// no-op.
+func startChunkRequestDelivery(t *testing.T, p *peer) (stop func()) {
 	t.Helper()
 	done := make(chan bool)
-	go p.processChunkRequests(done)
-	t.Cleanup(func() { close(done) })
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		p.processChunkRequests(done)
+	}()
+	var once sync.Once
+	stop = func() {
+		once.Do(func() {
+			close(done)
+			<-exited
+		})
+	}
+	t.Cleanup(stop)
+	return stop
 }
 
 // newTestPeer adds a peer to the client and returns the connection the remote side of that peer would use to talk to

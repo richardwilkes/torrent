@@ -135,6 +135,39 @@ func TestParsePeersCompact(t *testing.T) {
 	c.Equal([]peerAddr{{ip: testPeerIP1, port: 6881}, {ip: testPeerIP2, port: 6882}}, peers)
 }
 
+// TestParsePeersDropsEntriesNamingNoHost verifies that a peer list entry which names no host in particular is refused
+// rather than dialed. A tracker's peer list is unverified data, and both of the ways an entry can leave the host out
+// point the dial back at the machine we're running on: net.JoinHostPort("", "6881") is ":6881" and the unspecified
+// address is "0.0.0.0:6881", so a hostile tracker handing one back has us open connections and send BitTorrent
+// handshakes to whatever local service is listening on the port it chose rather than to a peer.
+func TestParsePeersDropsEntriesNamingNoHost(t *testing.T) {
+	c := check.New(t)
+
+	// The dict model takes the host verbatim from the tracker, so every one of these can arrive
+	in := decodeTestTrackerResponse(t, []any{
+		testPeerDict("", "", 6881),          // No host at all
+		testPeerDict("", "0.0.0.0", 6882),   // The unspecified IPv4 address
+		testPeerDict("", "::", 6883),        // The unspecified IPv6 address
+		testPeerDict("", testPeerIP1, 6884), // A peer we could actually reach
+	})
+	peers, err := parsePeers(discardLogger(), in.PeerAddresses, "<unknown>", 0)
+	c.NoError(err)
+	c.Equal([]peerAddr{{ip: testPeerIP1, port: 6884}}, peers)
+
+	// The compact form fills the host in itself, but it can still spell out the unspecified address
+	c.Equal([]peerAddr{{ip: testPeerIP1, port: 6881}}, parseCompactPeers(string([]byte{
+		0, 0, 0, 0, 0x1A, 0xE2, // 0.0.0.0:6882
+		10, 0, 0, 1, 0x1A, 0xE1, // 10.0.0.1:6881
+	}), "<unknown>", 0))
+
+	// A host that isn't an address at all is left alone, since BEP 3 lets the dict model carry a DNS name and
+	// resolving it is the dial's business
+	in = decodeTestTrackerResponse(t, []any{testPeerDict("", "peer.example.com", 6881)})
+	peers, err = parsePeers(discardLogger(), in.PeerAddresses, "<unknown>", 0)
+	c.NoError(err)
+	c.Equal([]peerAddr{{ip: "peer.example.com", port: 6881}}, peers)
+}
+
 // TestParsePeersMalformed verifies that a response without a usable peer list is handled rather than misread. A
 // tracker's response is unverified data, so anything at all may show up in it.
 func TestParsePeersMalformed(t *testing.T) {
@@ -160,6 +193,10 @@ const (
 	// noPeersResponse is a tracker response carrying an interval and an empty peer list, which is everything an
 	// announce needs and nothing more.
 	noPeersResponse = "d8:intervali1800e5:peers0:e"
+
+	// oneCompactPeerResponse is a tracker response carrying an interval and a compact peer list holding testPeerIP1 on
+	// port 6881, for the tests that need to see the peer list a response came back with actually applied.
+	oneCompactPeerResponse = "d8:intervali1800e5:peers6:\x0a\x00\x00\x01\x1a\xe1e"
 
 	// unbackedStringResponse declares a 2GB string with nothing at all behind it, which is what a tracker hands us when
 	// it wants us to allocate 2GB.
@@ -709,6 +746,49 @@ func TestStopAbortsTheStartAnnounce(t *testing.T) {
 		t.Fatal("the start announce was left to run out the HTTP timeout")
 	}
 	c.False(client.tracker.hasStarted(), "an announce that never reached the tracker leaves us out of the swarm")
+}
+
+// TestAStartAnnounceIsAppliedWithTheStopAlreadyUnderWay verifies the exemption the shutdown check makes for the start
+// announce. Every other announce whose response lands after the stop was signaled is dropped, since what it describes
+// belongs to a client that no longer exists, but the two genuinely overlap for the start: Client.Stop cancels the
+// announce context from another goroutine for the express purpose of cutting a start announce short, so a response that
+// wins the race against the cancellation is made sense of with the stop already under way. Dropping it there would
+// leave announceStart going on to start the periodic announce with no interval to run at.
+func TestAStartAnnounceIsAppliedWithTheStopAlreadyUnderWay(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client, response := newTestTrackerClient(t, d)
+	response.setBody(oneCompactPeerResponse)
+
+	// The stop has been signaled, which is all cancelAnnounce amounts to, while the announce is still in flight. Its
+	// request is made with a context of its own, so that it is the answer that wins the race rather than the
+	// cancellation, which is exactly the case the exemption is about.
+	client.tracker.cancelAnnounce()
+	c.True(client.tracker.announceStopping())
+	c.NoError(client.tracker.announce(context.Background(), startedMsg))
+
+	client.tracker.lock.RLock()
+	interval := client.tracker.interval
+	peers := client.tracker.peerAddresses
+	client.tracker.lock.RUnlock()
+	c.Equal(1800, interval, "the periodic announce has nothing to run at without the interval the start came back with")
+	c.Equal([]peerAddr{{ip: testPeerIP1, port: 6881}}, peers, "the swarm the start announce found must not be discarded")
+	c.True(client.tracker.hasStarted(),
+		"the started flag recorded when the tracker answered is what says a stopped event is owed")
+
+	// Everything that isn't the start announce is dropped instead, since by the time one of those comes back what it
+	// describes belongs to a client that is already gone
+	client.tracker.lock.Lock()
+	client.tracker.interval = 0
+	client.tracker.peerAddresses = nil
+	client.tracker.lock.Unlock()
+	c.NoError(client.tracker.announce(context.Background(), ""))
+	client.tracker.lock.RLock()
+	interval = client.tracker.interval
+	peers = client.tracker.peerAddresses
+	client.tracker.lock.RUnlock()
+	c.Equal(0, interval, "an update the stop overtook must not be applied")
+	c.Equal(0, len(peers))
 }
 
 // TestAnnounceBodyDiscardIsBounded verifies that draining what is left of a tracker's answer takes no more than the cap

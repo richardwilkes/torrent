@@ -110,15 +110,21 @@ func ShouldLogIOError(err error) bool {
 	msg := err.Error()
 	for _, ignore := range []string{
 		"use of closed network connection",
-		"operation timed out",
 		"connection reset by peer",
 		"i/o timeout",
 		"connection refused",
 		"broken pipe",
-		"connection aborted",
 		"no route to host",
 		"network is unreachable",
 		"network is down",
+
+		// The POSIX wordings that aren't simply the condition's name. Go's errno tables are what these are taken from,
+		// and the two systems don't agree on all of them: ECONNABORTED is "software caused connection abort" on both
+		// darwin and linux, while ETIMEDOUT is "operation timed out" on darwin and "connection timed out" on linux, so
+		// each wording has to be listed for the fallback to cover every platform this builds for.
+		"software caused connection abort", // ECONNABORTED
+		"operation timed out",              // ETIMEDOUT on darwin
+		"connection timed out",             // ETIMEDOUT on linux
 
 		// The Windows wordings of the same conditions, for the layers that pass the message along without the errno
 		// still attached to it. ERROR_NETNAME_DELETED, which Windows reads return alongside WSAECONNRESET when the peer
