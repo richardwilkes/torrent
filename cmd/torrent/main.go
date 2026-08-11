@@ -33,6 +33,12 @@ import (
 	"github.com/richardwilkes/torrent/tfs"
 )
 
+// stopTimeout is how long the shutdown registered at exit will wait for the torrent to stop. The stopped announce is
+// made against a tracker with a 30 second timeout of its own, so anything less would routinely give up on a shutdown
+// that was about to finish, while waiting longer would leave someone who pressed Ctrl-C staring at an unresponsive
+// program.
+const stopTimeout = 30 * time.Second
+
 func main() {
 	xos.AppName = "Simple Torrent"
 	xos.AppCmdName = "torrent"
@@ -93,6 +99,7 @@ func main() {
 		torrent.NotifyWhenStopped(stoppedNotifier),
 		torrent.SeedDuration(*seedDuration))
 	xos.ExitIfErr(err)
+	stopAtExit(xos.RunAtExit, c.Stop)
 
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
@@ -104,8 +111,20 @@ func main() {
 		stopped:  stoppedNotifier,
 		tick:     t.C,
 	}
-	m.run()
+	if !m.run() {
+		xos.Exit(1)
+	}
 	xos.Exit(0)
+}
+
+// stopAtExit arranges for the torrent to be stopped when the program exits. Registering the stop is what makes Ctrl-C
+// (SIGINT) and SIGTERM shut a download down cleanly, since the registrar installs handlers for both that call
+// xos.Exit, which in turn runs what was registered here. Without it, a long-running download is killed where it
+// stands: the tracker never receives the stopped announce and goes on handing our dead address to peers, peers are
+// dropped mid-write, and the storage file is left open and unflushed rather than being closed by the client's
+// shutdown. The registrar is supplied by the caller so that what gets registered can be tested on its own.
+func stopAtExit(register func(func()) int, stop func(time.Duration)) {
+	register(func() { stop(stopTimeout) })
 }
 
 // torrentFilePath returns the path of the torrent file to work with. Exactly one is required: only one torrent is
@@ -147,8 +166,10 @@ type monitor struct {
 	extracted bool
 }
 
-// run processes notifications until the client stops.
-func (m *monitor) run() {
+// run processes notifications until the client stops, returning whether it stopped without error. A torrent that
+// stopped in the errored state left its download incomplete, which the caller has no way to react to if the program
+// reports success all the same.
+func (m *monitor) run() bool {
 	for {
 		select {
 		case <-m.complete:
@@ -158,6 +179,7 @@ func (m *monitor) run() {
 			switch m.status().State {
 			case torrent.Errored:
 				slog.Error("stopped with error")
+				return false
 			case torrent.Done:
 				slog.Info("stopped")
 				// The client sends the completion and stopped notifications in quick succession when seeding ends,
@@ -168,7 +190,7 @@ func (m *monitor) run() {
 					m.remove()
 				}
 			}
-			return
+			return true
 		case <-m.tick:
 			slog.Info(m.status().String())
 		}
@@ -231,14 +253,23 @@ func extractFile(tf *tfs.File, p, target string) error {
 	return f.Close()
 }
 
-// sanitizePath makes each component of a slash-separated virtual path safe to use as a local filesystem path.
+// sanitizePath makes each component of a slash-separated virtual path safe to use as a local filesystem path. The
+// result is never empty: a path whose components all fall away, such as "." or "/", is sanitized as a single name
+// instead, the same way ".." already is. Joining an empty result onto a directory silently drops the component, and
+// the torrent validation accepts either of those as a torrent's name, so a multi-file torrent carrying one would be
+// extracted straight into the current directory rather than into the directory named for it, on top of whatever is
+// already there.
 func sanitizePath(p string) string {
-	parts := strings.Split(path.Clean(p), "/")
+	cleaned := path.Clean(p)
+	parts := strings.Split(cleaned, "/")
 	list := make([]string, 0, len(parts))
 	for _, part := range parts {
 		if part != "" && part != "." {
 			list = append(list, xfilepath.SanitizeName(part))
 		}
+	}
+	if len(list) == 0 {
+		return xfilepath.SanitizeName(cleaned)
 	}
 	return filepath.Join(list...)
 }
