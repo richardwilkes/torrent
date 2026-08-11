@@ -14,6 +14,7 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,6 +26,7 @@ import (
 	"github.com/richardwilkes/toolbox/v2/errs"
 	"github.com/richardwilkes/toolbox/v2/xio"
 	"github.com/richardwilkes/torrent/dispatcher"
+	"github.com/richardwilkes/torrent/tfs"
 )
 
 // peerMgmtWait is how long a test will wait for peer management to react. Anything approaching this means peer
@@ -612,6 +614,31 @@ func TestPeerRankingDoesNotRacePeerCounters(t *testing.T) {
 	}
 	close(stop)
 	wg.Wait()
+}
+
+// TestTorrentLabelStaysReadable verifies that the name a torrent's logging is tagged with comes from the torrent's own
+// path rather than from its storage path. The storage path carries the info hash that keeps two torrents from being
+// handed the same storage file, and 40 hex characters of it in front of every line say nothing to whoever is reading
+// the log.
+func TestTorrentLabelStaysReadable(t *testing.T) {
+	c := check.New(t)
+	const name = "example"
+	for _, one := range []struct {
+		path string
+		want string
+	}{
+		{path: name + ".torrent", want: name},
+		{path: filepath.Join("some", "dir", name+".torrent"), want: name},
+		{path: name, want: name},
+		// The whole of a dotfile-style name is the name rather than an extension, so none of it is trimmed away
+		{path: ".config", want: ".config"},
+	} {
+		f := newTestTorrentFile()
+		f.Path = one.path
+		f.InfoHash = tfs.InfoHash{0xde, 0xad, 0xbe, 0xef}
+		c.Equal(one.want, torrentLabel(f), one.path)
+		c.NotContains(torrentLabel(f), "deadbeef", "the info hash must not be dragged into the log label: %s", one.path)
+	}
 }
 
 // TestTestDispatchersDoNotProbeForTheExternalIP verifies that the dispatcher these tests are built with reports the

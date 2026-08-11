@@ -12,6 +12,7 @@ package tfs
 import (
 	"bytes"
 	"crypto/sha1" //nolint:gosec // The spec requires sha1
+	"encoding/hex"
 	"io"
 	"io/fs"
 	"math"
@@ -111,7 +112,10 @@ type File struct {
 		Private bool `bencode:"private"`
 	} `bencode:"info"`
 	InfoHash InfoHash `bencode:"-"`
-	lock     sync.Mutex
+	// size is the total the metadata declares, worked out while it was being validated. Nothing changes it afterwards,
+	// so Size can read it without any synchronization of its own from the goroutines a peer's messages drive.
+	size int64
+	lock sync.Mutex
 }
 
 // NewFileFromPath creates a torrent file structure from the raw torrent file data.
@@ -297,6 +301,9 @@ func (f *File) validate() error {
 		return errs.Newf("torrent piece count of %d doesn't match the %d expected for a size of %d and a piece length of %d",
 			f.PieceCount(), expected, size, f.Info.PieceLength)
 	}
+	// Recorded now that the metadata has been judged consistent, since nothing changes it afterwards and Size is asked
+	// for it on paths a remote peer drives.
+	f.size = size
 	return nil
 }
 
@@ -362,6 +369,19 @@ func (f *File) PieceCount() int {
 
 // Size returns the size of the complete data.
 func (f *File) Size() int64 {
+	// The total is worked out once, while the metadata is being validated, and the metadata is immutable from then on.
+	// Summing the file list on every call costs O(file count) — MaxFileCount is 131,072 entries — and LengthOf calls
+	// this for the last piece, which the peer code reaches for on every 17 byte request message that arrives: a remote
+	// asking for the final piece over and over would otherwise buy itself ~10^5 iterations of work per tiny message.
+	if f.size > 0 {
+		return f.size
+	}
+	return f.computeSize()
+}
+
+// computeSize sums the lengths the metadata declares, which is what a File that this package didn't build — and so
+// never validated, and never worked the total out for — has to fall back on.
+func (f *File) computeSize() int64 {
 	if f.Info.Length > 0 {
 		return f.Info.Length
 	}
@@ -372,14 +392,23 @@ func (f *File) Size() int64 {
 	return total
 }
 
-// StoragePath returns the path that will be used for torrent file storage. The extension is trimmed with
-// xfilepath.TrimExtension rather than filepath.Ext, since the whole of a dotfile-style name (".config") is an
-// extension as far as the latter is concerned: trimming that leaves nothing but DownloadExt, so every such torrent
-// sharing a download directory would be handed the same storage file to write its data into.
+// StoragePath returns the path that will be used for torrent file storage. The torrent's name is only there to make
+// the file recognizable; what makes it the storage of one particular torrent, and of no other, is the info hash
+// appended to it. A name alone maps distinct torrents onto the same storage file whenever those names agree once the
+// extension has been trimmed away ("movie.mkv" and "movie.srt" both leave "movie"), or once they have been cut down to
+// what a filesystem will accept, and two such torrents sharing a download directory then open, truncate and write that
+// one file, destroying each other's data with nothing to say it happened. A torrent carries whatever name it likes, so
+// that is something a hostile one arranges deliberately rather than a coincidence to be hoped against.
+//
+// The extension is trimmed with xfilepath.TrimExtension rather than filepath.Ext, since the whole of a dotfile-style
+// name (".config") is an extension as far as the latter is concerned, which would leave nothing of the name at all.
+// The hash is written in hex rather than in a denser encoding because the storage lands on filesystems that don't
+// distinguish letter case, on which anything mixing the two would let distinct hashes collide all over again.
 func (f *File) StoragePath() string {
 	dir, filename := filepath.Split(f.Path)
-	filename = xfilepath.TrimExtension(filename)
-	return filepath.Join(dir, truncateName(filename, maxStorageNameLength-len(DownloadExt))+DownloadExt)
+	suffix := "-" + hex.EncodeToString(f.InfoHash[:]) + DownloadExt
+	filename = truncateName(xfilepath.TrimExtension(filename), maxStorageNameLength-len(suffix))
+	return filepath.Join(dir, filename+suffix)
 }
 
 // truncateName shortens name to at most maxBytes bytes, cutting only at a rune boundary and never between the two
@@ -396,9 +425,15 @@ func truncateName(name string, maxBytes int) string {
 	return strings.TrimSuffix(name[:maxBytes], "@")
 }
 
-// Validate checks the supplied buffer to determine if it contains the data
-// for the piece at the specified index.
+// Validate checks the supplied buffer to determine if it contains the data for the piece at the specified index. An
+// index that isn't one of the torrent's pieces is answered with false rather than being allowed to run off the end of
+// the piece hashes: this is exported on a type built from untrusted metadata, and its siblings LengthOf and OffsetOf
+// answer for any index at all, so a caller that forgot to bound one taken from a peer's message would otherwise take
+// the whole process down with a slice out of range.
 func (f *File) Validate(index int, buffer []byte) bool {
+	if index < 0 || index >= f.PieceCount() {
+		return false
+	}
 	s := sha1.Sum(buffer) //nolint:gosec // The spec requires sha1
 	return bytes.Equal(s[:], f.Info.Pieces[index*sha1.Size:(index+1)*sha1.Size])
 }

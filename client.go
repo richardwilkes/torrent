@@ -27,6 +27,7 @@ import (
 
 	"github.com/richardwilkes/toolbox/v2/errs"
 	"github.com/richardwilkes/toolbox/v2/rate"
+	"github.com/richardwilkes/toolbox/v2/xfilepath"
 	"github.com/richardwilkes/toolbox/v2/xio"
 	"github.com/richardwilkes/torrent/dispatcher"
 	"github.com/richardwilkes/torrent/tfs"
@@ -85,6 +86,14 @@ type Client struct {
 	peerMgmtStopping         bool // protected by peerMgmtLock
 }
 
+// torrentLabel returns the short name a torrent's logging is tagged with, which is the name of the file it came from
+// with any extension trimmed away. It is taken from the torrent's own path rather than from its storage path: the
+// latter carries the info hash that keeps two torrents from being handed the same storage file, which is 40 hex
+// characters that say nothing to whoever is reading the log.
+func torrentLabel(torrentFile *tfs.File) string {
+	return xfilepath.TrimExtension(filepath.Base(torrentFile.Path))
+}
+
 // NewClient creates and starts a new client for a torrent.
 func NewClient(d *dispatcher.Dispatcher, torrentFile *tfs.File, options ...func(*Client) error) (*Client, error) {
 	if d == nil {
@@ -93,13 +102,12 @@ func NewClient(d *dispatcher.Dispatcher, torrentFile *tfs.File, options ...func(
 	if torrentFile == nil {
 		return nil, errs.New("torrentFile may not be nil")
 	}
-	_, path := filepath.Split(torrentFile.StoragePath())
 	c := &Client{
 		InRate:              d.InRate.New(math.MaxInt32),
 		OutRate:             d.OutRate.New(math.MaxInt32),
 		dispatcher:          d,
 		torrentFile:         torrentFile,
-		logger:              d.Logger().With("torrent_file", path[:len(path)-len(filepath.Ext(path))]),
+		logger:              d.Logger().With("torrent_file", torrentLabel(torrentFile)),
 		concurrentDownloads: 4,
 		peersWanted:         32,
 		peerWaitGroup:       &sync.WaitGroup{},
@@ -368,10 +376,8 @@ func (c *Client) prepareFile() error {
 func (c *Client) HandleConnection(conn net.Conn, logger *slog.Logger, _ dispatcher.ProtocolExtensions,
 	infoHash tfs.InfoHash, sendHandshake bool, handshakeDone func(),
 ) {
-	_, storagePath := filepath.Split(c.torrentFile.StoragePath())
 	remoteAddr := conn.RemoteAddr()
-	logger = logger.With("torrent_file", storagePath[:len(storagePath)-len(filepath.Ext(storagePath))],
-		"remote_addr", remoteAddr.String())
+	logger = logger.With("torrent_file", torrentLabel(c.torrentFile), "remote_addr", remoteAddr.String())
 	logger.Debug("new connection")
 	if !bytes.Equal(infoHash[:], c.torrentFile.InfoHash[:]) {
 		c.dispatcher.GateKeeper().BlockAddress(remoteAddr)

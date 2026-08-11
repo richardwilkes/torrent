@@ -12,6 +12,7 @@ package tfs_test
 import (
 	"bytes"
 	"crypto/sha1" //nolint:gosec // The spec requires sha1
+	"encoding/hex"
 	"errors"
 	"io"
 	"io/fs"
@@ -633,7 +634,50 @@ func TestStoragePathStaysAValidFilename(t *testing.T) {
 	c := check.New(t)
 	f, err := tfs.NewFileFromBytes(encodeTorrent(t, singleFileInfo()))
 	c.NoError(err)
-	c.Equal("example"+tfs.DownloadExt, f.StoragePath())
+	c.Equal(storageName(f, "example"), f.StoragePath())
+}
+
+// storageName returns the base name the storage file of the given torrent is expected to have: the readable part the
+// caller supplies, followed by the info hash that keeps two torrents from ever being handed the same storage file.
+func storageName(f *tfs.File, readable string) string {
+	return readable + "-" + hex.EncodeToString(f.InfoHash[:]) + tfs.DownloadExt
+}
+
+// TestStoragePathKeepsCollidingNamesDistinct covers the names that a storage path derived from the torrent's name
+// alone maps onto the same file: names that agree once the extension has been trimmed away, and names that agree once
+// they have been cut down to what a filesystem will accept. Two such torrents sharing a download directory would
+// open, truncate and write the same file, destroying each other's data with nothing to say it happened, and since a
+// torrent carries whatever name it likes that is something a hostile one arranges deliberately.
+func TestStoragePathKeepsCollidingNamesDistinct(t *testing.T) {
+	c := check.New(t)
+	dir := t.TempDir()
+	long := strings.Repeat("a", 300)
+	owner := make(map[string]string)
+	for _, name := range []string{
+		"movie.mkv", "movie.srt", "movie", // the same once the extension has been trimmed away
+		long + "-one.bin", long + "-two.bin", // the same once the name has been truncated
+	} {
+		info := singleFileInfo()
+		info["name"] = name
+		f, err := tfs.NewFileFromBytes(encodeTorrent(t, info))
+		c.NoError(err)
+		f.Path = filepath.Join(dir, f.Path)
+		storage := f.StoragePath()
+		base := filepath.Base(storage)
+		c.True(len(base) <= maxStorageNameLength, "%d bytes exceeds the limit for %q", len(base), name)
+		if other, taken := owner[storage]; taken {
+			t.Fatalf("%q and %q were both given the storage file %q", other, name, storage)
+		}
+		owner[storage] = name
+
+		// The storage file has to be reachable by the same path every time, since that is what lets a download that
+		// was interrupted carry on from what is already there rather than starting over
+		again, err := tfs.NewFileFromBytes(encodeTorrent(t, info))
+		c.NoError(err)
+		again.Path = filepath.Join(dir, again.Path)
+		c.Equal(storage, again.StoragePath(), "the same torrent must always be handed the same storage file")
+	}
+	c.Equal(5, len(owner))
 }
 
 // TestStoragePathKeepsDotfileNamesDistinct covers names that filepath.Ext considers to be nothing but an extension.
@@ -643,12 +687,14 @@ func TestStoragePathKeepsDotfileNamesDistinct(t *testing.T) {
 	c := check.New(t)
 	dir := t.TempDir()
 	owner := make(map[string]string)
+	files := make(map[string]*tfs.File)
 	for _, name := range []string{".config", ".env", ".hidden.bin", "example.bin"} {
 		info := singleFileInfo()
 		info["name"] = name
 		f, err := tfs.NewFileFromBytes(encodeTorrent(t, info))
 		c.NoError(err)
 		f.Path = filepath.Join(dir, f.Path)
+		files[name] = f
 		storage := f.StoragePath()
 		c.True(strings.HasSuffix(storage, tfs.DownloadExt))
 		if other, taken := owner[storage]; taken {
@@ -659,9 +705,9 @@ func TestStoragePathKeepsDotfileNamesDistinct(t *testing.T) {
 
 	// The leading dot is part of the name rather than an extension, so it stays; a real extension behind one is still
 	// trimmed.
-	c.Equal(".config", owner[filepath.Join(dir, ".config"+tfs.DownloadExt)])
-	c.Equal(".env", owner[filepath.Join(dir, ".env"+tfs.DownloadExt)])
-	c.Equal(".hidden.bin", owner[filepath.Join(dir, ".hidden"+tfs.DownloadExt)])
+	c.Equal(".config", owner[filepath.Join(dir, storageName(files[".config"], ".config"))])
+	c.Equal(".env", owner[filepath.Join(dir, storageName(files[".env"], ".env"))])
+	c.Equal(".hidden.bin", owner[filepath.Join(dir, storageName(files[".hidden.bin"], ".hidden"))])
 }
 
 // TestEmbeddedFilesOrderIsStable verifies the order doesn't shift from call to call. The input order comes from map
@@ -730,6 +776,55 @@ func TestLengthOfStaysPositive(t *testing.T) {
 	for i := range f.PieceCount() {
 		c.True(f.LengthOf(i) > 0, "piece %d", i)
 		c.True(f.LengthOf(i) <= f.Info.PieceLength, "piece %d", i)
+	}
+}
+
+// TestSizeIsWorkedOutWhileTheMetadataIsValidated verifies that the total isn't summed out of the file list on every
+// call. LengthOf asks for it for the last piece, and the peer code asks LengthOf for every 17 byte request message
+// that arrives, so a remote asking for the final piece over and over would otherwise buy itself an iteration per file
+// entry — up to MaxFileCount of them — for each tiny message it sent.
+func TestSizeIsWorkedOutWhileTheMetadataIsValidated(t *testing.T) {
+	c := check.New(t)
+	f, err := tfs.NewFileFromBytes(encodeTorrent(t, multiFileInfo()))
+	c.NoError(err)
+	c.Equal(int64(20), f.Size())
+	c.Equal(int64(4), f.LengthOf(f.PieceCount()-1))
+
+	// Summing the file list again is the only way to arrive at what it says now, so a size that comes back unchanged
+	// is one that was worked out while the metadata was being validated and hasn't been recomputed since
+	f.Info.Files = append(f.Info.Files, f.Info.Files[0])
+	c.Equal(int64(20), f.Size(), "the size must not be summed out of the file list on each call")
+	c.Equal(int64(4), f.LengthOf(f.PieceCount()-1))
+
+	// The single-file form has no list to sum, but has to agree with what it declared all the same
+	f, err = tfs.NewFileFromBytes(encodeTorrent(t, singleFileInfo()))
+	c.NoError(err)
+	c.Equal(int64(20), f.Size())
+}
+
+// TestValidateRefusesIndexesOutsideTheTorrent verifies that an index that isn't one of the torrent's pieces is
+// answered rather than run off the end of the piece hashes. Validate is exported on a type built from untrusted
+// metadata, and its siblings LengthOf and OffsetOf answer for any index at all, so a caller that forgot to bound one
+// taken from a peer's message would otherwise take the whole process down with a slice out of range.
+func TestValidateRefusesIndexesOutsideTheTorrent(t *testing.T) {
+	c := check.New(t)
+	content := []byte("0123456789abcdefghij")
+	first := sha1.Sum(content[:16])  //nolint:gosec // The spec requires sha1
+	second := sha1.Sum(content[16:]) //nolint:gosec // The spec requires sha1
+	info := singleFileInfo()
+	info["pieces"] = append(first[:], second[:]...)
+	f, err := tfs.NewFileFromBytes(encodeTorrent(t, info))
+	c.NoError(err)
+
+	// The pieces that are there are still judged on what they hold
+	c.True(f.Validate(0, content[:16]))
+	c.True(f.Validate(1, content[16:]))
+	c.False(f.Validate(0, content[16:]), "a buffer that doesn't hash to the piece must not be accepted")
+
+	for _, index := range []int{-1, 2, 3, math.MaxInt32, math.MinInt32} {
+		c.NotPanics(func() {
+			c.False(f.Validate(index, content[:16]), "piece %d is not part of the torrent", index)
+		}, "piece %d", index)
 	}
 }
 

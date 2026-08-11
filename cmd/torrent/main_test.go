@@ -491,22 +491,41 @@ func TestExtractFilesWithANameThatSanitizesAway(t *testing.T) {
 	c.Equal(existing, string(data), "the file already in the current directory must not be overwritten")
 }
 
-// TestExtractFilesRefusesToExtractOverTheStorageFile verifies that a torrent naming its content after the storage file
-// it was downloaded into is refused rather than extracted. A single-file torrent's content lands directly in the
-// current directory, which is where its storage file lives too, and the torrent chooses the name: creating the target
-// would truncate the very file the extraction is reading out of, so the copy would see EOF, report a zero-byte file as
-// successfully extracted, and the download would be gone.
-func TestExtractFilesRefusesToExtractOverTheStorageFile(t *testing.T) {
+// TestExtractFileRefusesToWriteOverTheStorageFile verifies that the storage file is never the target of an extraction,
+// whatever target it is handed. Creating the file exclusively already refuses one that exists, but the collision is
+// named in its own right because what it would destroy is the download itself rather than some unrelated file: the
+// copy reads the storage back through a section of it, so truncating it first has a zero-byte file reported as
+// successfully extracted and the data gone.
+func TestExtractFileRefusesToWriteOverTheStorageFile(t *testing.T) {
 	c := check.New(t)
 	t.Chdir(t.TempDir())
+	const content = torrentName + ".bin"
 
-	tf := newTorrentFile(t, torrentName+tfs.DownloadExt, map[string]any{lengthKey: int64(len(sampleContent))})
-	c.Equal(torrentName+tfs.DownloadExt, tf.StoragePath(), "the torrent must name its content after its storage file")
-	c.HasError(extractFiles(tf), "extracting a torrent over its own storage file must be refused")
+	tf := newTorrentFile(t, content, map[string]any{lengthKey: int64(len(sampleContent))})
+	c.HasError(extractFile(tf, content, tf.StoragePath()),
+		"extracting a torrent over its own storage file must be refused")
 
 	data, err := os.ReadFile(tf.StoragePath())
 	c.NoError(err)
 	c.Equal(sampleContent, string(data), "the storage file must still hold everything that was downloaded")
+}
+
+// TestExtractFilesOfATorrentNamedLikeItsStorage verifies that a torrent whose content is named the way a storage file
+// is doesn't collide with its own storage. The storage file carries the torrent's info hash, so no name a torrent
+// gives its content can land on it — which is what keeps a single-file torrent, whose content goes into the very
+// directory the storage lives in, from being able to arrange the collision above at all.
+func TestExtractFilesOfATorrentNamedLikeItsStorage(t *testing.T) {
+	c := check.New(t)
+	t.Chdir(t.TempDir())
+	const content = torrentName + tfs.DownloadExt
+
+	tf := newTorrentFile(t, content, map[string]any{lengthKey: int64(len(sampleContent))})
+	c.NotEqual(content, tf.StoragePath(), "a torrent must not be able to name its content onto its own storage file")
+	c.NoError(extractFiles(tf))
+
+	data, err := os.ReadFile(content)
+	c.NoError(err)
+	c.Equal(sampleContent, string(data))
 }
 
 // TestExtractFilesDoesNotOverwriteAnExistingFile verifies that a file already sitting at the target is left alone
