@@ -77,7 +77,7 @@ func main() {
 
 	if *unpackOnly {
 		slog.Info("unpacking")
-		extractFiles(f)
+		xos.ExitIfErr(unpack(f))
 		xos.Exit(0)
 	}
 
@@ -203,6 +203,44 @@ func (m *monitor) extractIfNeeded() {
 		m.extract()
 		m.extracted = true
 	}
+}
+
+// unpack extracts the torrent's files from storage that has already been downloaded, refusing to do so unless that
+// storage actually holds the whole torrent. The client preallocates the storage file at its full length as soon as a
+// download starts, so an unpack of an interrupted download would otherwise write out full-size files of whatever the
+// storage happened to hold — zeros, for the most part — and report success, which is indistinguishable from the real
+// thing until whoever asked for it tries to use the result. The notification path this shares its extraction with
+// already refuses to run until nothing is left to download.
+func unpack(tf *tfs.File) error {
+	if err := verifyStorageIsComplete(tf); err != nil {
+		return err
+	}
+	extractFiles(tf)
+	return nil
+}
+
+// verifyStorageIsComplete returns an error unless every piece of the torrent is present in its storage and hashes to
+// what the torrent says it should.
+func verifyStorageIsComplete(tf *tfs.File) error {
+	f, err := os.Open(tf.StoragePath())
+	if err != nil {
+		return err
+	}
+	defer xio.CloseIgnoringErrors(f)
+	count := tf.PieceCount()
+	buffer := make([]byte, tf.Info.PieceLength)
+	for i := range count {
+		length := int(tf.LengthOf(i))
+		var n int
+		if n, err = f.ReadAt(buffer[:length], tf.OffsetOf(i)); err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+		if n != length || !tf.Validate(i, buffer[:n]) {
+			return fmt.Errorf("%s does not hold the complete torrent: piece %d of %d is missing or damaged",
+				tf.StoragePath(), i+1, count)
+		}
+	}
+	return nil
 }
 
 func extractFiles(tf *tfs.File) {

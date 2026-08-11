@@ -54,7 +54,9 @@ func PeersWanted(wanted int) func(*Client) error {
 }
 
 // ConcurrentDownloads sets the number of peers to actively download from at
-// the same time. Default is 4.
+// the same time. Peers beyond this many are still connected to, and still
+// uploaded to, but are not asked for pieces until one of the peers downloading
+// finishes or gives up its piece. Default is 4.
 func ConcurrentDownloads(concurrent int) func(*Client) error {
 	return func(c *Client) error {
 		if concurrent < 1 {

@@ -11,10 +11,12 @@ package torrent
 
 import (
 	"math"
+	"net"
 	"testing"
 	"time"
 
 	"github.com/richardwilkes/toolbox/v2/check"
+	"github.com/richardwilkes/toolbox/v2/xio"
 	"github.com/richardwilkes/torrent/dispatcher"
 	"github.com/richardwilkes/torrent/tfs"
 )
@@ -46,6 +48,95 @@ func TestRateCapsTooSmallForAPieceMessageAreRejected(t *testing.T) {
 			tc.NoError(one.option(dispatcher.MinimumRateCap + 1)(client))
 		})
 	}
+}
+
+// TestConcurrentDownloadsLimitsThePeersWeDownloadFrom verifies that the option is the limit on simultaneous downloads
+// it says it is. Left to gate nothing but whether more peers were sought, every peer that unchoked us went on to claim
+// a piece of its own, so a client configured for one download at a time still pulled pieces from every peer it had.
+func TestConcurrentDownloadsLimitsThePeersWeDownloadFrom(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	c.HasError(ConcurrentDownloads(0)(client), "fewer than one download at a time must not be accepted")
+	c.NoError(ConcurrentDownloads(2)(client))
+
+	// Three peers, each holding the whole torrent and each free to be asked for a piece
+	peers := make([]*peer, 0, 3)
+	conns := make([]net.Conn, 0, cap(peers))
+	defer func() {
+		for _, conn := range conns {
+			xio.CloseIgnoringErrors(conn)
+		}
+	}()
+	for range cap(peers) {
+		conn, p := newTestPeer(t, client)
+		conns = append(conns, conn)
+		p.lock.Lock()
+		p.peerChoking = false
+		p.has = everyTestPiece()
+		p.lock.Unlock()
+		peers = append(peers, p)
+	}
+	for _, p := range peers {
+		p.startDownloadIfNeeded()
+	}
+	c.Equal(2, testDownloadingPeerCount(peers), "no more peers than ConcurrentDownloads allows may be downloading")
+
+	// A peer that is already downloading isn't stopped from carrying on with the next piece when it finishes one
+	downloading := peers[0]
+	if !testPeerIsDownloading(downloading) {
+		downloading = peers[2]
+	}
+	index := testClaimedPiece(downloading)
+	downloading.lock.Lock()
+	delete(downloading.pieces, index)
+	downloading.lock.Unlock()
+	client.tracker.markBlockValid(index)
+	downloading.startDownloadIfNeeded()
+	c.True(testPeerIsDownloading(downloading), "a peer that finished a piece must be able to start the next one")
+	c.Equal(2, testDownloadingPeerCount(peers))
+
+	// And the slot a peer gives up goes to one of the peers that was waiting for it
+	index = testClaimedPiece(downloading)
+	downloading.lock.Lock()
+	delete(downloading.pieces, index)
+	downloading.lock.Unlock()
+	client.tracker.clearDownload(index, downloading)
+	c.Equal(1, testDownloadingPeerCount(peers))
+	for _, p := range peers {
+		if p != downloading {
+			p.startDownloadIfNeeded()
+		}
+	}
+	c.Equal(2, testDownloadingPeerCount(peers), "the freed slot must be taken up, and only once")
+}
+
+// testDownloadingPeerCount returns how many of the peers are holding a piece.
+func testDownloadingPeerCount(peers []*peer) int {
+	count := 0
+	for _, p := range peers {
+		if testPeerIsDownloading(p) {
+			count++
+		}
+	}
+	return count
+}
+
+// testPeerIsDownloading returns whether the peer is holding a piece.
+func testPeerIsDownloading(p *peer) bool {
+	p.lock.RLock()
+	defer p.lock.RUnlock()
+	return len(p.pieces) != 0
+}
+
+// testClaimedPiece returns the index of the piece the peer is downloading.
+func testClaimedPiece(p *peer) int {
+	p.lock.RLock()
+	defer p.lock.RUnlock()
+	for index := range p.pieces {
+		return index
+	}
+	return -1
 }
 
 // TestMinimumRateCapPermitsAPieceMessage verifies that the minimum cap is actually large enough for the largest amount

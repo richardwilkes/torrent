@@ -692,13 +692,35 @@ func (t *tracker) isInteresting(has *fixedbits.Bits) bool {
 	return i != -1
 }
 
+// selectForDownloading claims a piece the peer has and we still need, returning its index, or -1 if there is nothing
+// for it to take. Nothing is claimed once as many peers as ConcurrentDownloads allows are already downloading, which
+// is what makes that option the limit on simultaneous downloads it says it is: without the cap here it only decided
+// whether more peers were sought, while every peer that unchoked us went on to start a download of its own regardless.
 func (t *tracker) selectForDownloading(who *peer, has *fixedbits.Bits) int {
 	t.lock.Lock()
+	defer t.lock.Unlock()
+	if !t.downloadSlotAvailable(who) {
+		return -1
+	}
 	i := fixedbits.FirstAvailable(has, t.downloading, t.have)
 	if i != -1 {
 		t.who[i] = who
 		t.downloading.Set(i)
 	}
-	t.lock.Unlock()
 	return i
+}
+
+// downloadSlotAvailable returns true if the peer may take on a piece, which it may either because it is already one of
+// the peers downloading or because fewer than ConcurrentDownloads peers are. The claims are counted by the peers
+// holding them rather than by the pieces claimed, since what the option limits is how many peers we download from.
+// The lock must be held.
+func (t *tracker) downloadSlotAvailable(who *peer) bool {
+	downloaders := make(map[*peer]bool, len(t.who))
+	for _, one := range t.who {
+		if one == who {
+			return true
+		}
+		downloaders[one] = true
+	}
+	return len(downloaders) < t.client.concurrentDownloads
 }

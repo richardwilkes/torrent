@@ -11,6 +11,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/sha1" //nolint:gosec // The spec requires sha1
 	"fmt"
 	"maps"
 	"os"
@@ -39,6 +40,7 @@ const (
 	lengthKey = "length"
 	pathKey   = "path"
 	filesKey  = "files"
+	piecesKey = "pieces"
 	fileB     = "b.txt"
 
 	// torrentName is the name carried by the torrents the extraction tests build, and therefore the directory a
@@ -48,6 +50,9 @@ const (
 	// sampleContent is the storage content of the torrents the extraction tests build. Its length has to agree with
 	// the piece length and piece count newTorrentFile supplies.
 	sampleContent = "0123456789abcdefghij"
+
+	// samplePieceLength is the piece length newTorrentFile builds its torrents with.
+	samplePieceLength = 16
 
 	// exitHelperEnv marks the child process the exit handling test starts, and exitHelperName is the test that child
 	// runs. The lines the child reports are how the parent follows what its exit handling did.
@@ -277,8 +282,8 @@ func newTorrentFile(t *testing.T, name string, layout map[string]any) *tfs.File 
 	c := check.New(t)
 	info := map[string]any{
 		"name":         name,
-		"piece length": int64(16),
-		"pieces":       make([]byte, 40),
+		"piece length": int64(samplePieceLength),
+		piecesKey:      make([]byte, 40),
 	}
 	maps.Copy(info, layout)
 	data, err := bencode.EncodeBytes(map[string]any{"info": info})
@@ -365,6 +370,55 @@ func TestExtractFilesWithANameThatSanitizesAway(t *testing.T) {
 	data, err = os.ReadFile(fileB)
 	c.NoError(err)
 	c.Equal(existing, string(data), "the file already in the current directory must not be overwritten")
+}
+
+// TestUnpackRefusesStorageThatIsNotComplete verifies that unpacking a torrent whose download never finished writes
+// nothing at all. The storage file is preallocated at its full length the moment a download starts, so extracting from
+// it without checking produces full-size files of whatever it happens to hold — zeros, for the most part — and
+// reports success, which is indistinguishable from the real thing until someone tries to use the result.
+func TestUnpackRefusesStorageThatIsNotComplete(t *testing.T) {
+	for _, one := range []struct {
+		name    string
+		content string
+	}{
+		{name: "storage holding the whole torrent", content: sampleContent},
+		{name: "storage that was never filled in", content: strings.Repeat("\x00", len(sampleContent))},
+		{name: "storage holding all but the last piece", content: sampleContent[:samplePieceLength] + "\x00\x00\x00\x00"},
+		{name: "storage shorter than the torrent", content: sampleContent[:8]},
+	} {
+		t.Run(one.name, func(t *testing.T) {
+			c := check.New(t)
+			t.Chdir(t.TempDir())
+			tf := newTorrentFile(t, torrentName, map[string]any{
+				filesKey:  []any{map[string]any{lengthKey: int64(len(sampleContent)), pathKey: []any{fileB}}},
+				piecesKey: samplePieceHashes(),
+			})
+			c.NoError(os.WriteFile(tf.StoragePath(), []byte(one.content), 0o600))
+
+			err := unpack(tf)
+			if one.content == sampleContent {
+				c.NoError(err)
+				data, rerr := os.ReadFile(filepath.Join(torrentName, fileB))
+				c.NoError(rerr)
+				c.Equal(sampleContent, string(data))
+				return
+			}
+			c.HasError(err, "an incomplete torrent must not be unpacked")
+			_, err = os.Stat(filepath.Join(torrentName, fileB))
+			c.HasError(err, "nothing may be extracted from storage that isn't complete")
+		})
+	}
+}
+
+// samplePieceHashes returns the piece hashes for a torrent whose storage holds sampleContent, at the piece length
+// newTorrentFile builds its torrents with.
+func samplePieceHashes() []byte {
+	hashes := make([]byte, 0, sha1.Size*((len(sampleContent)+samplePieceLength-1)/samplePieceLength))
+	for i := 0; i < len(sampleContent); i += samplePieceLength {
+		sum := sha1.Sum([]byte(sampleContent[i:min(i+samplePieceLength, len(sampleContent))])) //nolint:gosec // The spec requires sha1
+		hashes = append(hashes, sum[:]...)
+	}
+	return hashes
 }
 
 // TestTorrentFilePath verifies that exactly one torrent file must be named, since only one is processed per run and

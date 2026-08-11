@@ -153,6 +153,15 @@ func TestDownloadStalled(t *testing.T) {
 			},
 			stalled: false,
 		},
+		{
+			name: "the requests haven't reached the wire yet",
+			state: peerState{
+				downloading:     true,
+				downloadStarted: now.Add(-4 * maxWaitForChunkDownload),
+				requestsUnsent:  true,
+			},
+			stalled: false,
+		},
 	} {
 		c.Equal(one.stalled, one.state.downloadStalled(now), one.name)
 	}
@@ -210,6 +219,7 @@ func TestStalledPeerIsBanned(t *testing.T) {
 	defer xio.CloseIgnoringErrors(conn)
 
 	p.queuePieceDownload(0)
+	markTestRequestsSent(t, p)
 	p.lock.Lock()
 	p.peerChoking = false
 	p.downloadStarted = time.Now().Add(-4 * maxWaitForChunkDownload)
@@ -1263,7 +1273,7 @@ func TestPeerManagementIntervalsAreIndependent(t *testing.T) {
 
 			// Only the tick under test is ever delivered, so it is the only thing that can clear the expired download
 			p.lock.Lock()
-			p.pieces[0] = &piece{buffer: make([]byte, chunkSize), timeout: time.Now().Add(-time.Minute)}
+			p.pieces[0] = &piece{buffer: make([]byte, chunkSize), timeout: time.Now().Add(-time.Minute), requested: true}
 			p.lock.Unlock()
 			select {
 			case one.pick(clearExpired, adjust) <- time.Now():
