@@ -25,6 +25,7 @@ import (
 	"github.com/richardwilkes/toolbox/v2/rate"
 	"github.com/richardwilkes/toolbox/v2/xio"
 	"github.com/richardwilkes/toolbox/v2/xnet"
+	"github.com/richardwilkes/toolbox/v2/xos"
 	"github.com/richardwilkes/torrent/tfs"
 	"github.com/richardwilkes/torrent/tio"
 )
@@ -105,18 +106,25 @@ type pendingHandshakes struct {
 
 // acquire takes a pending handshake slot for a connection from the given address, returning whether there was one to
 // take. A slot that is taken must be given back with release.
-func (p *pendingHandshakes) acquire(addr string) bool {
+//
+// The counts the decision was made from come back with it, both of them read under the one hold of the lock, so that a
+// caller reporting a refusal describes the state that actually caused it. Sampling them again afterwards would take the
+// lock twice more per refused connection — on the single accept goroutine, while up to maxPendingHandshakes dispatch
+// goroutines are contending for the same lock to give their slots back — and still report numbers that need not be the
+// ones the refusal was decided from.
+func (p *pendingHandshakes) acquire(addr string) (acquired bool, total, forAddress int) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
-	if p.total >= maxPendingHandshakes || p.byAddress[addr] >= maxPendingHandshakesPerAddress {
-		return false
+	total, forAddress = p.total, p.byAddress[addr]
+	if total >= maxPendingHandshakes || forAddress >= maxPendingHandshakesPerAddress {
+		return false, total, forAddress
 	}
 	if p.byAddress == nil {
 		p.byAddress = make(map[string]int)
 	}
 	p.byAddress[addr]++
 	p.total++
-	return true
+	return true, p.total, p.byAddress[addr]
 }
 
 // release gives back a slot taken for a connection from the given address. The last one an address holds takes its
@@ -376,15 +384,22 @@ func (d *Dispatcher) listen() {
 		}
 		retryDelay = 0
 		addr := handshakeSlotKey(conn.RemoteAddr())
-		if !d.pendingHandshakes.acquire(addr) {
+		acquired, pending, pendingForAddress := d.pendingHandshakes.acquire(addr)
+		if !acquired {
 			// Either we're already holding as many un-handshaken connections as we're willing to, or this address is,
 			// which is the same refusal for a different reason: the first bounds what a flood costs us, the second
 			// keeps one host from being the whole of it. Hanging up returns the descriptor immediately and leaves the
 			// remote free to try again, which is a great deal better than letting connections that may never say
 			// anything accumulate until nothing else can open a file either.
-			d.logger.Debug("refused connection", "remote_addr", conn.RemoteAddr().String(),
-				"pending_handshakes", d.pendingHandshakes.count(), "pending_handshakes_for_address",
-				d.pendingHandshakes.countFor(addr))
+			//
+			// The line is built only when it is going to be written, since formatting the remote address allocates and
+			// this is the path the bound exists to survive: a flood has the single accept goroutine here for every
+			// connection it makes. The counts come from the refusal itself rather than being sampled again, so they
+			// are the ones it was decided from.
+			if d.logger.Enabled(context.Background(), slog.LevelDebug) {
+				d.logger.Debug("refused connection", "remote_addr", conn.RemoteAddr().String(),
+					"pending_handshakes", pending, "pending_handshakes_for_address", pendingForAddress)
+			}
 			xio.CloseIgnoringErrors(conn)
 			continue
 		}
@@ -417,6 +432,12 @@ func (d *Dispatcher) dispatch(conn net.Conn, addr string) {
 	if handler == nil {
 		return
 	}
+	// A panic in the handler is contained to the connection that provoked it. ConnectionHandler is an exported
+	// extension point and the handler goes on to run the entire peer session — parsing binary messages the remote
+	// composes — on this goroutine, so a panic escaping it takes the process down and every other torrent the
+	// dispatcher is serving along with it. The deferred release and close above run on the unwind either way; the
+	// process kill is the whole of what this prevents.
+	defer xos.PanicRecovery(func(err error) { errs.LogTo(logger, err) })
 	handler.HandleConnection(conn, logger, extensions, infoHash, true, handshakeDone)
 }
 

@@ -10,6 +10,8 @@
 package dispatcher
 
 import (
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -148,6 +150,70 @@ func TestGateKeeperWithoutALoggerUsesTheDefault(t *testing.T) {
 
 	gk.BlockAddressString("10.0.0.1")
 	c.Contains(defaultSink.contents(), `msg="blocked peer"`)
+}
+
+// TestLookupsReclaimExpiredEntries verifies that an entry whose time has run out is taken away by the lookup that finds
+// it, rather than being left to a sweep that runs only once every blockDuration and stops altogether at Close.
+func TestLookupsReclaimExpiredEntries(t *testing.T) {
+	c := check.New(t)
+	gk := NewGateKeeper(nil)
+	defer gk.Close()
+
+	const addr = "10.0.0.1"
+	expired := time.Now().Add(-time.Minute)
+	gk.addresses.Store(addr, expired)
+	c.False(gk.IsAddressStringBlocked(addr))
+	_, stillThere := gk.addresses.Load(addr)
+	c.False(stillThere, "a lookup must reclaim the block it found expired")
+
+	gk.undialable.Store(addr, expired)
+	c.False(gk.IsDialBlocked(addr))
+	_, stillThere = gk.undialable.Load(addr)
+	c.False(stillThere, "a lookup must reclaim the dial suppression it found expired")
+
+	// One that hasn't run out is left exactly where it is
+	gk.BlockAddressString(addr)
+	c.True(gk.IsAddressStringBlocked(addr))
+	_, stillThere = gk.addresses.Load(addr)
+	c.True(stillThere, "a lookup must leave a block that is still in force alone")
+}
+
+// TestClosedGateKeeperRecordsNothing verifies that a GateKeeper which has been closed stops accumulating entries.
+// Pruning is the only thing that removes one on its own and it exits at Close, while Dispatcher.Stop closes the
+// gatekeeper and leaves it reachable through Dispatcher.GateKeeper() — which every client holds and calls on each
+// failed dial and peer error. Nothing couples a client's lifetime to the dispatcher's, so a dispatcher stopped ahead of
+// its clients would otherwise grow a permanent entry per address for as long as those clients kept running.
+func TestClosedGateKeeperRecordsNothing(t *testing.T) {
+	c := check.New(t)
+	gk := NewGateKeeper(nil)
+	gk.BlockAddressString("10.0.0.1")
+	gk.SuppressDialsTo("10.0.0.2")
+	gk.Close()
+
+	// What it was holding goes with it, since nothing is left to reclaim any of it
+	c.Equal(0, entryCount(&gk.addresses), "a closed GateKeeper must not go on holding the blocks it had")
+	c.Equal(0, entryCount(&gk.undialable), "a closed GateKeeper must not go on holding the suppressions it had")
+
+	// And nothing recorded afterwards is retained either
+	for i := range 100 {
+		addr := "10.1.0." + strconv.Itoa(i)
+		gk.BlockAddressString(addr)
+		gk.SuppressDialsTo(addr)
+		c.False(gk.IsAddressStringBlocked(addr))
+		c.False(gk.IsDialBlocked(addr))
+	}
+	c.Equal(0, entryCount(&gk.addresses), "a closed GateKeeper must not accumulate blocks")
+	c.Equal(0, entryCount(&gk.undialable), "a closed GateKeeper must not accumulate dial suppressions")
+}
+
+// entryCount returns the number of entries in the map, which sync.Map doesn't report on its own.
+func entryCount(m *sync.Map) int {
+	count := 0
+	m.Range(func(_, _ any) bool {
+		count++
+		return true
+	})
+	return count
 }
 
 // TestGateKeeperCloseIsIdempotent verifies that a second Close is a no-op rather than a panic, since nothing prevents

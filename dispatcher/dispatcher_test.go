@@ -67,11 +67,10 @@ func TestPortFromAddr(t *testing.T) {
 // running.
 func TestNewDispatcherOptionFailureCleansUp(t *testing.T) {
 	c := check.New(t)
-	before := settledGoroutineCount(t)
 	d, err := NewDispatcher(func(_ *Dispatcher) error { return errs.New("option failed") })
 	c.HasError(err)
 	c.Nil(d)
-	waitForGoroutines(t, before)
+	waitForDispatcherGoroutines(t)
 }
 
 // TestNewDispatcherPortRangeFailureCleansUp verifies that being unable to listen on any port in the requested range
@@ -81,11 +80,10 @@ func TestNewDispatcherPortRangeFailureCleansUp(t *testing.T) {
 	port, listener := occupiedPort(t)
 	defer xio.CloseIgnoringErrors(listener)
 
-	before := settledGoroutineCount(t)
 	d, err := NewDispatcher(PortRange(port, port))
 	c.HasError(err)
 	c.Nil(d)
-	waitForGoroutines(t, before)
+	waitForDispatcherGoroutines(t)
 }
 
 // TestPortRangeFailureReportsWhyItFailed verifies that the reason no port in the range could be listened on is passed
@@ -128,14 +126,13 @@ func occupiedPort(t *testing.T) (uint32, net.Listener) {
 // goroutine and a ticker, so a dispatcher that doesn't close them leaks both on every create and stop cycle.
 func TestStopReleasesResources(t *testing.T) {
 	c := check.New(t)
-	before := settledGoroutineCount(t)
 	// Built through the helper, whose failure is fatal: everything below uses the dispatcher, so carrying on from a
 	// failed create would dereference nil and panic, taking the whole test binary down instead of failing this test
 	d := newTestDispatcher(t)
 	d.Stop()
 	c.True(d.InRate.Closed(), "the inbound rate limiter must be closed")
 	c.True(d.OutRate.Closed(), "the outbound rate limiter must be closed")
-	waitForGoroutines(t, before)
+	waitForDispatcherGoroutines(t)
 
 	// Stopping a second time must neither panic nor block
 	d.Stop()
@@ -248,6 +245,25 @@ func TestAcceptRetriesTransientErrors(t *testing.T) {
 		t.Fatal("the accept loop never stopped")
 	}
 	c.Equal(len(listener.script)+1, listener.accepts(), "every scripted result must have been consumed")
+	checkHandshakeWrite(t, sent)
+}
+
+// checkHandshakeWrite reports what became of a handshake a test wrote from a goroutine of its own. Over a pipe the
+// write cannot complete, since nothing reads the peer ID trailing the part the dispatcher handshakes with, so the
+// connection being closed at the end of the dispatch is what releases it and io.ErrClosedPipe is the expected outcome
+// rather than a failure; over a real socket the kernel takes the whole of it and there is no error at all. Anything
+// else — a deadline that expired because our bytes were never read, say — is the real reason a test is about to fail,
+// and discarding it leaves that test reporting only what it was waiting for.
+func checkHandshakeWrite(t *testing.T, sent <-chan error) {
+	t.Helper()
+	select {
+	case err := <-sent:
+		if err != nil && !errors.Is(err, io.ErrClosedPipe) {
+			t.Errorf("the handshake write failed for a reason other than the connection being closed: %v", err)
+		}
+	case <-time.After(goroutineWait):
+		t.Error("the handshake write never finished")
+	}
 }
 
 // TestPendingHandshakesAreBounded verifies that connections which have been accepted but haven't handshaken yet can't
@@ -329,6 +345,102 @@ func TestPendingHandshakesAreBoundedPerAddress(t *testing.T) {
 	c.False(hungUpOn(honest), "a peer at another address must not be refused for what the flooding address is doing")
 }
 
+// TestRefusingAConnectionIsPaidForOnlyWhenItIsLogged verifies that the accept loop doesn't do the refusal line's work
+// when the line isn't going to be written, and that when it is, the counts it reports are the ones the refusal was
+// decided from. Refusing is the path the bound exists to survive — during a flood the single accept goroutine is here
+// for every connection made — so formatting a remote address that is about to be thrown away, and taking the pending
+// handshake lock twice more to sample counts that may have moved since, is work it can't afford and that says the wrong
+// thing when it is done.
+func TestRefusingAConnectionIsPaidForOnlyWhenItIsLogged(t *testing.T) {
+	c := check.New(t)
+
+	// The only thing that may ask a refused connection for its address when debug logging is off is the slot key the
+	// accept loop decides with
+	addrCalls, logged := refuseOneConnection(t, slog.LevelInfo)
+	c.Equal(int32(1), addrCalls, "a refused connection's address must not be formatted for a line that isn't written")
+	c.NotContains(logged, "refused connection")
+
+	// With debug logging on the line is written, so the address is formatted once more, and both counts are the ones
+	// the refusal was made from rather than whatever the accounting has become by the time the line is built
+	addrCalls, logged = refuseOneConnection(t, slog.LevelDebug)
+	c.Equal(int32(2), addrCalls)
+	c.Contains(logged, `msg="refused connection"`)
+	c.Contains(logged, " pending_handshakes="+strconv.Itoa(maxPendingHandshakesPerAddress+otherAddressHolds))
+	c.Contains(logged, " pending_handshakes_for_address="+strconv.Itoa(maxPendingHandshakesPerAddress))
+}
+
+// otherAddressHolds is how many pending handshake slots refuseOneConnection has a second address take, so that the
+// total and the refused address's own share are different numbers.
+const otherAddressHolds = 2
+
+// refuseOneConnection runs the accept loop over a script that fills the share one address is allowed of the pending
+// handshake bound, has another address take a couple of slots, and then offers one more connection from the first,
+// which must be refused. It returns how many times that connection's remote address was asked for, along with
+// everything the dispatcher logged. Only the refused connection is counted, since the accepted ones are still being
+// worked on by goroutines of their own, which ask for their addresses again as they go.
+//
+// A slot is given back at the moment the refusal line's arguments are being evaluated, which is the second time the
+// refused connection is asked for its address, so that the accounting has moved on from what the refusal was decided
+// from. Counts sampled there rather than carried out of the refusal describe a bound with room to spare as the reason
+// the connection was turned away.
+func refuseOneConnection(t *testing.T, level slog.Level) (addrCalls int32, logged string) {
+	t.Helper()
+	const flooder = 1
+	const other = 2
+	script := make([]acceptResult, 0, maxPendingHandshakesPerAddress+otherAddressHolds+1)
+	for range maxPendingHandshakesPerAddress {
+		_, remote := newAddressedPipeFrom(t, flooder)
+		script = append(script, acceptResult{conn: remote})
+	}
+	for range otherAddressHolds {
+		_, remote := newAddressedPipeFrom(t, other)
+		script = append(script, acceptResult{conn: remote})
+	}
+
+	// Declared ahead of the connection, since the hook the connection carries reaches back into the dispatcher the
+	// connection is about to be handed to
+	var d *Dispatcher
+	var calls atomic.Int32
+	_, refused := newAddressedPipeFrom(t, flooder)
+	script = append(script, acceptResult{conn: &countingAddrConn{
+		Conn:  refused,
+		calls: &calls,
+		onCall: func(n int32) {
+			if n == 2 {
+				d.pendingHandshakes.release(testHostIP(flooder).String())
+			}
+		},
+	}})
+
+	logger, sink := newTestLoggerAt(level)
+	d = newScriptedDispatcher(&scriptedListener{script: script})
+	d.logger = logger
+	defer d.gatekeeper.Close()
+
+	// The loop runs to the end of the script, so every decision about every connection has been made by the time it
+	// returns
+	d.listen()
+	return calls.Load(), sink.contents()
+}
+
+// countingAddrConn records how many times it was asked for its remote address, which is what the refusal path's logging
+// costs: the address is formatted into a string of its own for every connection turned away. onCall, which may be nil,
+// is handed the number of the call being made, so that a test can have the accounting change underneath the refusal it
+// is examining.
+type countingAddrConn struct {
+	net.Conn
+	calls  *atomic.Int32
+	onCall func(n int32)
+}
+
+func (c *countingAddrConn) RemoteAddr() net.Addr {
+	n := c.calls.Add(1)
+	if c.onCall != nil {
+		c.onCall(n)
+	}
+	return c.Conn.RemoteAddr()
+}
+
 // TestPendingHandshakeSlotsAreCountedByHostAlone verifies that the per-address share is charged to the host rather than
 // to the host and port together. A remote picks its own source port and gets a fresh one for every connection, so
 // counted together every connection is its own address and the share bounds nothing at all.
@@ -402,6 +514,7 @@ func TestPendingHandshakeSlotCoversTheHandlersHandshake(t *testing.T) {
 	case <-time.After(goroutineWait):
 		t.Fatal("the accept loop never stopped")
 	}
+	checkHandshakeWrite(t, sent)
 }
 
 // TestPendingHandshakeSlotIsReleasedByAHandlerThatNeverReports verifies that a handler which returns without ever
@@ -451,6 +564,66 @@ func TestPendingHandshakeSlotIsReleasedByAHandlerThatNeverReports(t *testing.T) 
 	case <-time.After(goroutineWait):
 		t.Fatal("the accept loop never stopped")
 	}
+	checkHandshakeWrite(t, sent)
+}
+
+// TestAPanickingHandlerDoesNotTakeTheProcessWithIt verifies that a panic in a connection handler is contained to the
+// connection that provoked it. ConnectionHandler is an exported extension point and the handler runs the entire peer
+// session — parsing the binary messages a remote composes — on the dispatch goroutine, so a panic escaping it kills the
+// process, taking down every other torrent the dispatcher is serving. The slot the accept loop took and the connection
+// itself must still be given back on the way out, since a panic that leaked either of those would cost the dispatcher a
+// little more of its bound every time one happened.
+func TestAPanickingHandlerDoesNotTakeTheProcessWithIt(t *testing.T) {
+	c := check.New(t)
+	logger, sink := newTestLogger()
+	local, remote := newAddressedPipe(t)
+	d := newScriptedDispatcher(&scriptedListener{script: []acceptResult{{conn: remote}}})
+	d.logger = logger
+	defer d.gatekeeper.Close()
+
+	infoHash := tfs.InfoHash{1, 2, 3}
+	entered := make(chan struct{}, 1)
+	d.Register(infoHash, handlerFunc(func(_ net.Conn, _ *slog.Logger, _ ProtocolExtensions, _ tfs.InfoHash, _ bool,
+		_ func(),
+	) {
+		entered <- struct{}{}
+		panic("the handler blew up")
+	}))
+
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		d.listen()
+	}()
+	c.NoError(local.SetDeadline(time.Now().Add(goroutineWait)))
+	sent := make(chan error, 1)
+	go func() { sent <- SendTorrentHandshake(local, ProtocolExtensions{}, infoHash, PeerID{}) }()
+
+	select {
+	case <-entered:
+	case <-time.After(goroutineWait):
+		t.Fatal("the connection was never dispatched to its handler")
+	}
+
+	// The handler has panicked, so the release, which the unwind triggers, may not have happened yet
+	deadline := time.Now().Add(goroutineWait)
+	for d.pendingHandshakes.count() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("the handshake slot was never given back: %d still pending", d.pendingHandshakes.count())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	c.True(hungUpOn(local), "the connection a panicking handler was given must still be closed")
+	logged := sink.contents()
+	c.Contains(logged, "recovered from panic", "a contained panic must be reported rather than swallowed")
+	c.Contains(logged, "the handler blew up")
+
+	select {
+	case <-stopped:
+	case <-time.After(goroutineWait):
+		t.Fatal("the accept loop never stopped")
+	}
+	checkHandshakeWrite(t, sent)
 }
 
 // newScriptedDispatcher returns a dispatcher that accepts from the supplied listener, with everything that would
@@ -643,8 +816,14 @@ func TestGateKeeperLogsWhereLogToSaid(t *testing.T) {
 // newTestLogger returns a logger that records everything written to it, down to the debug level the gatekeeper uses,
 // along with the sink holding what it recorded.
 func newTestLogger() (*slog.Logger, *logSink) {
+	return newTestLoggerAt(slog.LevelDebug)
+}
+
+// newTestLoggerAt does the same for a logger that records only what the given level admits, for the tests that are
+// about what a dispatcher does when a line isn't going to be written at all.
+func newTestLoggerAt(level slog.Level) (*slog.Logger, *logSink) {
 	sink := &logSink{}
-	return slog.New(slog.NewTextHandler(sink, &slog.HandlerOptions{Level: slog.LevelDebug})), sink
+	return slog.New(slog.NewTextHandler(sink, &slog.HandlerOptions{Level: level})), sink
 }
 
 // captureDefaultLogger replaces the process default logger with one that records what it is given for the duration of
@@ -788,66 +967,129 @@ func ageExternalIPCheck(d *Dispatcher, age time.Duration) {
 	d.lastExternalIPCheck = d.lastExternalIPCheck.Add(-age)
 }
 
-// settledGoroutineCount returns the number of running goroutines once it has stopped changing, for use as the baseline
-// a leak check measures against. A count taken while goroutines an earlier test abandoned are still winding down —
-// which a failed constructor leaves behind, since the gatekeeper's pruner and the rate limiters' tickers are only
-// signaled to exit — is inflated by however many of them are left, and a baseline that is too high hides a leak of
-// exactly that size: the very thing the check exists to catch.
-func settledGoroutineCount(t *testing.T) int {
-	t.Helper()
-	// Consecutive samples that agree, rather than a single one, since goroutines on their way out go a few at a time
-	const settledSamples = 5
-	deadline := time.Now().Add(goroutineWait)
-	count := runtime.NumGoroutine()
-	for agreed := 0; agreed < settledSamples; {
-		time.Sleep(10 * time.Millisecond)
-		current := runtime.NumGoroutine()
-		if current == count {
-			agreed++
-			continue
+// dispatcherGoroutineMarkers name the entry point of every goroutine a dispatcher owns: the accept loop, the startup
+// line it logs from a goroutine of its own, the per-connection dispatch, the gatekeeper's pruner, and the ticker
+// goroutine each of the two rate limiters runs. The trailing parenthesis is what makes each of these a frame the
+// goroutine is actually running rather than the "created by X in goroutine N" line naming whoever started it.
+//
+// Counting these, rather than the process-wide runtime.NumGoroutine() against a baseline, is what makes the leak checks
+// independent of everything else the test binary happens to be doing: a baseline comparison fails the moment anything
+// unrelated starts a goroutine that outlives the wait, and passes when something unrelated exits one at the same moment
+// as a real leak. TestEveryDispatcherGoroutineIsRecognized is what keeps these names from going stale, since a marker
+// that matches nothing would have every check below report zero no matter what was left running.
+var dispatcherGoroutineMarkers = []string{
+	"github.com/richardwilkes/torrent/dispatcher.(*Dispatcher).listen(",
+	"github.com/richardwilkes/torrent/dispatcher.(*Dispatcher).logListening(",
+	"github.com/richardwilkes/torrent/dispatcher.(*Dispatcher).dispatch(",
+	"github.com/richardwilkes/torrent/dispatcher.(*GateKeeper).prune(",
+	"github.com/richardwilkes/toolbox/v2/rate.New.func1(",
+}
+
+// goroutineStacks returns the stacks of every goroutine running right now.
+func goroutineStacks() string {
+	buffer := make([]byte, 1<<16)
+	for {
+		n := runtime.Stack(buffer, true)
+		if n < len(buffer) {
+			return string(buffer[:n])
 		}
-		count = current
-		agreed = 0 // Start the run over, since the count is still moving
-		if time.Now().After(deadline) {
-			t.Fatalf("the goroutine count never settled; last at %d", count)
+		buffer = make([]byte, 2*len(buffer))
+	}
+}
+
+// dispatcherGoroutineCount returns how many of the goroutines running right now were started by a dispatcher.
+func dispatcherGoroutineCount() int {
+	count := 0
+	// A traceback separates one goroutine's stack from the next with a blank line
+	for one := range strings.SplitSeq(goroutineStacks(), "\n\n") {
+		for _, marker := range dispatcherGoroutineMarkers {
+			if strings.Contains(one, marker) {
+				count++
+				break
+			}
 		}
 	}
 	return count
 }
 
-// TestSettledGoroutineCountWaitsOutStragglers verifies that the baseline a leak check starts from doesn't count
-// goroutines that are already on their way out, since a baseline inflated by them would let a leak of the same size
-// through unnoticed.
-func TestSettledGoroutineCountWaitsOutStragglers(t *testing.T) {
-	c := check.New(t)
-	baseline := settledGoroutineCount(t)
-	release := make(chan struct{})
-	var wg sync.WaitGroup
-	for range 4 {
-		wg.Go(func() { <-release })
-	}
-	c.True(runtime.NumGoroutine() > baseline, "the stragglers must be running before they are told to finish")
-
-	// Told to finish, but not waited for: a count taken right now includes them
-	close(release)
-	count := settledGoroutineCount(t)
-	wg.Wait()
-	c.True(count <= baseline, "the baseline of %d counted goroutines that were on their way out (%d)", baseline, count)
-}
-
-// waitForGoroutines waits for the number of running goroutines to drop back to the count that was present before the
-// call under test was made.
-func waitForGoroutines(t *testing.T, before int) {
+// waitForDispatcherGoroutines waits for every goroutine any dispatcher started to have exited. Goroutines an earlier
+// test abandoned only make this wait longer, never fail it, since Stop and the failed constructors signal their
+// goroutines to exit rather than waiting for them.
+func waitForDispatcherGoroutines(t *testing.T) {
 	t.Helper()
 	deadline := time.Now().Add(goroutineWait)
 	for {
-		count := runtime.NumGoroutine()
-		if count <= before {
+		count := dispatcherGoroutineCount()
+		if count == 0 {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("goroutine count never dropped back to %d; still at %d", before, count)
+			t.Fatalf("%d dispatcher goroutine(s) never exited:\n%s", count, goroutineStacks())
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// TestEveryDispatcherGoroutineIsRecognized verifies that the leak checks can see each goroutine a dispatcher owns. They
+// find them by the name of the function each was started with, so a rename, or a goroutine added without a marker to
+// match it, leaves the count reporting zero for something that is plainly still running — and every leak check in this
+// file passes no matter what was leaked. Each goroutine is therefore parked where it cannot finish before the stacks
+// are taken, so that all five markers have something to find.
+func TestEveryDispatcherGoroutineIsRecognized(t *testing.T) {
+	c := check.New(t)
+	release := make(chan struct{})
+	// Released before the dispatcher is stopped, since goroutines still parked would keep the stop waiting. Deferred
+	// rather than left to a cleanup because every deferred call runs ahead of the cleanup the helper registered.
+	defer close(release)
+
+	probing := make(chan struct{}, 1)
+	d := newTestDispatcher(t, func(one *Dispatcher) error {
+		one.lookupExternalIP = func(_ context.Context, _ time.Duration) net.IP {
+			probing <- struct{}{}
+			<-release
+			return nil
+		}
+		return nil
+	})
+
+	infoHash := tfs.InfoHash{1, 2, 3}
+	dispatched := make(chan struct{}, 1)
+	d.Register(infoHash, handlerFunc(func(_ net.Conn, _ *slog.Logger, _ ProtocolExtensions, _ tfs.InfoHash, _ bool,
+		_ func(),
+	) {
+		dispatched <- struct{}{}
+		<-release
+	}))
+
+	conn, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(d.InternalPort()))))
+	if err != nil {
+		// Fatal, since everything that follows, the deferred close included, would use a nil connection and panic
+		t.Fatal(err)
+	}
+	defer xio.CloseIgnoringErrors(conn)
+	c.NoError(conn.SetDeadline(time.Now().Add(goroutineWait)))
+	sent := make(chan error, 1)
+	go func() { sent <- SendTorrentHandshake(conn, ProtocolExtensions{}, infoHash, PeerID{}) }()
+
+	select {
+	case <-probing:
+	case <-time.After(goroutineWait):
+		t.Fatal("the external IP was never looked up")
+	}
+	select {
+	case <-dispatched:
+	case <-time.After(goroutineWait):
+		t.Fatal("the connection was never dispatched to its handler")
+	}
+
+	// Checked with True rather than Contains, so that a marker that has gone stale is reported on its own instead of
+	// alongside every stack in the process
+	stacks := goroutineStacks()
+	for _, marker := range dispatcherGoroutineMarkers {
+		c.True(strings.Contains(stacks, marker),
+			"no running goroutine was found for %s, so a leak of it would go unnoticed", marker)
+	}
+	c.True(dispatcherGoroutineCount() >= len(dispatcherGoroutineMarkers),
+		"every marker matched, so the count must have found at least one goroutine apiece")
+	checkHandshakeWrite(t, sent)
 }

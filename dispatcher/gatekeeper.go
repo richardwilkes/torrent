@@ -57,20 +57,55 @@ func (r *GateKeeper) BlockAddress(addr net.Addr) {
 	r.BlockAddressString(host)
 }
 
-// BlockAddressString adds the specified address to the blocked list, which refuses it in both directions.
+// BlockAddressString adds the specified address to the blocked list, which refuses it in both directions. A GateKeeper
+// that has been closed records nothing; see record for why.
 func (r *GateKeeper) BlockAddressString(addr string) {
-	r.addresses.Store(addr, time.Now().Add(blockDuration))
-	r.logger.Debug("blocked peer", "address", addr)
+	if r.record(&r.addresses, addr, blockDuration) {
+		r.logger.Debug("blocked peer", "address", addr)
+	}
 }
 
 // SuppressDialsTo records that an outgoing connection attempt to the address failed, so that we don't spend the next
 // attempts on it as well. This is deliberately not a block: a peer that is firewalled or behind a NAT can't accept
 // connections but can happily make them, which is an ordinary thing to be in a swarm, so refusing the connections it
 // makes to us because a dial of ours didn't get through would cost us a peer that never did anything wrong — and, in
-// a small swarm, potentially every peer there is.
+// a small swarm, potentially every peer there is. A GateKeeper that has been closed records nothing; see record for
+// why.
 func (r *GateKeeper) SuppressDialsTo(addr string) {
-	r.undialable.Store(addr, time.Now().Add(dialSuppressionDuration))
-	r.logger.Debug("suppressed dials to peer", "address", addr)
+	if r.record(&r.undialable, addr, dialSuppressionDuration) {
+		r.logger.Debug("suppressed dials to peer", "address", addr)
+	}
+}
+
+// record stores an expiry for the address and reports whether it did. A GateKeeper that has been closed records
+// nothing: pruning is the only thing that takes an entry out on its own and it exits at Close, so everything stored
+// afterwards would stay for the life of the process. Nothing couples a client's lifetime to the dispatcher's, and
+// Dispatcher.Stop closes the gatekeeper while leaving it reachable through Dispatcher.GateKeeper() — which every client
+// holds and calls on each failed dial and peer error — so a dispatcher stopped ahead of its clients would otherwise
+// grow a permanent entry per address for as long as those clients kept running.
+//
+// The closed check is made again after the store because a Close running alongside it may have swept the map in
+// between; taking our own entry back out when that happens is what keeps the last writer from leaving one behind.
+func (r *GateKeeper) record(m *sync.Map, addr string, duration time.Duration) bool {
+	if r.isClosed() {
+		return false
+	}
+	m.Store(addr, time.Now().Add(duration))
+	if r.isClosed() {
+		m.Delete(addr)
+		return false
+	}
+	return true
+}
+
+// isClosed returns true if this GateKeeper has been shut down.
+func (r *GateKeeper) isClosed() bool {
+	select {
+	case <-r.done:
+		return true
+	default:
+		return false
+	}
 }
 
 // IsAddressBlocked returns true if the address is blocked.
@@ -93,13 +128,20 @@ func (r *GateKeeper) IsDialBlocked(addr string) bool {
 	return r.IsAddressStringBlocked(addr) || unexpired(&r.undialable, addr)
 }
 
-// unexpired returns true if the map holds an entry for the address whose expiry hasn't passed yet.
+// unexpired returns true if the map holds an entry for the address whose expiry hasn't passed yet. An entry that has
+// run out is taken away by the lookup that finds it, rather than being left for a sweep that runs only once every
+// blockDuration and stops altogether at Close. The removal compares first, so that an entry a concurrent block replaced
+// with a fresh expiry after we read the old one isn't silently thrown away, which would let back in precisely the peer
+// we least want to.
 func unexpired(m *sync.Map, addr string) bool {
-	if expires, ok := m.Load(addr); ok {
-		if t, ok2 := expires.(time.Time); ok2 {
-			return time.Now().Before(t)
-		}
+	expires, ok := m.Load(addr)
+	if !ok {
+		return false
 	}
+	if t, ok2 := expires.(time.Time); ok2 && time.Now().Before(t) {
+		return true
+	}
+	m.CompareAndDelete(addr, expires)
 	return false
 }
 
@@ -143,7 +185,12 @@ func (r *GateKeeper) removeIfExpired(m *sync.Map, addr, expires any, msg string)
 	}
 }
 
-// Close shuts this GateKeeper down. Calling it more than once is a no-op.
+// Close shuts this GateKeeper down, discarding what it was holding and refusing to record anything more, since the
+// pruning that would have reclaimed it stops here. Calling it more than once is a no-op.
 func (r *GateKeeper) Close() {
-	r.closeOnce.Do(func() { close(r.done) })
+	r.closeOnce.Do(func() {
+		close(r.done)
+		r.addresses.Clear()
+		r.undialable.Clear()
+	})
 }
