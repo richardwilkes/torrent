@@ -225,6 +225,97 @@ func TestFirstMissing(t *testing.T) {
 	c.Equal(2, FirstMissing(has, shortHave))
 }
 
+// TestFirstAvailableAndFirstMissingMatchADirectSearch verifies the byte at a time combination against the plain
+// definition of what the two answer, for every combination of a handful of bits and for sets that differ in size. The
+// answer has to be exactly what a bit by bit search of the whole would have given, including which of the sets bounds
+// the search and what happens when the last byte reaches past that bound.
+func TestFirstAvailableAndFirstMissingMatchADirectSearch(t *testing.T) {
+	c := check.New(t)
+	// Short of a full byte, so that the spare bits of the last byte are in play, and small enough to try every
+	// combination of the three sets exhaustively
+	const width = 5
+	for _, sizes := range [][3]int{
+		{width, width, width},
+		{width, width - 2, width},
+		{width - 2, width, width},
+		{width, width, width - 2},
+		{0, width, width},
+		{width, width, width + 3},
+		{width + 8, width, width + 4},
+	} {
+		for hasBits := range 1 << width {
+			for downloadingBits := range 1 << width {
+				for haveBits := range 1 << width {
+					has := bitsFrom(sizes[0], hasBits)
+					downloading := bitsFrom(sizes[1], downloadingBits)
+					have := bitsFrom(sizes[2], haveBits)
+					c.Equal(firstAvailableBySearch(has, downloading, have), FirstAvailable(has, downloading, have),
+						"sizes %v, has %05b, downloading %05b, have %05b", sizes, hasBits, downloadingBits, haveBits)
+					c.Equal(firstMissingBySearch(has, have), FirstMissing(has, have),
+						"sizes %v, has %05b, have %05b", sizes, hasBits, haveBits)
+				}
+			}
+		}
+	}
+}
+
+// bitsFrom builds a set of the given size whose bits are taken from the low order end of 'pattern', with the first
+// index taking the lowest order bit. Indexes the set is too small to hold are dropped, exactly as Set does.
+func bitsFrom(size, pattern int) *Bits {
+	b := New(size)
+	for i := 0; pattern != 0; i++ {
+		if pattern&1 != 0 {
+			b.Set(i)
+		}
+		pattern >>= 1
+	}
+	return b
+}
+
+// firstAvailableBySearch answers the question FirstAvailable does, by looking at one index at a time.
+func firstAvailableBySearch(has, downloading, have *Bits) int {
+	for i := range min(has.size, downloading.size, have.size) {
+		if has.IsSet(i) && !downloading.IsSet(i) && !have.IsSet(i) {
+			return i
+		}
+	}
+	return -1
+}
+
+// firstMissingBySearch answers the question FirstMissing does, by looking at one index at a time.
+func firstMissingBySearch(has, have *Bits) int {
+	for i := range min(has.size, have.size) {
+		if has.IsSet(i) && !have.IsSet(i) {
+			return i
+		}
+	}
+	return -1
+}
+
+// TestFirstAvailableAndFirstMissingAllocateNothing verifies that the sets are combined in place rather than into a copy
+// of them that is then scanned. A peer drives both from every 'have' message it sends, and FirstAvailable runs under
+// the tracker's write lock, so at the largest piece count the library allows a copy would cost a 256KB allocation and a
+// full scan of it per message, with every other peer's piece selection waiting on the lock while it happens.
+func TestFirstAvailableAndFirstMissingAllocateNothing(t *testing.T) {
+	c := check.New(t)
+	const pieceCount = 1 << 16
+	has := New(pieceCount)
+	downloading := New(pieceCount)
+	have := New(pieceCount)
+	for i := range pieceCount {
+		has.Set(i)
+		have.Set(i)
+		downloading.Set(i)
+	}
+	// Nothing to find, which is the case that has to look at the whole of the storage before it can say so
+	c.Equal(-1, FirstAvailable(has, downloading, have))
+	c.Equal(-1, FirstMissing(has, have))
+	c.Equal(float64(0), testing.AllocsPerRun(10, func() {
+		FirstAvailable(has, downloading, have)
+		FirstMissing(has, have)
+	}))
+}
+
 // TestByteLength verifies the storage size reported for a given number of bits, which peer.go relies on to validate the
 // length of an incoming bit field message.
 func TestByteLength(t *testing.T) {

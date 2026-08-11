@@ -9,7 +9,10 @@
 
 package spanlist
 
-import "slices"
+import (
+	"cmp"
+	"slices"
+)
 
 // Span holds a starting position and a length.
 type Span struct {
@@ -47,16 +50,28 @@ type SpanList struct {
 // Contains returns true if every position in the span is already covered by the list. A span with no length is
 // contained by definition, since there is nothing in it that could be missing. Note that spans that overlap or abut
 // are merged as they are inserted, so a span that is covered at all is covered by a single entry.
+//
+// Only one entry can hold the span's start, and Insert leaves the list sorted by it, so that entry is found rather than
+// searched for: a caller walking a piece asks this once per chunk, and starts that walk again from the beginning every
+// time the peer unchokes it, which at the largest piece length the library allows is a walk of the whole list tens of
+// thousands of times over for the sake of a peer's five byte message.
 func (sl *SpanList) Contains(span *Span) bool {
 	if span.Length <= 0 {
 		return true
 	}
-	for _, one := range sl.Spans {
-		if span.Start >= one.Start && span.Start+span.Length <= one.Start+one.Length {
-			return true
+	i, found := slices.BinarySearchFunc(sl.Spans, span.Start, func(one Span, start int) int {
+		return cmp.Compare(one.Start, start)
+	})
+	if !found {
+		// The insertion point is the first entry that starts after the span does, so the one before it is the only one
+		// that can hold it
+		if i == 0 {
+			return false
 		}
+		i--
 	}
-	return false
+	one := sl.Spans[i]
+	return span.Start+span.Length <= one.Start+one.Length
 }
 
 // Insert a span into the list. Returns true if the span overlapped an

@@ -9,6 +9,8 @@
 
 package fixedbits
 
+import "math/bits"
+
 // Bits holds a fixed-size collection of bits.
 type Bits struct {
 	data []byte
@@ -20,35 +22,63 @@ func New(numberOfBits int) *Bits {
 	if numberOfBits < 0 {
 		numberOfBits = 0
 	}
-	size := numberOfBits / 8
-	if numberOfBits%8 != 0 {
-		size++
-	}
 	return &Bits{
-		data: make([]byte, size),
+		data: make([]byte, byteLengthOf(numberOfBits)),
 		size: numberOfBits,
 	}
 }
 
+// byteLengthOf returns the number of bytes needed to hold the given number of bits.
+func byteLengthOf(numberOfBits int) int {
+	return (numberOfBits + 7) / 8
+}
+
 // FirstAvailable returns the first index that is set in 'has' and is set in
 // neither 'downloading' nor 'have', or -1 if no such index exists.
+//
+// The three are combined a byte at a time and the walk ends at the first byte
+// with anything in it, rather than the whole combination being built up front
+// and scanned afterwards. A peer drives this from every 'have' message it
+// sends, by way of the piece selection that runs under the tracker's write
+// lock, so a torrent with the largest piece count the library allows would
+// otherwise pay a 256KB allocation and a full scan of it for each of them
+// while every other peer waits for that lock.
 func FirstAvailable(has, downloading, have *Bits) int {
-	avail := New(min(has.size, downloading.size, have.size))
-	for i := range avail.data {
-		avail.data[i] = has.data[i] &^ downloading.data[i] &^ have.data[i]
+	size := min(has.size, downloading.size, have.size)
+	for i := range byteLengthOf(size) {
+		if one := has.data[i] &^ downloading.data[i] &^ have.data[i]; one != 0 {
+			return firstSetIndex(i, one, size)
+		}
 	}
-	return avail.NextSet(0)
+	return -1
 }
 
 // FirstMissing returns the first index that is set in 'has' and is not set in
 // 'have', or -1 if no such index exists. Unlike FirstAvailable, an index that
-// something else has already claimed still counts.
+// something else has already claimed still counts. Combined a byte at a time
+// and stopped at the first hit, for the reasons FirstAvailable gives.
 func FirstMissing(has, have *Bits) int {
-	missing := New(min(has.size, have.size))
-	for i := range missing.data {
-		missing.data[i] = has.data[i] &^ have.data[i]
+	size := min(has.size, have.size)
+	for i := range byteLengthOf(size) {
+		if one := has.data[i] &^ have.data[i]; one != 0 {
+			return firstSetIndex(i, one, size)
+		}
 	}
-	return missing.NextSet(0)
+	return -1
+}
+
+// firstSetIndex returns the index of the highest order bit set in a non-zero
+// byte at the given position, or -1 if that index is beyond 'size'. Nothing
+// further along can be within it either, since every later bit has a higher
+// index, so the whole scan is over at that point. The bits of the byte the
+// combination didn't cover are what puts an index out of range: only the
+// narrowest of the sets being combined has had its spare bits cleared to the
+// size in use here.
+func firstSetIndex(byteIndex int, b byte, size int) int {
+	if index := byteIndex*8 + bits.LeadingZeros8(b); index < size {
+		return index
+	}
+	return -1
 }
 
 // Clone the bits into a fresh copy.

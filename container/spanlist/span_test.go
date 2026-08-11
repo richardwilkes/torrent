@@ -220,6 +220,55 @@ func TestSpanInsertOutOfOrder(t *testing.T) {
 	}
 }
 
+// TestSpanContainsMatchesALinearSearch verifies the search that answers Contains against the straightforward walk of
+// the whole list that it replaced, for every span that fits within a small universe and for a range of list shapes:
+// empty, a single entry, entries with gaps on either side of them, and entries reaching each end of the universe. Only
+// one entry can hold a span's start, so the answer is found by searching for that entry rather than by walking to it,
+// and nothing about which entry that is may change with the shortcut.
+func TestSpanContainsMatchesALinearSearch(t *testing.T) {
+	c := check.New(t)
+	const universe = 24
+	for _, inserts := range [][]spanlist.Span{
+		{},
+		{{Start: 0, Length: universe}},
+		{{Start: 4, Length: 4}},
+		{{Start: 0, Length: 4}, {Start: 8, Length: 4}, {Start: 16, Length: 4}},
+		{{Start: 2, Length: 1}, {Start: 5, Length: 6}, {Start: 20, Length: 4}},
+		{
+			{Start: 1, Length: 2},
+			{Start: 4, Length: 1},
+			{Start: 7, Length: 3},
+			{Start: 12, Length: 1},
+			{Start: 15, Length: 9},
+		},
+	} {
+		var list spanlist.SpanList
+		for _, one := range inserts {
+			list.Insert(&one)
+		}
+		for start := range universe {
+			for length := range universe - start + 1 {
+				span := spanlist.Span{Start: start, Length: length}
+				c.Equal(containsByScanning(&list, &span), list.Contains(&span), "%v in %v", span, list.Spans)
+			}
+		}
+	}
+}
+
+// containsByScanning answers the question Contains does, the way Contains used to answer it: by walking the whole list
+// looking for an entry that holds every position of the span.
+func containsByScanning(sl *spanlist.SpanList, span *spanlist.Span) bool {
+	if span.Length <= 0 {
+		return true
+	}
+	for _, one := range sl.Spans {
+		if span.Start >= one.Start && span.Start+span.Length <= one.Start+one.Length {
+			return true
+		}
+	}
+	return false
+}
+
 // TestSpanContains verifies which ranges are reported as already covered, which is what tells a peer whether a chunk
 // that just arrived carried anything new and which chunks of a piece still have to be asked for.
 func TestSpanContains(t *testing.T) {
