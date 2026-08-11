@@ -10,7 +10,10 @@
 package dispatcher
 
 import (
+	"context"
 	"log/slog"
+	"net"
+	"time"
 
 	"github.com/richardwilkes/toolbox/v2/errs"
 )
@@ -35,6 +38,16 @@ func GlobalUploadCap(bytesPerSecond int) func(*Dispatcher) error {
 			return errs.Newf("GlobalUploadCap must be at least %d", MinimumRateCap)
 		}
 		d.OutRate.SetCap(bytesPerSecond)
+		return nil
+	}
+}
+
+// FixedExternalIP sets the external IP address the dispatcher reports, rather than having it consult outside sites to
+// determine one. Pass nil to report no external address at all. Callers that already know their address, and tests,
+// which have no business issuing network requests to third parties, want this. Default is to look the address up.
+func FixedExternalIP(ip net.IP) func(*Dispatcher) error {
+	return func(d *Dispatcher) error {
+		d.lookupExternalIP = func(_ context.Context, _ time.Duration) net.IP { return ip }
 		return nil
 	}
 }

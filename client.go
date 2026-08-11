@@ -15,6 +15,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"maps"
 	"math"
 	"net"
 	"os"
@@ -63,6 +64,7 @@ type Client struct {
 	peerMgmtStop             chan struct{}      // closed when peer management should stop
 	peerMgmtDone             chan struct{}      // protected by peerMgmtLock
 	peers                    map[net.Conn]*peer // protected by lock
+	dialing                  map[string]bool    // protected by lock
 	stoppedChan              chan bool          // protected by lock
 	concurrentDownloads      int
 	peersWanted              int
@@ -98,6 +100,7 @@ func NewClient(d *dispatcher.Dispatcher, torrentFile *tfs.File, options ...func(
 		peerMgmtStop:        make(chan struct{}),
 		seedDuration:        96 * time.Hour,
 		peers:               make(map[net.Conn]*peer),
+		dialing:             make(map[string]bool),
 		stoppedChan:         make(chan bool, 1),
 	}
 	if _, err := rand.Read(c.id[:]); err != nil {
@@ -357,6 +360,15 @@ func (c *Client) HandleConnection(conn net.Conn, logger *slog.Logger, _ dispatch
 		c.dispatcher.GateKeeper().BlockAddress(remoteAddr)
 		return
 	}
+	// A remote presenting our own ID is us. That happens when the tracker hands back our own address, which parsePeers
+	// can only filter out when the external IP lookup succeeded, so both the dial we made and the connection it arrives
+	// on land here. Severing it is standard practice and keeps a connection to ourselves from occupying two of our
+	// limited peer slots; blocking the address as well keeps the next peer adjustment from simply dialing it again.
+	if peerID == c.id {
+		logger.Debug("refusing connection to ourselves")
+		c.dispatcher.GateKeeper().BlockAddress(remoteAddr)
+		return
+	}
 	p := newPeer(c, conn, logger)
 	if c.shouldStop() {
 		return
@@ -392,7 +404,11 @@ func (c *Client) HandleConnection(conn net.Conn, logger *slog.Logger, _ dispatch
 	p.processIncomingMessages()
 }
 
+// connectToPeer dials the peer and, if the handshake exchange succeeds, hands the connection off to be serviced. The
+// host is claimed by the caller through startDial before this is started, so that nothing else can dial it in the
+// window before this goroutine runs, and stays claimed for as long as we're working with the connection.
 func (c *Client) connectToPeer(addr string, port int) {
+	defer c.finishDial(addr)
 	slog.Debug("dialing peer", "address", addr, "port", port)
 	conn, err := net.DialTimeout("tcp", net.JoinHostPort(addr, strconv.Itoa(port)), peerDialTimeout)
 	if err != nil {
@@ -609,15 +625,41 @@ func (d *peerData) worseForDropping(other *peerData) bool {
 	return d.peer.created.After(other.peer.created)
 }
 
-// connectedHosts returns the set of hosts we already have a connection to.
-func connectedHosts(pd []*peerData) map[string]bool {
+// hostsInUse returns the set of hosts we already have a connection to, either through a peer that has been registered
+// or through an outgoing connection attempt that hasn't finished yet.
+func (c *Client) hostsInUse(pd []*peerData) map[string]bool {
 	existing := make(map[string]bool, len(pd))
 	for _, one := range pd {
 		if host, _, err := net.SplitHostPort(one.peer.conn.RemoteAddr().String()); err == nil {
 			existing[host] = true
 		}
 	}
+	c.lock.RLock()
+	maps.Copy(existing, c.dialing)
+	c.lock.RUnlock()
 	return existing
+}
+
+// startDial records that an outgoing connection attempt to the host is under way, returning false if there already is
+// one. The attempt has no peer registered for it until the handshake exchange has completed, which together with the
+// dial can take longer than the interval between peer adjustments, so an attempt that wasn't recorded here would be
+// made a second time by the next adjustment, wasting a peer slot on each side with a duplicate connection that the
+// remote then drops.
+func (c *Client) startDial(host string) bool {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	if c.dialing[host] {
+		return false
+	}
+	c.dialing[host] = true
+	return true
+}
+
+// finishDial records that the outgoing connection attempt to the host is over, making the host available again.
+func (c *Client) finishDial(host string) {
+	c.lock.Lock()
+	delete(c.dialing, host)
+	c.lock.Unlock()
 }
 
 func (c *Client) adjustPeers() {
@@ -645,7 +687,7 @@ func (c *Client) adjustPeers() {
 	}
 	slog.Debug("managing peers", "download_count", downloadCount, "seeding_complete", c.tracker.isSeedingComplete())
 	if downloadCount < c.concurrentDownloads && !c.tracker.isSeedingComplete() {
-		existing := connectedHosts(pd)
+		existing := c.hostsInUse(pd)
 		count := min(c.peersWanted-len(pd), 4)
 		if count < 1 && len(pd) > 0 {
 			// Find one to disconnect so we can add an alternate
@@ -670,7 +712,8 @@ func (c *Client) adjustPeers() {
 			for i := 0; i < count; i++ {
 				added := false
 				for addr, port := range pam {
-					if _, exists := existing[addr]; !exists && !c.dispatcher.GateKeeper().IsAddressStringBlocked(addr) {
+					if !existing[addr] && !c.dispatcher.GateKeeper().IsAddressStringBlocked(addr) &&
+						c.startDial(addr) {
 						go c.connectToPeer(addr, port)
 						existing[addr] = true
 						added = true

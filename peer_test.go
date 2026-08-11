@@ -34,6 +34,11 @@ import (
 const (
 	testPieceCount = 4
 	sha1Size       = 20
+
+	// testExternalIP is the external address the dispatchers the tests are built with report. It comes from the range
+	// reserved for documentation, so no real lookup could ever return it, which is what lets a test tell the fixed
+	// address apart from one that was actually looked up.
+	testExternalIP = "203.0.113.1"
 )
 
 func TestValidMessageLength(t *testing.T) {
@@ -68,9 +73,7 @@ func TestValidMessageLength(t *testing.T) {
 // TestMalformedMessagesAreRejected verifies that a peer sending a message whose length is too short for its ID is
 // disconnected rather than causing a slice bounds panic while the message is decoded.
 func TestMalformedMessagesAreRejected(t *testing.T) {
-	d, err := dispatcher.NewDispatcher()
-	check.New(t).NoError(err)
-	defer d.Stop()
+	d := newTestDispatcher(t)
 	for _, one := range []struct {
 		name    string
 		message []byte
@@ -105,14 +108,12 @@ func TestMalformedMessagesAreRejected(t *testing.T) {
 // TestWellFormedMessagesAreAccepted verifies that the message length validation doesn't reject valid messages.
 func TestWellFormedMessagesAreAccepted(t *testing.T) {
 	c := check.New(t)
-	d, err := dispatcher.NewDispatcher()
-	c.NoError(err)
-	defer d.Stop()
+	d := newTestDispatcher(t)
 	conn, _, done := startTestPeer(t, newTestClient(d))
 	defer xio.CloseIgnoringErrors(conn)
 
 	// Tell the peer we have piece 0, which should result in it telling us it is interested
-	_, err = conn.Write(newTestMessage(haveID, 0, 0, 0, 0))
+	_, err := conn.Write(newTestMessage(haveID, 0, 0, 0, 0))
 	c.NoError(err)
 	c.NoError(conn.SetReadDeadline(time.Now().Add(msgReadDeadline)))
 	buffer := make([]byte, 5)
@@ -131,9 +132,7 @@ func TestWellFormedMessagesAreAccepted(t *testing.T) {
 // them in every announce. Counters that never leave the peer leave every announce claiming nothing was transferred.
 func TestTransferTotalsReachTheTracker(t *testing.T) {
 	c := check.New(t)
-	d, err := dispatcher.NewDispatcher()
-	c.NoError(err)
-	defer d.Stop()
+	d := newTestDispatcher(t)
 	client := newTestClient(d)
 	c.Equal(int64(0), client.tracker.downloadedBytes.Load())
 	c.Equal(int64(0), client.tracker.uploadedBytes.Load())
@@ -143,7 +142,7 @@ func TestTransferTotalsReachTheTracker(t *testing.T) {
 
 	// Tell the peer we have piece 0, which it answers with an interested message
 	message := newTestMessage(haveID, 0, 0, 0, 0)
-	_, err = conn.Write(message)
+	_, err := conn.Write(message)
 	c.NoError(err)
 	c.NoError(conn.SetReadDeadline(time.Now().Add(msgReadDeadline)))
 	response := make([]byte, 5)
@@ -173,9 +172,7 @@ func TestTransferTotalsReachTheTracker(t *testing.T) {
 // torrent as soon as its bit field arrived, leaving it with no one to talk to.
 func TestBitFieldLargerThanTheRateCapIsAccepted(t *testing.T) {
 	c := check.New(t)
-	d, err := dispatcher.NewDispatcher()
-	c.NoError(err)
-	defer d.Stop()
+	d := newTestDispatcher(t)
 
 	// Enough pieces that the bit field message is larger than the smallest cap that may be set
 	const pieceCount = 140000
@@ -192,7 +189,7 @@ func TestBitFieldLargerThanTheRateCapIsAccepted(t *testing.T) {
 	c.True(len(bits)+5 > dispatcher.MinimumRateCap, "the bit field message must exceed the cap to be a test of it")
 
 	// The peer has everything and we have nothing, so it is answered with an interested message
-	_, err = conn.Write(newTestMessage(bitFieldID, bits...))
+	_, err := conn.Write(newTestMessage(bitFieldID, bits...))
 	c.NoError(err)
 	c.NoError(conn.SetReadDeadline(time.Now().Add(msgReadDeadline)))
 	response := make([]byte, 5)
@@ -213,9 +210,7 @@ func TestBitFieldLargerThanTheRateCapIsAccepted(t *testing.T) {
 // would panic when the piece it returned was validated against the piece hashes.
 func TestBitFieldSpareBitsAreIgnored(t *testing.T) {
 	c := check.New(t)
-	d, err := dispatcher.NewDispatcher()
-	c.NoError(err)
-	defer d.Stop()
+	d := newTestDispatcher(t)
 	client := newTestClient(d)
 
 	// We already have every piece in the torrent, so only the spare bits could be seen as something to download
@@ -231,7 +226,7 @@ func TestBitFieldSpareBitsAreIgnored(t *testing.T) {
 
 	// The peer claims to have everything, including the pieces that don't exist
 	c.Equal(1, p.has.ByteLength())
-	_, err = conn.Write(newTestMessage(bitFieldID, 0xFF))
+	_, err := conn.Write(newTestMessage(bitFieldID, 0xFF))
 	c.NoError(err)
 	_, err = conn.Write(newTestMessage(unchokeID))
 	c.NoError(err)
@@ -259,10 +254,7 @@ func TestBitFieldSpareBitsAreIgnored(t *testing.T) {
 // client that already has pieces — every peer that connects to one that is seeding — would otherwise see us as having
 // nothing and never ask us for anything at all.
 func TestBitFieldIsSentToNewPeers(t *testing.T) {
-	c := check.New(t)
-	d, err := dispatcher.NewDispatcher()
-	c.NoError(err)
-	defer d.Stop()
+	d := newTestDispatcher(t)
 	client := newTestClient(d)
 	markTestPiecesAvailable(client, 1, 3)
 	conn, _, done := startTestPeer(t, client)
@@ -282,15 +274,13 @@ func TestBitFieldIsSentToNewPeers(t *testing.T) {
 // the protocol allows, rather than sending an empty one.
 func TestNoBitFieldIsSentWhenWeHaveNothing(t *testing.T) {
 	c := check.New(t)
-	d, err := dispatcher.NewDispatcher()
-	c.NoError(err)
-	defer d.Stop()
+	d := newTestDispatcher(t)
 	conn, _, _ := startTestPeer(t, newTestClient(d))
 	defer xio.CloseIgnoringErrors(conn)
 
 	// Tell the peer we have a piece, which makes it interested. That message arriving first proves no bit field came
 	// ahead of it.
-	_, err = conn.Write(newTestMessage(haveID, 0, 0, 0, 0))
+	_, err := conn.Write(newTestMessage(haveID, 0, 0, 0, 0))
 	c.NoError(err)
 	c.NoError(conn.SetReadDeadline(time.Now().Add(msgReadDeadline)))
 	buffer := make([]byte, 5)
@@ -317,9 +307,7 @@ func expectBitField(t *testing.T, conn net.Conn, bits ...byte) {
 // as it liked, at almost no cost to itself, and no other peer could take that piece while it did.
 func TestDuplicateChunksDoNotRenewTheDownloadDeadline(t *testing.T) {
 	c := check.New(t)
-	d, err := dispatcher.NewDispatcher()
-	c.NoError(err)
-	defer d.Stop()
+	d := newTestDispatcher(t)
 	client := newTestClient(d)
 	conn, p := newTestPeer(t, client)
 	defer xio.CloseIgnoringErrors(conn)
@@ -372,9 +360,7 @@ func downloadDeadline(p *peer, one *piece) (deadline, lastReceived time.Time) {
 // enough one arrives as a negative number, which would slice the buffer out of bounds and panic.
 func TestChunkOutsideThePieceIsRejected(t *testing.T) {
 	c := check.New(t)
-	d, err := dispatcher.NewDispatcher()
-	c.NoError(err)
-	defer d.Stop()
+	d := newTestDispatcher(t)
 	client := newTestClient(d)
 	conn, p := newTestPeer(t, client)
 	defer xio.CloseIgnoringErrors(conn)
@@ -403,16 +389,14 @@ func TestChunkOutsideThePieceIsRejected(t *testing.T) {
 // what has already arrived, and that the requests it discarded are made again once it unchokes us.
 func TestChokeDoesNotCostTheConnectionOrThePiece(t *testing.T) {
 	c := check.New(t)
-	d, err := dispatcher.NewDispatcher()
-	c.NoError(err)
-	defer d.Stop()
+	d := newTestDispatcher(t)
 	client := newTestClient(d)
 	conn, p, done := startTestPeer(t, client)
 	defer xio.CloseIgnoringErrors(conn)
 
 	// The peer unchokes us and we ask it for a piece
 	c.NoError(conn.SetDeadline(time.Now().Add(peerMgmtWait)))
-	_, err = conn.Write(newTestMessage(unchokeID))
+	_, err := conn.Write(newTestMessage(unchokeID))
 	c.NoError(err)
 	p.queuePieceDownload(0)
 	buffer := make([]byte, 17)
@@ -470,9 +454,7 @@ func waitForDeadlineBeyond(t *testing.T, one *piece, beyond time.Time) {
 // just the chunks that haven't arrived, rather than asking for the whole piece over again.
 func TestResumeOnlyAsksForTheChunksThatAreMissing(t *testing.T) {
 	c := check.New(t)
-	d, err := dispatcher.NewDispatcher()
-	c.NoError(err)
-	defer d.Stop()
+	d := newTestDispatcher(t)
 	client := newTestClient(d)
 	conn, p := newTestPeer(t, client)
 	defer xio.CloseIgnoringErrors(conn)
@@ -503,9 +485,7 @@ func TestResumeOnlyAsksForTheChunksThatAreMissing(t *testing.T) {
 // that has started to arrive is still expected promptly.
 func TestReadDeadlines(t *testing.T) {
 	c := check.New(t)
-	d, err := dispatcher.NewDispatcher()
-	c.NoError(err)
-	defer d.Stop()
+	d := newTestDispatcher(t)
 	client := newTestClient(d)
 	conn, remote := newTestConnPair(t)
 	defer xio.CloseIgnoringErrors(conn)
@@ -518,7 +498,7 @@ func TestReadDeadlines(t *testing.T) {
 		keepAlivePeriod, idle)
 
 	// Send just the length prefix of a message, so that the peer starts waiting for the rest of it
-	_, err = conn.Write(newTestMessage(haveID, 0, 0, 0, 0)[:4])
+	_, err := conn.Write(newTestMessage(haveID, 0, 0, 0, 0)[:4])
 	c.NoError(err)
 	rest := nextReadDeadline(t, recorder)
 	c.True(rest <= msgReadDeadline, "waiting for the rest of a message must be no more than %v, was %v",
@@ -527,9 +507,7 @@ func TestReadDeadlines(t *testing.T) {
 
 // TestOversizedMessageIsRejected verifies that a peer can't demand an arbitrarily large allocation from us.
 func TestOversizedMessageIsRejected(t *testing.T) {
-	d, err := dispatcher.NewDispatcher()
-	check.New(t).NoError(err)
-	defer d.Stop()
+	d := newTestDispatcher(t)
 	client := newTestClient(d)
 	limit := newTestPeerMessageLimit(t, client)
 	for _, one := range []struct {
@@ -562,9 +540,7 @@ func TestOversizedMessageIsRejected(t *testing.T) {
 // a message larger than a piece message, and must not be able to make us allocate as if it did.
 func TestMessageLimitIsSizedForTheTorrent(t *testing.T) {
 	c := check.New(t)
-	d, err := dispatcher.NewDispatcher()
-	c.NoError(err)
-	defer d.Stop()
+	d := newTestDispatcher(t)
 
 	// A small torrent is held to the size of a piece message, the largest of the fixed-size messages
 	c.Equal(uint32(dispatcher.MaxPieceMessageLength-4), newTestPeerMessageLimit(t, newTestClient(d)))
@@ -592,16 +568,14 @@ func newTestPeerMessageLimit(t *testing.T, client *Client) uint32 {
 // TestLargestAllowedMessageIsAccepted verifies that the message size limit isn't off by one.
 func TestLargestAllowedMessageIsAccepted(t *testing.T) {
 	c := check.New(t)
-	d, err := dispatcher.NewDispatcher()
-	c.NoError(err)
-	defer d.Stop()
+	d := newTestDispatcher(t)
 	client := newTestClient(d)
 	limit := newTestPeerMessageLimit(t, client)
 	conn, _, done := startTestPeer(t, client)
 	defer xio.CloseIgnoringErrors(conn)
 
 	// An unknown message ID is ignored, no matter how large it is, as long as it is within the limit
-	_, err = conn.Write(newTestMessage(200, make([]byte, limit-1)...))
+	_, err := conn.Write(newTestMessage(200, make([]byte, limit-1)...))
 	c.NoError(err)
 	select {
 	case <-done:
@@ -613,9 +587,7 @@ func TestLargestAllowedMessageIsAccepted(t *testing.T) {
 // TestInvalidPieceRequestsAreRejected verifies that a peer can't ask us for data that doesn't exist, which would
 // otherwise result in an allocation sized by the peer and a read beyond the end of the piece.
 func TestInvalidPieceRequestsAreRejected(t *testing.T) {
-	d, err := dispatcher.NewDispatcher()
-	check.New(t).NoError(err)
-	defer d.Stop()
+	d := newTestDispatcher(t)
 	for _, one := range []struct {
 		name   string
 		index  uint32
@@ -648,9 +620,7 @@ func TestInvalidPieceRequestsAreRejected(t *testing.T) {
 // TestValidPieceRequestIsServed verifies that the piece request validation doesn't reject legitimate requests.
 func TestValidPieceRequestIsServed(t *testing.T) {
 	c := check.New(t)
-	d, err := dispatcher.NewDispatcher()
-	c.NoError(err)
-	defer d.Stop()
+	d := newTestDispatcher(t)
 	client := newTestClient(d)
 	client.file = newTestStorage(t, client)
 	markTestPiecesAvailable(client, 1)
@@ -662,7 +632,7 @@ func TestValidPieceRequestIsServed(t *testing.T) {
 	p.setChoked(false)
 	c.NoError(conn.SetReadDeadline(time.Now().Add(msgReadDeadline)))
 	buffer := make([]byte, 5)
-	_, err = io.ReadFull(conn, buffer)
+	_, err := io.ReadFull(conn, buffer)
 	c.NoError(err)
 	c.Equal(newTestMessage(unchokeID), buffer)
 
@@ -692,9 +662,7 @@ func TestValidPieceRequestIsServed(t *testing.T) {
 // treat the response as a corrupt piece and ban us.
 func TestPieceRequestForPieceWeDontHaveIsIgnored(t *testing.T) {
 	c := check.New(t)
-	d, err := dispatcher.NewDispatcher()
-	c.NoError(err)
-	defer d.Stop()
+	d := newTestDispatcher(t)
 	client := newTestClient(d)
 	client.file = newTestStorage(t, client)
 
@@ -708,7 +676,7 @@ func TestPieceRequestForPieceWeDontHaveIsIgnored(t *testing.T) {
 	p.setChoked(false)
 	c.NoError(conn.SetReadDeadline(time.Now().Add(msgReadDeadline)))
 	buffer := make([]byte, 5)
-	_, err = io.ReadFull(conn, buffer)
+	_, err := io.ReadFull(conn, buffer)
 	c.NoError(err)
 	c.Equal(newTestMessage(unchokeID), buffer)
 
@@ -738,10 +706,7 @@ func TestPieceRequestForPieceWeDontHaveIsIgnored(t *testing.T) {
 // TestPieceRequestFloodIsRejected verifies that a peer that asks for far more than we can deliver is disconnected
 // rather than allowed to grow the pending request queue without bound.
 func TestPieceRequestFloodIsRejected(t *testing.T) {
-	c := check.New(t)
-	d, err := dispatcher.NewDispatcher()
-	c.NoError(err)
-	defer d.Stop()
+	d := newTestDispatcher(t)
 	client := newTestClient(d)
 	client.file = newTestStorage(t, client)
 	markTestPiecesAvailable(client, 0, 1, 2, 3)
@@ -758,7 +723,7 @@ func TestPieceRequestFloodIsRejected(t *testing.T) {
 
 	// Ask for more than will be held onto, without ever reading the responses
 	for i := range maxPendingPieceRequests + 128 {
-		if _, err = conn.Write(newTestPieceRequest(requestID, uint32(i%testPieceCount), 0, chunkSize)); err != nil {
+		if _, err := conn.Write(newTestPieceRequest(requestID, uint32(i%testPieceCount), 0, chunkSize)); err != nil {
 			break
 		}
 	}
@@ -778,9 +743,7 @@ func TestPieceRequestFloodIsRejected(t *testing.T) {
 // recorded, or the remote's view of our interest ends up permanently at odds with ours.
 func TestUpdateInterestIsSerialized(t *testing.T) {
 	c := check.New(t)
-	d, err := dispatcher.NewDispatcher()
-	c.NoError(err)
-	defer d.Stop()
+	d := newTestDispatcher(t)
 	client := newTestClient(d)
 	conn, p := newTestPeer(t, client)
 	defer xio.CloseIgnoringErrors(conn)
@@ -866,9 +829,7 @@ func collectStateMessages(t *testing.T, p *peer) [][]byte {
 // a piece that finishes validating is announced to every peer from the read goroutine of the one that completed it, so
 // a single peer that can't be written to must not be able to stall the handling of all the others.
 func TestStateChangesDoNotBlockOnAFullWriteQueue(t *testing.T) {
-	d, err := dispatcher.NewDispatcher()
-	check.New(t).NoError(err)
-	defer d.Stop()
+	d := newTestDispatcher(t)
 	for _, one := range []struct {
 		change   func(client *Client, p *peer)
 		name     string
@@ -941,9 +902,7 @@ func nextQueuedMessage(t *testing.T, p *peer) []byte {
 // that no longer exists and no other peer could take it for as long as the torrent ran.
 func TestPieceIsNotClaimedByAPeerThatIsOnItsWayOut(t *testing.T) {
 	c := check.New(t)
-	d, err := dispatcher.NewDispatcher()
-	c.NoError(err)
-	defer d.Stop()
+	d := newTestDispatcher(t)
 	client := newTestClient(d)
 	conn, p := newTestPeer(t, client)
 	defer xio.CloseIgnoringErrors(conn)
@@ -972,9 +931,7 @@ func TestPieceIsNotClaimedByAPeerThatIsOnItsWayOut(t *testing.T) {
 // unable to ever finish it.
 func TestExpiredDownloadsLeaveAnotherPeersClaimAlone(t *testing.T) {
 	c := check.New(t)
-	d, err := dispatcher.NewDispatcher()
-	c.NoError(err)
-	defer d.Stop()
+	d := newTestDispatcher(t)
 	client := newTestClient(d)
 	conn, p := newTestPeer(t, client)
 	defer xio.CloseIgnoringErrors(conn)
@@ -1021,9 +978,7 @@ func everyTestPiece() *fixedbits.Bits {
 // leave a peer we're done with holding one of the limited peer slots for all of that time.
 func TestGivingUpOnAPeerClosesTheConnection(t *testing.T) {
 	c := check.New(t)
-	d, err := dispatcher.NewDispatcher()
-	c.NoError(err)
-	defer d.Stop()
+	d := newTestDispatcher(t)
 	client := newTestClient(d)
 	conn, remote := newTestConnPair(t)
 	recorder := &deadlineConn{Conn: remote, deadlines: make(chan time.Duration, 8)}
@@ -1092,9 +1047,7 @@ func TestRoutineDisconnectsDoNotBlockTheAddress(t *testing.T) {
 		t.Run(one.name, func(t *testing.T) {
 			c := check.New(t)
 			// A dispatcher of its own, since every one of these connections comes from the same address
-			d, err := dispatcher.NewDispatcher()
-			c.NoError(err)
-			defer d.Stop()
+			d := newTestDispatcher(t)
 			conn, p, done := startTestPeer(t, newTestClient(d))
 			defer xio.CloseIgnoringErrors(conn)
 			addr := p.conn.RemoteAddr()
@@ -1296,6 +1249,20 @@ func newTestConnPair(t *testing.T) (local, remote net.Conn) {
 	return local, remote
 }
 
+// newTestDispatcher creates a dispatcher for a test and stops it once the test is over. The external IP lookup is
+// always replaced with a fixed address, since the real one is started by the dispatcher's listen goroutine as soon as
+// the dispatcher exists: leaving it in place makes the test depend on outside sites being reachable and leaves a probe
+// goroutine issuing HTTP requests to them for as long as those take to give up, which outlives the test.
+func newTestDispatcher(t *testing.T) *dispatcher.Dispatcher {
+	t.Helper()
+	d, err := dispatcher.NewDispatcher(dispatcher.FixedExternalIP(net.ParseIP(testExternalIP)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(d.Stop)
+	return d
+}
+
 func newTestClient(d *dispatcher.Dispatcher) *Client {
 	return newTestClientForTorrent(d, newTestTorrentFile())
 }
@@ -1310,6 +1277,7 @@ func newTestClientForTorrent(d *dispatcher.Dispatcher, torrentFile *tfs.File) *C
 		peerWaitGroup:       &sync.WaitGroup{},
 		peerMgmtStop:        make(chan struct{}),
 		peers:               make(map[net.Conn]*peer),
+		dialing:             make(map[string]bool),
 		stoppedChan:         make(chan bool, 1),
 		concurrentDownloads: 4,
 		peersWanted:         32,

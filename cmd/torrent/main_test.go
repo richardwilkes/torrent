@@ -128,15 +128,22 @@ func TestMonitorCompleteThenStop(t *testing.T) {
 		stopped:  stopped,
 	}
 
-	// Hold the stop back until the completion has been acted on, so that the two can't be selected between
+	// Hold the stop back until the completion has been acted on, so that the two can't be selected between. The stop
+	// is sent either way, since run would otherwise never return, but whether the completion was what extracted the
+	// files is what decides the test: the stop path extracts them too, so without this a completion path that does
+	// nothing at all still leaves the same actions behind.
+	extractedOnCompletion := make(chan bool, 1)
 	go func() {
 		select {
 		case <-extracted:
+			extractedOnCompletion <- true
 		case <-time.After(notifyWait):
+			extractedOnCompletion <- false
 		}
 		stopped <- nil
 	}()
 	m.run()
+	c.True(<-extractedOnCompletion, "the completion notification must extract the files by itself")
 	c.Equal([]string{extractAction, removeAction}, actions)
 }
 

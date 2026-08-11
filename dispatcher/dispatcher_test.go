@@ -122,7 +122,7 @@ func occupiedPort(t *testing.T) (uint32, net.Listener) {
 func TestStopReleasesResources(t *testing.T) {
 	c := check.New(t)
 	before := runtime.NumGoroutine()
-	d, err := NewDispatcher(stubExternalIP(nil))
+	d, err := NewDispatcher(FixedExternalIP(nil))
 	c.NoError(err)
 	d.Stop()
 	c.True(d.InRate.Closed(), "the inbound rate limiter must be closed")
@@ -247,27 +247,30 @@ func (l *scriptedListener) accepts() int {
 	return l.next
 }
 
-// stubExternalIP replaces the external IP lookup with one that answers immediately, so that a test neither issues real
-// network requests nor leaves a probe goroutine running behind it.
-func stubExternalIP(ip net.IP) func(*Dispatcher) error {
-	return func(d *Dispatcher) error {
-		d.lookupExternalIP = func(_ context.Context, _ time.Duration) net.IP { return ip }
-		return nil
-	}
-}
-
 // newTestDispatcher creates a dispatcher for a test and stops it once the test is over. The external IP lookup is
 // always stubbed out, since the real one is started by the listen goroutine as soon as the dispatcher exists: leaving
 // it in place makes the test depend on outside sites being reachable and leaves a probe goroutine running for as long
 // as those requests take to give up, which is the better part of a minute where the network is restricted.
 func newTestDispatcher(t *testing.T, options ...func(*Dispatcher) error) *Dispatcher {
 	t.Helper()
-	d, err := NewDispatcher(append([]func(*Dispatcher) error{stubExternalIP(nil)}, options...)...)
+	d, err := NewDispatcher(append([]func(*Dispatcher) error{FixedExternalIP(nil)}, options...)...)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(d.Stop)
 	return d
+}
+
+// TestFixedExternalIP verifies that a supplied address is reported as our external one without any lookup being made,
+// which is what keeps callers that already know their address, and the tests, off of the outside sites the real lookup
+// consults.
+func TestFixedExternalIP(t *testing.T) {
+	c := check.New(t)
+	expected := net.ParseIP("203.0.113.7")
+	d := newTestDispatcher(t, FixedExternalIP(expected))
+	c.NotEqual(reflect.ValueOf(xnet.ExternalIPAddress).Pointer(), reflect.ValueOf(d.lookupExternalIP).Pointer(),
+		"the real external IP lookup must be replaced")
+	c.Equal(expected.String(), d.ExternalIP().String())
 }
 
 // TestTestDispatchersDoNotLookUpTheRealExternalIP verifies that a dispatcher built for a test can't consult the

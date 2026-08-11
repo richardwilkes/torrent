@@ -234,9 +234,7 @@ func TestTrackerResponseIsBounded(t *testing.T) {
 // announce reporting zero misreports the transfer and breaks ratio accounting on trackers that use the values.
 func TestAnnounceReportsTransferTotals(t *testing.T) {
 	c := check.New(t)
-	d, err := dispatcher.NewDispatcher()
-	c.NoError(err)
-	defer d.Stop()
+	d := newTestDispatcher(t)
 	client := newTestClient(d)
 
 	c.Contains(client.tracker.announceURL(startedMsg), "&uploaded=0&downloaded=0")
@@ -261,9 +259,7 @@ func TestAnnounceToleratesTheShutdownResponse(t *testing.T) {
 	} {
 		t.Run(one.name, func(t *testing.T) {
 			c := check.New(t)
-			d, err := dispatcher.NewDispatcher()
-			c.NoError(err)
-			defer d.Stop()
+			d := newTestDispatcher(t)
 			client, body := newTestTrackerClient(t, d)
 			*body = one.body
 			client.tracker.lock.Lock()
@@ -284,9 +280,7 @@ func TestAnnounceToleratesTheShutdownResponse(t *testing.T) {
 // interval isn't treated as a failure and doesn't disturb the interval already in hand.
 func TestAnnounceKeepsTheIntervalWhenOneIsNotReturned(t *testing.T) {
 	c := check.New(t)
-	d, err := dispatcher.NewDispatcher()
-	c.NoError(err)
-	defer d.Stop()
+	d := newTestDispatcher(t)
 	client, body := newTestTrackerClient(t, d)
 	*body = "d8:intervali1800e5:peers0:e"
 

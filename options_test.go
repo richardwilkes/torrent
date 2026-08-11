@@ -26,10 +26,7 @@ const rateSettleTime = 2500 * time.Millisecond
 // TestRateCapsTooSmallForAPieceMessageAreRejected verifies that a cap which would refuse every piece message, and
 // therefore tear down the connection to each peer as soon as one arrives, isn't accepted in the first place.
 func TestRateCapsTooSmallForAPieceMessageAreRejected(t *testing.T) {
-	c := check.New(t)
-	d, err := dispatcher.NewDispatcher()
-	c.NoError(err)
-	defer d.Stop()
+	d := newTestDispatcher(t)
 	for _, one := range []struct {
 		option func(int) func(*Client) error
 		name   string
@@ -56,9 +53,7 @@ func TestRateCapsTooSmallForAPieceMessageAreRejected(t *testing.T) {
 // is what makes the minimum necessary.
 func TestMinimumRateCapPermitsAPieceMessage(t *testing.T) {
 	c := check.New(t)
-	d, err := dispatcher.NewDispatcher()
-	c.NoError(err)
-	defer d.Stop()
+	d := newTestDispatcher(t)
 	client := newTestClient(d)
 	defer client.closeRateLimiters()
 
@@ -77,9 +72,7 @@ func TestMinimumRateCapPermitsAPieceMessage(t *testing.T) {
 // would cost us the connection to a peer that did nothing wrong.
 func TestMessagesLargerThanTheCapAreChargedInPieces(t *testing.T) {
 	c := check.New(t)
-	d, err := dispatcher.NewDispatcher()
-	c.NoError(err)
-	defer d.Stop()
+	d := newTestDispatcher(t)
 	client := newTestClient(d)
 	defer client.closeRateLimiters()
 	c.NoError(DownloadCap(dispatcher.MinimumRateCap)(client))
