@@ -362,8 +362,12 @@ func (c *Client) prepareFile() error {
 	return nil
 }
 
-// HandleConnection is called by the dispatcher for new connections.
-func (c *Client) HandleConnection(conn net.Conn, logger *slog.Logger, _ dispatcher.ProtocolExtensions, infoHash tfs.InfoHash, sendHandshake bool) {
+// HandleConnection is called by the dispatcher for new connections. handshakeDone, when it isn't nil, is the
+// dispatcher's notification that the pending handshake slot it took for this connection may be released, and is called
+// as soon as the handshake this finishes is over.
+func (c *Client) HandleConnection(conn net.Conn, logger *slog.Logger, _ dispatcher.ProtocolExtensions,
+	infoHash tfs.InfoHash, sendHandshake bool, handshakeDone func(),
+) {
 	_, storagePath := filepath.Split(c.torrentFile.StoragePath())
 	remoteAddr := conn.RemoteAddr()
 	logger = logger.With("torrent_file", storagePath[:len(storagePath)-len(filepath.Ext(storagePath))],
@@ -399,6 +403,11 @@ func (c *Client) HandleConnection(conn net.Conn, logger *slog.Logger, _ dispatch
 		logger.Debug("refusing connection to ourselves")
 		c.dispatcher.GateKeeper().BlockAddress(remoteAddr)
 		return
+	}
+	// The handshake is over, so whatever the dispatcher set aside for it is released here rather than being carried
+	// into the peer session below, which the remote can keep alive for as long as it likes
+	if handshakeDone != nil {
+		handshakeDone()
 	}
 	p := newPeer(c, conn, logger)
 	if c.shouldStop() {
@@ -468,7 +477,9 @@ func (c *Client) connectToPeer(addr string, port int) {
 		c.dispatcher.GateKeeper().BlockAddressString(addr)
 		return
 	}
-	c.HandleConnection(conn, logger, extensions, infoHash, false)
+	// No handshake completion notification is passed along, since a connection we dialed was never accepted by the
+	// dispatcher and so has no pending handshake slot of its own
+	c.HandleConnection(conn, logger, extensions, infoHash, false, nil)
 }
 
 func (c *Client) finish(err error) {

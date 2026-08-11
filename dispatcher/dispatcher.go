@@ -46,15 +46,22 @@ const (
 	maxAcceptRetryDelay = time.Second
 	// maxPendingHandshakes is the number of accepted connections that may be working through their handshake at the
 	// same time. Each one holds a socket and a goroutine for roughly 15 to 25 seconds — the three sequential reads of
-	// ReceiveTorrentHandshake, plus the handshake write and peer ID read the handler makes — before any peer count
-	// limit applies to it, so without a bound here a flood of connections that never say anything runs the process
-	// out of file descriptors, which breaks outbound dials and disk I/O along with the accept loop.
+	// ReceiveTorrentHandshake, plus the handshake write and peer ID read the handler makes, every one of them under
+	// its own HandshakeDeadline — before any peer count limit applies to it, so without a bound here a flood of
+	// connections that never say anything runs the process out of file descriptors, which breaks outbound dials and
+	// disk I/O along with the accept loop. The slot is therefore held for all of that, not just the part of the
+	// handshake the dispatcher reads itself, which would leave the rest counted against no limit at all.
 	maxPendingHandshakes = 128
 )
 
 // ConnectionHandler defines the interface for handling torrent connections.
 type ConnectionHandler interface {
-	HandleConnection(conn net.Conn, log *slog.Logger, extensions ProtocolExtensions, infoHash tfs.InfoHash, sendHandshake bool)
+	// HandleConnection services a connection whose incoming handshake has already been read. handshakeDone, which is
+	// nil when the caller isn't holding a pending handshake slot for the connection, must be called as soon as the
+	// handler has finished the rest of the handshake — the handshake write and the peer ID read — and always before
+	// the peer session, which the remote may hold open indefinitely, is started.
+	HandleConnection(conn net.Conn, log *slog.Logger, extensions ProtocolExtensions, infoHash tfs.InfoHash,
+		sendHandshake bool, handshakeDone func())
 }
 
 // Dispatcher holds a dispatcher for bit torrent connections.
@@ -181,10 +188,12 @@ func (d *Dispatcher) ExternalPort() uint32 {
 	return atomic.LoadUint32(&d.externalPort)
 }
 
-// Stop accepting connections and shutdown.
+// Stop accepting connections and shutdown. Stopping a dispatcher that has already been stopped is a no-op.
 func (d *Dispatcher) Stop() {
 	d.gatekeeper.Close()
-	if err := d.listener.Close(); err != nil {
+	// A second stop finds the listener already closed, which is the expected outcome of a supported no-op rather than
+	// a shutdown that went wrong, so, exactly as the accept loop does, net.ErrClosed isn't reported.
+	if err := d.listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 		errs.LogTo(d.logger, err)
 	}
 	d.closeRateLimiters()
@@ -289,19 +298,23 @@ func (d *Dispatcher) logListening() {
 }
 
 // dispatch works an accepted connection through its handshake and, if it is for a torrent we have a handler for, hands
-// it off to that handler. The pending handshake slot the accept loop took for this connection is given back as soon as
-// the handshake is over rather than when this returns: the handler runs for the whole life of the peer session, which
-// keep-alives sustain for as long as the remote likes, so a slot held until then would turn the bound on connections
-// that haven't handshaken into a cap on how many inbound peers we may ever have at once.
+// it off to that handler. The pending handshake slot the accept loop took for this connection is given back once the
+// whole handshake is over — which the handler, being the one that makes the handshake write and the peer ID read that
+// finish it, reports by calling the function it is handed — rather than when this returns: the handler goes on to run
+// the peer session, which keep-alives sustain for as long as the remote likes, so a slot held until then would turn
+// the bound on connections that haven't handshaken into a cap on how many inbound peers we may ever have at once. The
+// slot is given back here as well, so that a handler which fails, or which never reports at all, can't strand it.
 func (d *Dispatcher) dispatch(conn net.Conn) {
 	logger := d.logger.With("remote_addr", conn.RemoteAddr().String())
 	defer xio.CloseIgnoringErrors(conn)
+	var once sync.Once
+	handshakeDone := func() { once.Do(func() { d.pendingHandshakes.Add(-1) }) }
+	defer handshakeDone()
 	handler, extensions, infoHash := d.handshake(conn, logger)
-	d.pendingHandshakes.Add(-1)
 	if handler == nil {
 		return
 	}
-	handler.HandleConnection(conn, logger, extensions, infoHash, true)
+	handler.HandleConnection(conn, logger, extensions, infoHash, true, handshakeDone)
 }
 
 // handshake takes an accepted connection through the handshake exchange and returns the handler registered for the

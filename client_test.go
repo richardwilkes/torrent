@@ -1009,7 +1009,7 @@ func TestPeerIsNotLeftBehindWhileStopping(t *testing.T) {
 
 	var extensions dispatcher.ProtocolExtensions
 	waitFor(t, "HandleConnection", func() {
-		client.HandleConnection(remote, client.logger, extensions, client.torrentFile.InfoHash, false)
+		client.HandleConnection(remote, client.logger, extensions, client.torrentFile.InfoHash, false, nil)
 	})
 	c.Equal(0, len(client.currentPeers()))
 	c.False(d.GateKeeper().IsAddressBlocked(remote.RemoteAddr()),
@@ -1033,7 +1033,7 @@ func TestConnectionToOurselvesIsRefused(t *testing.T) {
 	_, err := conn.Write(client.id[:])
 	c.NoError(err)
 	waitFor(t, "HandleConnection", func() {
-		client.HandleConnection(remote, client.logger, extensions, client.torrentFile.InfoHash, false)
+		client.HandleConnection(remote, client.logger, extensions, client.torrentFile.InfoHash, false, nil)
 	})
 	c.Equal(0, len(client.currentPeers()))
 	c.True(d.GateKeeper().IsAddressBlocked(remote.RemoteAddr()),
@@ -1044,11 +1044,58 @@ func TestConnectionToOurselvesIsRefused(t *testing.T) {
 	var peerID dispatcher.PeerID
 	_, err = otherConn.Write(peerID[:])
 	c.NoError(err)
-	go client.HandleConnection(otherRemote, client.logger, extensions, client.torrentFile.InfoHash, false)
+	go client.HandleConnection(otherRemote, client.logger, extensions, client.torrentFile.InfoHash, false, nil)
 	deadline := time.Now().Add(peerMgmtWait)
 	for len(client.currentPeers()) == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("a peer with an ID of its own was never taken on")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestHandshakeCompletionIsReportedAfterThePeerIDIsRead verifies that the dispatcher isn't told the handshake is over
+// until the peer ID read that finishes it has actually completed, and that it is told before the peer session begins.
+// Reporting any earlier hands back the pending handshake slot while a read with a deadline of its own is still
+// outstanding, which is precisely the read a remote that wants to hold a socket and a goroutine without being counted
+// against anything simply never satisfies; reporting any later holds the slot for a session the remote's keep-alives
+// can sustain for as long as it likes.
+func TestHandshakeCompletionIsReportedAfterThePeerIDIsRead(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	// An ID of our own, so that the all zeros ID the remote presents isn't taken for a connection to ourselves
+	for i := range client.id {
+		client.id[i] = urlQuerySafeBytes[i%len(urlQuerySafeBytes)]
+	}
+	var extensions dispatcher.ProtocolExtensions
+
+	conn, remote := newTestConnPair(t)
+	reported := make(chan struct{}, 1)
+	go client.HandleConnection(remote, client.logger, extensions, client.torrentFile.InfoHash, false,
+		func() { reported <- struct{}{} })
+
+	// Nothing has been sent, so the handler is parked on the peer ID read with the handshake still unfinished
+	select {
+	case <-reported:
+		t.Fatal("the handshake was reported finished while the peer ID read was still outstanding")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	var peerID dispatcher.PeerID
+	_, err := conn.Write(peerID[:])
+	c.NoError(err)
+	select {
+	case <-reported:
+	case <-time.After(peerMgmtWait):
+		t.Fatal("the handshake was never reported finished")
+	}
+
+	// The peer session, which is what the slot must not be held across, only starts once the report has been made
+	deadline := time.Now().Add(peerMgmtWait)
+	for len(client.currentPeers()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the peer session never started")
 		}
 		time.Sleep(time.Millisecond)
 	}

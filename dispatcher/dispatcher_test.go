@@ -140,6 +140,20 @@ func TestStopReleasesResources(t *testing.T) {
 	d.Stop()
 }
 
+// TestStoppingASecondTimeReportsNoError verifies that the supported no-op of stopping an already stopped dispatcher
+// stays silent. The only thing wrong on that pass is that the listener is already closed, which is exactly what was
+// asked for, so logging the "use of closed network connection" error the close returns would tell an operator a clean
+// shutdown had failed when nothing about it did.
+func TestStoppingASecondTimeReportsNoError(t *testing.T) {
+	c := check.New(t)
+	logger, sink := newTestLogger()
+	d, err := NewDispatcher(FixedExternalIP(nil), LogTo(logger))
+	c.NoError(err)
+	d.Stop()
+	d.Stop()
+	c.NotContains(sink.contents(), "level=ERROR", "stopping a dispatcher must not report an error")
+}
+
 // TestListenerAcceptsWhileTheExternalIPIsBeingDetermined verifies that connections are accepted without waiting on the
 // external IP lookup, which consults outside sites and can take many seconds to give up when the network is
 // unreachable.
@@ -202,7 +216,7 @@ func TestAcceptRetriesTransientErrors(t *testing.T) {
 	infoHash := tfs.InfoHash{1, 2, 3}
 	dispatched := make(chan tfs.InfoHash, 1)
 	d.Register(infoHash, handlerFunc(func(_ net.Conn, _ *slog.Logger, _ ProtocolExtensions, hash tfs.InfoHash,
-		sendHandshake bool,
+		sendHandshake bool, _ func(),
 	) {
 		c.True(sendHandshake, "an inbound connection is still owed a handshake of our own")
 		dispatched <- hash
@@ -269,22 +283,33 @@ func TestPendingHandshakesAreBounded(t *testing.T) {
 	}
 }
 
-// TestPendingHandshakeSlotIsReleasedBeforeTheSessionRuns verifies that the slot an accepted connection takes is given
-// back as soon as its handshake is over, rather than when its handler returns. The handler runs the whole peer
-// session, which keep-alives sustain for as long as the remote likes, so a slot held for that long would make the
-// bound on connections that haven't handshaken a cap on how many inbound peers we may ever have at once: once that
-// many long-lived peers had accumulated, every new inbound connection would be refused for good.
-func TestPendingHandshakeSlotIsReleasedBeforeTheSessionRuns(t *testing.T) {
+// TestPendingHandshakeSlotCoversTheHandlersHandshake verifies that the slot an accepted connection takes is still held
+// while the handler makes the rest of the handshake — our handshake write and the peer ID read, each with a deadline
+// of its own — and is given back the moment the handler reports that exchange over, which is before the peer session
+// it goes on to run. Releasing the slot as soon as the dispatcher's own reads finished would leave those seconds
+// counted against no limit at all, so a remote that knows an info hash we serve could send the handshake prefix, cycle
+// through the bound in milliseconds, and then withhold its peer ID, holding a socket and a goroutine apiece for the
+// deadlines that follow until we run out of file descriptors. Holding it until the handler returns would be no good
+// either: the session lasts as long as the remote's keep-alives do, so the bound on connections that haven't
+// handshaken would become a cap on how many inbound peers we may ever have at once.
+func TestPendingHandshakeSlotCoversTheHandlersHandshake(t *testing.T) {
 	c := check.New(t)
 	local, remote := newAddressedPipe(t)
 	d := newScriptedDispatcher(&scriptedListener{script: []acceptResult{{conn: remote}}})
 	defer d.gatekeeper.Close()
 
 	infoHash := tfs.InfoHash{1, 2, 3}
-	pending := make(chan int32, 1)
+	type counts struct{ duringHandshake, duringSession int32 }
+	observed := make(chan counts, 1)
 	release := make(chan struct{})
-	d.Register(infoHash, handlerFunc(func(_ net.Conn, _ *slog.Logger, _ ProtocolExtensions, _ tfs.InfoHash, _ bool) {
-		pending <- d.pendingHandshakes.Load()
+	d.Register(infoHash, handlerFunc(func(_ net.Conn, _ *slog.Logger, _ ProtocolExtensions, _ tfs.InfoHash, _ bool,
+		handshakeDone func(),
+	) {
+		var one counts
+		one.duringHandshake = d.pendingHandshakes.Load()
+		handshakeDone() // Stands in for the handshake write and peer ID read having completed
+		one.duringSession = d.pendingHandshakes.Load()
+		observed <- one
 		<-release // Stands in for a peer session the remote holds open with keep-alives
 	}))
 
@@ -300,12 +325,64 @@ func TestPendingHandshakeSlotIsReleasedBeforeTheSessionRuns(t *testing.T) {
 	go func() { sent <- SendTorrentHandshake(local, ProtocolExtensions{}, infoHash, PeerID{}) }()
 
 	select {
-	case count := <-pending:
-		c.Equal(int32(0), count, "the handshake slot must be given back before the peer session is handed the connection")
+	case one := <-observed:
+		c.Equal(int32(1), one.duringHandshake,
+			"the handshake slot must still be held while the handler finishes the handshake")
+		c.Equal(int32(0), one.duringSession,
+			"the handshake slot must be given back before the peer session is handed the connection")
 	case <-time.After(goroutineWait):
 		t.Fatal("the connection was never dispatched to its handler")
 	}
 	close(release)
+
+	select {
+	case <-stopped:
+	case <-time.After(goroutineWait):
+		t.Fatal("the accept loop never stopped")
+	}
+}
+
+// TestPendingHandshakeSlotIsReleasedByAHandlerThatNeverReports verifies that a handler which returns without ever
+// saying its handshake finished — one that failed partway through it, or an implementation that simply doesn't make
+// the call — doesn't strand the slot the accept loop took for its connection. Slots lost that way accumulate until the
+// bound is used up entirely by connections that are long gone and nothing new can be accepted at all.
+func TestPendingHandshakeSlotIsReleasedByAHandlerThatNeverReports(t *testing.T) {
+	c := check.New(t)
+	local, remote := newAddressedPipe(t)
+	d := newScriptedDispatcher(&scriptedListener{script: []acceptResult{{conn: remote}}})
+	defer d.gatekeeper.Close()
+
+	infoHash := tfs.InfoHash{1, 2, 3}
+	handled := make(chan struct{}, 1)
+	d.Register(infoHash, handlerFunc(func(_ net.Conn, _ *slog.Logger, _ ProtocolExtensions, _ tfs.InfoHash, _ bool,
+		_ func(),
+	) {
+		handled <- struct{}{}
+	}))
+
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		d.listen()
+	}()
+	c.NoError(local.SetDeadline(time.Now().Add(goroutineWait)))
+	sent := make(chan error, 1)
+	go func() { sent <- SendTorrentHandshake(local, ProtocolExtensions{}, infoHash, PeerID{}) }()
+
+	select {
+	case <-handled:
+	case <-time.After(goroutineWait):
+		t.Fatal("the connection was never dispatched to its handler")
+	}
+
+	// The handler has been entered, so the release, which its return triggers, may not have happened yet
+	deadline := time.Now().Add(goroutineWait)
+	for d.pendingHandshakes.Load() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("the handshake slot was never given back: %d still pending", d.pendingHandshakes.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
 
 	select {
 	case <-stopped:
@@ -384,12 +461,13 @@ func TestTheDispatcherEndOfAPipeIgnoresReadDeadlines(t *testing.T) {
 }
 
 // handlerFunc adapts a function to the ConnectionHandler interface.
-type handlerFunc func(conn net.Conn, log *slog.Logger, extensions ProtocolExtensions, infoHash tfs.InfoHash, sendHandshake bool)
+type handlerFunc func(conn net.Conn, log *slog.Logger, extensions ProtocolExtensions, infoHash tfs.InfoHash,
+	sendHandshake bool, handshakeDone func())
 
 func (f handlerFunc) HandleConnection(conn net.Conn, log *slog.Logger, extensions ProtocolExtensions,
-	infoHash tfs.InfoHash, sendHandshake bool,
+	infoHash tfs.InfoHash, sendHandshake bool, handshakeDone func(),
 ) {
-	f(conn, log, extensions, infoHash, sendHandshake)
+	f(conn, log, extensions, infoHash, sendHandshake, handshakeDone)
 }
 
 // scriptedListener hands out a canned sequence of accept results, then reports that it has been closed.
