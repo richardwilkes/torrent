@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/richardwilkes/toolbox/v2/errs"
+	"github.com/richardwilkes/toolbox/v2/rate"
 	"github.com/richardwilkes/toolbox/v2/xio"
 	"github.com/richardwilkes/torrent/container/fixedbits"
 	"github.com/richardwilkes/torrent/container/spanlist"
@@ -41,10 +42,6 @@ const (
 	// against it, but the piece can't stay claimed forever either, since no other peer can take it while it is.
 	maxChokedDownloadWait = time.Minute
 	chunkSize             = dispatcher.ChunkSize
-	// maxMessageLength is the largest message we'll accept from a peer, not counting the length prefix. The largest
-	// message we ever expect is a piece message, which is 9 bytes plus a chunk, but bit field messages grow with the
-	// number of pieces in the torrent, so allow a generous amount beyond that.
-	maxMessageLength = 128 * 1024
 	// maxPendingPieceRequests is the number of unfulfilled piece requests we'll hold onto for a peer before deciding
 	// it is flooding us.
 	maxPendingPieceRequests = 512
@@ -53,6 +50,22 @@ const (
 // errStorageClosed is returned when a peer tries to read or write the torrent's storage after the client has closed
 // it, which can happen for the peer goroutines that outlive the client's peer wait group.
 var errStorageClosed = errors.New("torrent storage has been closed")
+
+// useRate accounts for the given number of bytes moved on this connection, charging the limiter in pieces no larger
+// than dispatcher.MaxPieceMessageLength, which every permitted cap is large enough to accept. A limiter refuses any
+// single amount larger than its cap outright, so charging a whole message at once would tear down the connection to
+// a peer over a message that is perfectly legal but bigger than the cap — a bit field for a torrent with more than
+// ~131,000 pieces is one, and those are exchanged by both ends as soon as a connection is established.
+func useRate(limiter rate.Limiter, amount int) error {
+	for amount > 0 {
+		charge := min(amount, dispatcher.MaxPieceMessageLength)
+		if err := <-limiter.Use(charge); err != nil {
+			return err
+		}
+		amount -= charge
+	}
+	return nil
+}
 
 const (
 	chokeID byte = iota
@@ -96,6 +109,16 @@ type pieceRequest struct {
 	begin  int
 	length int
 	cancel bool
+}
+
+// maxMessageLength returns the largest message length, which includes the one-byte message ID but not the four-byte
+// length prefix, that will be accepted from this peer. Every message but the bit field has a small, fixed size, and
+// the largest of those is a piece message carrying a full chunk. A bit field is exactly one byte per eight pieces in
+// the torrent, so the limit is what this particular torrent needs rather than what the largest permitted one would:
+// a peer on a small torrent then can't make us allocate for a message that torrent could never produce.
+func (p *peer) maxMessageLength() uint32 {
+	// The bit length is fixed when the peer is created, so no lock is needed to look at it.
+	return uint32(max(dispatcher.MaxPieceMessageLength-4, 1+p.has.ByteLength()))
 }
 
 // validMessageLength returns true if the given message length, which includes the one-byte message ID, is valid for a
@@ -419,6 +442,7 @@ func (p *peer) processIncomingMessages() {
 	go p.processStateChanges(done)
 	go p.pieceRequestQueue()
 	lengthBuffer := make([]byte, 4)
+	maxLength := p.maxMessageLength()
 	for {
 		p.lock.RLock()
 		bail := p.bail
@@ -435,8 +459,8 @@ func (p *peer) processIncomingMessages() {
 			return
 		}
 		length := binary.BigEndian.Uint32(lengthBuffer)
-		if length > maxMessageLength {
-			p.logger.Warn("message too large", "length", length, "max", maxMessageLength)
+		if length > maxLength {
+			p.logger.Warn("message too large", "length", length, "max", maxLength)
 			p.client.dispatcher.GateKeeper().BlockAddress(p.conn.RemoteAddr())
 			return
 		}
@@ -524,7 +548,7 @@ func (p *peer) processIncomingMessages() {
 		p.bytesRead += int64(length + 4)
 		p.lock.Unlock()
 		p.client.tracker.addDownloadedBytes(int64(length + 4))
-		if err := <-p.client.InRate.Use(int(length + 4)); err != nil {
+		if err := useRate(p.client.InRate, int(length+4)); err != nil {
 			if tio.ShouldLogIOError(err) {
 				errs.LogTo(p.logger, err)
 			}
@@ -832,7 +856,7 @@ func (p *peer) processWriteQueue(done chan bool) {
 					continue
 				}
 			} else {
-				err = <-p.client.OutRate.Use(len(buffer))
+				err = useRate(p.client.OutRate, len(buffer))
 			}
 			if err == nil {
 				lastWriteTime = time.Now()

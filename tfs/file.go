@@ -42,6 +42,12 @@ const (
 	// unusual. Keeping it below math.MaxInt32 also means int(LengthOf(index)) can't truncate on a 32-bit platform.
 	MaxPieceLength = 32 * 1024 * 1024
 
+	// MaxPieceCount is the largest number of pieces a torrent may declare. This matches the limit other clients apply
+	// by default, so a torrent beyond it is one no one else will load either. It also bounds the bit field that says
+	// which pieces a peer has, since that is exchanged as a single protocol message whose size grows with the piece
+	// count, as well as the piece hash data itself, which is 20 bytes per piece.
+	MaxPieceCount = 1 << 21
+
 	// maxStorageNameLength is the largest number of bytes a single path element may occupy in the storage path. 255 is
 	// the limit imposed by nearly every filesystem in common use.
 	maxStorageNameLength = 255
@@ -136,6 +142,9 @@ func (f *File) validate() error {
 	}
 	if len(f.Info.Pieces) == 0 || len(f.Info.Pieces)%sha1.Size != 0 {
 		return errs.Newf("invalid torrent piece hash data length: %d", len(f.Info.Pieces))
+	}
+	if f.PieceCount() > MaxPieceCount {
+		return errs.Newf("torrent piece count of %d exceeds the maximum of %d", f.PieceCount(), MaxPieceCount)
 	}
 	if f.Info.Length < 0 {
 		return errs.Newf("invalid torrent length: %d", f.Info.Length)

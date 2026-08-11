@@ -15,12 +15,13 @@ const (
 
 	// MaxPieceMessageLength is the number of bytes a piece message carrying a full chunk occupies on the wire,
 	// including its 4-byte length prefix, its 1-byte ID and the 8 bytes identifying the range being sent. This is the
-	// largest amount that is ever accounted for in a single rate limiter call while transferring piece data.
+	// largest amount that is ever accounted for in a single rate limiter call: messages that are larger — a bit field
+	// grows with the number of pieces in the torrent, and outgrows this one at around 131,000 pieces — are charged
+	// over as many calls as it takes.
 	MaxPieceMessageLength = 4 + 9 + ChunkSize
 
-	// MinimumRateCap is the smallest download or upload speed, in bytes per second, that may be set. Rate limits are
-	// applied to whole protocol messages, and a limiter refuses any single amount larger than its own cap and never
-	// satisfies one larger than a cap it is subordinate to, so a cap below the size of a piece message carrying a full
-	// chunk would fail or permanently stall every transfer.
+	// MinimumRateCap is the smallest download or upload speed, in bytes per second, that may be set. A limiter refuses
+	// any single amount larger than its own cap and never satisfies one larger than a cap it is subordinate to, so a
+	// cap below the largest amount charged in a single call would fail or permanently stall every transfer.
 	MinimumRateCap = MaxPieceMessageLength
 )

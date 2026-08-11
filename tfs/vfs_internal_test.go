@@ -25,7 +25,7 @@ func decodeUnvalidated(t *testing.T, files []any) *File {
 	c := check.New(t)
 	data, err := bencode.EncodeBytes(map[string]any{
 		"info": map[string]any{
-			"name":         "example",
+			"name":         exampleName,
 			"piece length": int64(16),
 			"pieces":       make([]byte, 20),
 			"files":        files,
@@ -34,7 +34,7 @@ func decodeUnvalidated(t *testing.T, files []any) *File {
 	c.NoError(err)
 	var f File
 	c.NoError(bencode.DecodeBytes(data, &f))
-	f.Path = "example"
+	f.Path = exampleName
 	return &f
 }
 

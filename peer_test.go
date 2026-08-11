@@ -167,6 +167,47 @@ func TestTransferTotalsReachTheTracker(t *testing.T) {
 	}
 }
 
+// TestBitFieldLargerThanTheRateCapIsAccepted verifies that a peer isn't dropped over the very first thing it says.
+// A bit field grows with the number of pieces in the torrent and outgrows the smallest permitted cap at around
+// 131,000 pieces, so charging the whole message to the limiter in one go would disconnect every peer of such a
+// torrent as soon as its bit field arrived, leaving it with no one to talk to.
+func TestBitFieldLargerThanTheRateCapIsAccepted(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+
+	// Enough pieces that the bit field message is larger than the smallest cap that may be set
+	const pieceCount = 140000
+	client := newTestClientForTorrent(d, newTestTorrentFileWithPieces(pieceCount))
+	defer client.closeRateLimiters()
+	c.NoError(DownloadCap(dispatcher.MinimumRateCap)(client))
+
+	conn, p, done := startTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+	bits := make([]byte, p.has.ByteLength())
+	for i := range bits {
+		bits[i] = 0xFF
+	}
+	c.True(len(bits)+5 > dispatcher.MinimumRateCap, "the bit field message must exceed the cap to be a test of it")
+
+	// The peer has everything and we have nothing, so it is answered with an interested message
+	_, err = conn.Write(newTestMessage(bitFieldID, bits...))
+	c.NoError(err)
+	c.NoError(conn.SetReadDeadline(time.Now().Add(msgReadDeadline)))
+	response := make([]byte, 5)
+	_, err = io.ReadFull(conn, response)
+	c.NoError(err)
+	c.Equal(newTestMessage(interestedID), response)
+
+	// Being charged for the message takes more than one period at this cap, so the connection has to survive the wait
+	select {
+	case <-done:
+		t.Fatal("the peer was dropped over a bit field larger than the rate cap")
+	case <-time.After(rateSettleTime):
+	}
+}
+
 // TestBitFieldSpareBitsAreIgnored verifies that a peer that sets the spare bits at the end of its bit field, which
 // correspond to pieces that don't exist, can't get us to request a piece index beyond the end of the torrent. Doing so
 // would panic when the piece it returned was validated against the piece hashes.
@@ -489,16 +530,18 @@ func TestOversizedMessageIsRejected(t *testing.T) {
 	d, err := dispatcher.NewDispatcher()
 	check.New(t).NoError(err)
 	defer d.Stop()
+	client := newTestClient(d)
+	limit := newTestPeerMessageLimit(t, client)
 	for _, one := range []struct {
 		name   string
 		length uint32
 	}{
-		{name: "one byte too large", length: maxMessageLength + 1},
+		{name: "one byte too large", length: limit + 1},
 		{name: "as large as the length prefix allows", length: math.MaxUint32},
 	} {
 		t.Run(one.name, func(t *testing.T) {
 			c := check.New(t)
-			conn, _, done := startTestPeer(t, newTestClient(d))
+			conn, _, done := startTestPeer(t, client)
 			defer xio.CloseIgnoringErrors(conn)
 			buffer := make([]byte, 4)
 			binary.BigEndian.PutUint32(buffer, one.length)
@@ -514,17 +557,51 @@ func TestOversizedMessageIsRejected(t *testing.T) {
 	}
 }
 
+// TestMessageLimitIsSizedForTheTorrent verifies that the limit tracks the torrent rather than being a single figure
+// large enough for the biggest torrent allowed. A peer on a torrent of a few pieces has no legitimate reason to send
+// a message larger than a piece message, and must not be able to make us allocate as if it did.
+func TestMessageLimitIsSizedForTheTorrent(t *testing.T) {
+	c := check.New(t)
+	d, err := dispatcher.NewDispatcher()
+	c.NoError(err)
+	defer d.Stop()
+
+	// A small torrent is held to the size of a piece message, the largest of the fixed-size messages
+	c.Equal(uint32(dispatcher.MaxPieceMessageLength-4), newTestPeerMessageLimit(t, newTestClient(d)))
+
+	// A torrent whose bit field is larger than that has the room its bit field actually needs, and no more
+	const pieceCount = 140000
+	client := newTestClientForTorrent(d, newTestTorrentFileWithPieces(pieceCount))
+	defer client.closeRateLimiters()
+	c.Equal(uint32(1+pieceCount/8), newTestPeerMessageLimit(t, client))
+
+	// The largest torrent that can be loaded still has a limit that is bounded and known
+	client = newTestClientForTorrent(d, newTestTorrentFileWithPieces(tfs.MaxPieceCount))
+	defer client.closeRateLimiters()
+	c.Equal(uint32(1+tfs.MaxPieceCount/8), newTestPeerMessageLimit(t, client))
+	c.Equal(uint32(262145), newTestPeerMessageLimit(t, client))
+}
+
+// newTestPeerMessageLimit returns the largest message length a peer of the given client will accept.
+func newTestPeerMessageLimit(t *testing.T, client *Client) uint32 {
+	t.Helper()
+	_, p := newTestPeer(t, client)
+	return p.maxMessageLength()
+}
+
 // TestLargestAllowedMessageIsAccepted verifies that the message size limit isn't off by one.
 func TestLargestAllowedMessageIsAccepted(t *testing.T) {
 	c := check.New(t)
 	d, err := dispatcher.NewDispatcher()
 	c.NoError(err)
 	defer d.Stop()
-	conn, _, done := startTestPeer(t, newTestClient(d))
+	client := newTestClient(d)
+	limit := newTestPeerMessageLimit(t, client)
+	conn, _, done := startTestPeer(t, client)
 	defer xio.CloseIgnoringErrors(conn)
 
 	// An unknown message ID is ignored, no matter how large it is, as long as it is within the limit
-	_, err = conn.Write(newTestMessage(200, make([]byte, maxMessageLength-1)...))
+	_, err = conn.Write(newTestMessage(200, make([]byte, limit-1)...))
 	c.NoError(err)
 	select {
 	case <-done:
@@ -1220,11 +1297,15 @@ func newTestConnPair(t *testing.T) (local, remote net.Conn) {
 }
 
 func newTestClient(d *dispatcher.Dispatcher) *Client {
+	return newTestClientForTorrent(d, newTestTorrentFile())
+}
+
+func newTestClientForTorrent(d *dispatcher.Dispatcher, torrentFile *tfs.File) *Client {
 	c := &Client{
 		InRate:              d.InRate.New(math.MaxInt32),
 		OutRate:             d.OutRate.New(math.MaxInt32),
 		dispatcher:          d,
-		torrentFile:         newTestTorrentFile(),
+		torrentFile:         torrentFile,
 		logger:              slog.New(slog.DiscardHandler),
 		peerWaitGroup:       &sync.WaitGroup{},
 		peerMgmtStop:        make(chan struct{}),
@@ -1238,10 +1319,14 @@ func newTestClient(d *dispatcher.Dispatcher) *Client {
 }
 
 func newTestTorrentFile() *tfs.File {
+	return newTestTorrentFileWithPieces(testPieceCount)
+}
+
+func newTestTorrentFileWithPieces(count int) *tfs.File {
 	var f tfs.File
 	f.Info.Name = "test"
 	f.Info.PieceLength = chunkSize
-	f.Info.Pieces = make([]byte, sha1Size*testPieceCount)
-	f.Info.Length = chunkSize * testPieceCount
+	f.Info.Pieces = make([]byte, sha1Size*count)
+	f.Info.Length = chunkSize * int64(count)
 	return &f
 }
