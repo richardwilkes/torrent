@@ -12,6 +12,7 @@ package main
 import (
 	"bufio"
 	"crypto/sha1" //nolint:gosec // The spec requires sha1
+	"errors"
 	"fmt"
 	"maps"
 	"os"
@@ -60,8 +61,15 @@ const (
 	exitHelperName = "TestStopAtExitHelper"
 	readyLine      = "registered"
 	stoppedLine    = "stopped"
+	extractedLine  = "extracted"
 
 	windowsOS = "windows"
+)
+
+// errExtractFailed and errRemoveFailed stand in for the extraction and removal of a torrent's files going wrong.
+var (
+	errExtractFailed = errors.New("unable to extract")
+	errRemoveFailed  = errors.New("unable to remove")
 )
 
 // TestMonitorStop verifies what is done when the client stops. The completion and stopped notifications are sent in
@@ -70,6 +78,8 @@ const (
 func TestMonitorStop(t *testing.T) {
 	for _, one := range []struct {
 		name             string
+		extractErr       error
+		removeErr        error
 		want             []string
 		remainingBytes   int64
 		state            torrent.State
@@ -110,6 +120,22 @@ func TestMonitorStop(t *testing.T) {
 			want:   nil,
 			wantOK: false,
 		},
+		{
+			// The storage is all that is left of the download when the extraction of it fails, so it has to stay put
+			// for another attempt rather than being removed along with everything else
+			name:       "the files could not be extracted",
+			state:      torrent.Done,
+			extractErr: errExtractFailed,
+			want:       []string{extractAction},
+			wantOK:     false,
+		},
+		{
+			name:      "the storage could not be removed",
+			state:     torrent.Done,
+			removeErr: errRemoveFailed,
+			want:      []string{extractAction, removeAction},
+			wantOK:    false,
+		},
 	} {
 		t.Run(one.name, func(t *testing.T) {
 			c := check.New(t)
@@ -124,14 +150,20 @@ func TestMonitorStop(t *testing.T) {
 				status: func() *torrent.Status {
 					return &torrent.Status{State: one.state, RemainingBytes: one.remainingBytes}
 				},
-				extract:   func() { actions = append(actions, extractAction) },
-				remove:    func() { actions = append(actions, removeAction) },
+				extract: func() error {
+					actions = append(actions, extractAction)
+					return one.extractErr
+				},
+				remove: func() error {
+					actions = append(actions, removeAction)
+					return one.removeErr
+				},
 				complete:  complete,
 				stopped:   stopped,
 				extracted: one.alreadyExtracted,
 			}
-			c.Equal(one.wantOK, m.run(), "a torrent that stopped with an error must be reported as such, so that "+
-				"the program can exit with a status that says the download failed")
+			c.Equal(one.wantOK, m.run(), "a torrent that stopped with an error, or that left nothing usable behind, "+
+				"must be reported as such, so that the program can exit with a status that says the download failed")
 			c.Equal(one.want, actions)
 		})
 	}
@@ -148,11 +180,12 @@ func TestMonitorCompleteThenStop(t *testing.T) {
 	var actions []string
 	m := &monitor{
 		status: func() *torrent.Status { return &torrent.Status{State: torrent.Done} },
-		extract: func() {
+		extract: func() error {
 			actions = append(actions, extractAction)
 			extracted <- struct{}{}
+			return nil
 		},
-		remove:   func() { actions = append(actions, removeAction) },
+		remove:   func() error { actions = append(actions, removeAction); return nil },
 		complete: complete,
 		stopped:  stopped,
 	}
@@ -177,28 +210,84 @@ func TestMonitorCompleteThenStop(t *testing.T) {
 }
 
 // TestStopAtExit verifies that the torrent is stopped when the program exits, which is what a Ctrl-C or a SIGTERM
-// turns into. Without it, the process dies where it stands: the tracker never receives the stopped announce, peers
-// are dropped mid-write and the client's shutdown never runs.
+// turns into, and that the exit then waits for the monitor to finish acting on that stop. Without the stop, the
+// process dies where it stands: the tracker never receives the stopped announce, peers are dropped mid-write and the
+// client's shutdown never runs. Without the wait, the os.Exit that follows kills the extraction the monitor performs
+// part way through, leaving truncated files behind that look complete.
 func TestStopAtExit(t *testing.T) {
 	c := check.New(t)
-	var registered func()
+	registered := registerStopAtExit(t, func(timeout time.Duration) { c.Equal(stopTimeout, timeout) },
+		make(chan struct{}), notifyWait)
+
+	returned := make(chan struct{})
+	go func() {
+		registered()
+		close(returned)
+	}()
+	select {
+	case <-returned:
+		t.Fatal("the exit did not wait for the monitor to finish with the torrent's files")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// TestStopAtExitResumesOnceTheMonitorIsDone verifies that the exit picks back up as soon as the monitor reports that
+// it has finished, rather than sitting out the whole of the time it was allowed to wait.
+func TestStopAtExitResumesOnceTheMonitorIsDone(t *testing.T) {
+	c := check.New(t)
 	stopped := make(chan time.Duration, 1)
+	finished := make(chan struct{})
+	registered := registerStopAtExit(t, func(timeout time.Duration) { stopped <- timeout }, finished, time.Hour)
+
+	returned := make(chan struct{})
+	go func() {
+		registered()
+		close(returned)
+	}()
+	select {
+	case timeout := <-stopped:
+		c.Equal(stopTimeout, timeout)
+	case <-time.After(notifyWait):
+		t.Fatal("the torrent was not stopped")
+	}
+	close(finished)
+	select {
+	case <-returned:
+	case <-time.After(notifyWait):
+		t.Fatal("the exit did not resume once the monitor had finished with the torrent's files")
+	}
+}
+
+// TestStopAtExitGivesUpWaitingForTheMonitor verifies that the wait for the monitor is bounded. Extraction that has
+// genuinely wedged must not leave someone who pressed Ctrl-C with a program that never exits.
+func TestStopAtExitGivesUpWaitingForTheMonitor(t *testing.T) {
+	registered := registerStopAtExit(t, func(_ time.Duration) {}, make(chan struct{}), time.Millisecond)
+
+	returned := make(chan struct{})
+	go func() {
+		registered()
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(notifyWait):
+		t.Fatal("the exit never gave up waiting for the monitor")
+	}
+}
+
+// registerStopAtExit registers the exit handling with a stand-in registrar and returns what was registered with it.
+func registerStopAtExit(t *testing.T, stop func(time.Duration), finished <-chan struct{}, wait time.Duration) func() {
+	t.Helper()
+	var registered func()
 	stopAtExit(func(f func()) int {
 		registered = f
 		return 1
-	}, func(timeout time.Duration) { stopped <- timeout })
+	}, stop, finished, wait)
 	if registered == nil {
 		// Fatal, since calling what wasn't registered would panic and take the whole test binary down with it
 		t.Fatal("nothing was registered to run when the program exits")
 	}
-
-	registered()
-	select {
-	case timeout := <-stopped:
-		c.Equal(stopTimeout, timeout)
-	default:
-		t.Fatal("the torrent was not stopped")
-	}
+	return registered
 }
 
 // TestStopAtExitRunsOnInterrupt verifies the whole chain a Ctrl-C travels: the signal handlers the registrar installs,
@@ -210,13 +299,22 @@ func TestStopAtExitRunsOnInterrupt(t *testing.T) {
 		t.Skip("interrupts cannot be sent to another process on this platform")
 	}
 	c := check.New(t)
+	// The checks that everything below rests on are fatal rather than the package's ordinary non-fatal ones: a test
+	// that carried on from any of them would reach the deferred kill with a nil cmd.Process and panic the whole test
+	// binary instead of reporting a clean failure
 	self, err := os.Executable()
-	c.NoError(err)
-	cmd := exec.Command(self, "-test.run=^"+exitHelperName+"$", "-test.timeout="+notifyWait.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(self, "-test.run=^"+exitHelperName+"$", "-test.timeout="+(2*notifyWait).String())
 	cmd.Env = append(os.Environ(), exitHelperEnv+"=1")
 	stdout, err := cmd.StdoutPipe()
-	c.NoError(err)
-	c.NoError(cmd.Start())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
 	lines := make(chan string, 32)
 	go func() {
 		defer close(lines)
@@ -235,6 +333,9 @@ func TestStopAtExitRunsOnInterrupt(t *testing.T) {
 
 	c.NoError(cmd.Process.Signal(os.Interrupt))
 	waitForLine(t, lines, stoppedLine)
+	// The exit handling has to hold the process open until the stand-in for the monitor has reported that it finished
+	// with the torrent's files, since the os.Exit that follows would otherwise cut an extraction off mid-copy
+	waitForLine(t, lines, extractedLine)
 }
 
 // waitForLine fails the test if the child process doesn't report the expected line promptly.
@@ -264,14 +365,24 @@ func TestStopAtExitHelper(t *testing.T) {
 	if os.Getenv(exitHelperEnv) != "1" {
 		t.Skip("only runs as the child process of TestStopAtExitRunsOnInterrupt")
 	}
+	// Stands in for the monitor, which only has the torrent's files to deal with once the stop has been made, and
+	// takes long enough over them that an exit which didn't wait would be gone before it had finished
+	stopped := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		<-stopped
+		time.Sleep(100 * time.Millisecond)
+		fmt.Println(extractedLine)
+		close(finished)
+	}()
 	stopAtExit(xos.RunAtExit, func(timeout time.Duration) {
-		if timeout != stopTimeout {
-			return
+		if timeout == stopTimeout {
+			fmt.Println(stoppedLine)
 		}
-		fmt.Println(stoppedLine)
-	})
+		close(stopped)
+	}, finished, notifyWait)
 	fmt.Println(readyLine)
-	time.Sleep(notifyWait) // The interrupt the parent is about to send is what ends this
+	time.Sleep(2 * notifyWait) // The interrupt the parent is about to send is what ends this
 }
 
 // newTorrentFile builds a torrent whose storage lives in the current directory and holds sampleContent. Only the part
@@ -279,18 +390,26 @@ func TestStopAtExitHelper(t *testing.T) {
 // extraction tests vary: either a length, for the single-file form, or a file list, for the multi-file one.
 func newTorrentFile(t *testing.T, name string, layout map[string]any) *tfs.File {
 	t.Helper()
-	c := check.New(t)
 	info := map[string]any{
 		"name":         name,
 		"piece length": int64(samplePieceLength),
 		piecesKey:      make([]byte, 40),
 	}
 	maps.Copy(info, layout)
+	// The checks here are fatal rather than the package's ordinary non-fatal ones: every caller goes straight on to
+	// use what is returned, so a test that carried on from a failure would dereference a nil file and panic the whole
+	// test binary instead of reporting a clean failure
 	data, err := bencode.EncodeBytes(map[string]any{"info": info})
-	c.NoError(err)
+	if err != nil {
+		t.Fatal(err)
+	}
 	f, err := tfs.NewFileFromBytes(data)
-	c.NoError(err)
-	c.NoError(os.WriteFile(f.StoragePath(), []byte(sampleContent), 0o600))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(f.StoragePath(), []byte(sampleContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	return f
 }
 
@@ -306,7 +425,7 @@ func TestExtractFiles(t *testing.T) {
 			map[string]any{lengthKey: int64(8), pathKey: []any{fileB}},
 		},
 	})
-	extractFiles(tf)
+	c.NoError(extractFiles(tf))
 
 	data, err := os.ReadFile(filepath.Join(torrentName, "sub", "a.txt"))
 	c.NoError(err)
@@ -323,7 +442,7 @@ func TestExtractFilesSingle(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	tf := newTorrentFile(t, "example.bin", map[string]any{lengthKey: int64(20)})
-	extractFiles(tf)
+	c.NoError(extractFiles(tf))
 
 	data, err := os.ReadFile("example.bin")
 	c.NoError(err)
@@ -340,7 +459,7 @@ func TestExtractFilesMultiFileWithOneEntry(t *testing.T) {
 	tf := newTorrentFile(t, torrentName, map[string]any{
 		filesKey: []any{map[string]any{lengthKey: int64(20), pathKey: []any{fileB}}},
 	})
-	extractFiles(tf)
+	c.NoError(extractFiles(tf))
 
 	data, err := os.ReadFile(filepath.Join(torrentName, fileB))
 	c.NoError(err)
@@ -362,12 +481,48 @@ func TestExtractFilesWithANameThatSanitizesAway(t *testing.T) {
 	tf := newTorrentFile(t, ".", map[string]any{
 		filesKey: []any{map[string]any{lengthKey: int64(20), pathKey: []any{fileB}}},
 	})
-	extractFiles(tf)
+	c.NoError(extractFiles(tf))
 
 	data, err := os.ReadFile(filepath.Join(sanitizePath(tf.Info.Name), fileB))
 	c.NoError(err)
 	c.Equal(sampleContent, string(data))
 	data, err = os.ReadFile(fileB)
+	c.NoError(err)
+	c.Equal(existing, string(data), "the file already in the current directory must not be overwritten")
+}
+
+// TestExtractFilesRefusesToExtractOverTheStorageFile verifies that a torrent naming its content after the storage file
+// it was downloaded into is refused rather than extracted. A single-file torrent's content lands directly in the
+// current directory, which is where its storage file lives too, and the torrent chooses the name: creating the target
+// would truncate the very file the extraction is reading out of, so the copy would see EOF, report a zero-byte file as
+// successfully extracted, and the download would be gone.
+func TestExtractFilesRefusesToExtractOverTheStorageFile(t *testing.T) {
+	c := check.New(t)
+	t.Chdir(t.TempDir())
+
+	tf := newTorrentFile(t, torrentName+tfs.DownloadExt, map[string]any{lengthKey: int64(len(sampleContent))})
+	c.Equal(torrentName+tfs.DownloadExt, tf.StoragePath(), "the torrent must name its content after its storage file")
+	c.HasError(extractFiles(tf), "extracting a torrent over its own storage file must be refused")
+
+	data, err := os.ReadFile(tf.StoragePath())
+	c.NoError(err)
+	c.Equal(sampleContent, string(data), "the storage file must still hold everything that was downloaded")
+}
+
+// TestExtractFilesDoesNotOverwriteAnExistingFile verifies that a file already sitting at the target is left alone
+// rather than being truncated to make room for the extraction. A single-file torrent's content lands directly in the
+// current directory, alongside whatever unrelated files of the caller's are there, and the torrent chooses the name.
+func TestExtractFilesDoesNotOverwriteAnExistingFile(t *testing.T) {
+	c := check.New(t)
+	t.Chdir(t.TempDir())
+	const existing = "do not overwrite me"
+	const target = torrentName + ".bin"
+	c.NoError(os.WriteFile(target, []byte(existing), 0o600))
+
+	tf := newTorrentFile(t, target, map[string]any{lengthKey: int64(len(sampleContent))})
+	c.HasError(extractFiles(tf), "a file already at the target must not be overwritten")
+
+	data, err := os.ReadFile(target)
 	c.NoError(err)
 	c.Equal(existing, string(data), "the file already in the current directory must not be overwritten")
 }

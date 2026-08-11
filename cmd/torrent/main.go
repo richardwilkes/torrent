@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/richardwilkes/toolbox/v2/errs"
 	"github.com/richardwilkes/toolbox/v2/xfilepath"
 	"github.com/richardwilkes/toolbox/v2/xflag"
 	"github.com/richardwilkes/toolbox/v2/xio"
@@ -38,6 +39,13 @@ import (
 // that was about to finish, while waiting longer would leave someone who pressed Ctrl-C staring at an unresponsive
 // program.
 const stopTimeout = 30 * time.Second
+
+// extractTimeout is how long the shutdown registered at exit will then wait for the monitor to finish acting on that
+// stop. Extraction copies the whole torrent out of its storage, which runs to minutes for a large one, and cutting
+// that short leaves truncated files behind that look complete, so the wait has to be long enough to cover an ordinary
+// copy. It is still bounded, since work that has genuinely wedged must not leave someone who pressed Ctrl-C with a
+// program that never exits.
+const extractTimeout = 5 * time.Minute
 
 func main() {
 	xos.AppName = "Simple Torrent"
@@ -100,32 +108,57 @@ func main() {
 		torrent.NotifyWhenStopped(stoppedNotifier),
 		torrent.SeedDuration(*seedDuration))
 	xos.ExitIfErr(err)
-	stopAtExit(xos.RunAtExit, c.Stop)
+	monitorDone := make(chan struct{})
+	stopAtExit(xos.RunAtExit, c.Stop, monitorDone, extractTimeout)
 
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
 	m := &monitor{
 		status:   c.Status,
-		extract:  func() { extractFiles(c.TorrentFile()) },
-		remove:   func() { xos.ExitIfErr(os.Remove(f.StoragePath())) },
+		extract:  func() error { return extractFiles(c.TorrentFile()) },
+		remove:   func() error { return os.Remove(f.StoragePath()) },
 		complete: completeNotifier,
 		stopped:  stoppedNotifier,
 		tick:     t.C,
 	}
-	if !m.run() {
+	ok := m.run()
+	// The exit handling waits on this, so it has to be closed before anything that can end the program is reached:
+	// xos.Exit parks any goroutine that calls it while an exit is already being handled, and this one parked with the
+	// monitor still marked as running would leave that wait to time out rather than finish.
+	close(monitorDone)
+	if !ok {
 		xos.Exit(1)
 	}
 	xos.Exit(0)
 }
 
-// stopAtExit arranges for the torrent to be stopped when the program exits. Registering the stop is what makes Ctrl-C
+// stopAtExit arranges for the torrent to be stopped when the program exits and for the exit to then wait, for at most
+// 'wait', until 'finished' says the monitor is done acting on that stop. Registering the stop is what makes Ctrl-C
 // (SIGINT) and SIGTERM shut a download down cleanly, since the registrar installs handlers for both that call
 // xos.Exit, which in turn runs what was registered here. Without it, a long-running download is killed where it
 // stands: the tracker never receives the stopped announce and goes on handing our dead address to peers, peers are
 // dropped mid-write, and the storage file is left open and unflushed rather than being closed by the client's
-// shutdown. The registrar is supplied by the caller so that what gets registered can be tested on its own.
-func stopAtExit(register func(func()) int, stop func(time.Duration)) {
-	register(func() { stop(stopTimeout) })
+// shutdown.
+//
+// Waiting for the monitor is what keeps that exit from cutting it off part way through. The monitor extracts the
+// torrent's files on its own goroutine while this runs on the one that took the signal, and the os.Exit that follows
+// this doesn't unwind the rest of the program: an interrupt arriving mid-copy would otherwise leave truncated files
+// behind that look complete, and one arriving just after would make it a coin toss whether the storage file those
+// files came from was removed at all.
+//
+// The registrar, the stop, the notification and the wait are all supplied by the caller so that what gets registered
+// can be tested on its own.
+func stopAtExit(register func(func()) int, stop func(time.Duration), finished <-chan struct{}, wait time.Duration) {
+	register(func() {
+		stop(stopTimeout)
+		timer := time.NewTimer(wait)
+		defer timer.Stop()
+		select {
+		case <-finished:
+		case <-timer.C:
+			slog.Warn("gave up waiting for the torrent's files to be dealt with", "timeout", wait)
+		}
+	})
 }
 
 // torrentFilePath returns the path of the torrent file to work with. Exactly one is required: only one torrent is
@@ -159,17 +192,23 @@ func portRangeOption(port uint64) (func(*dispatcher.Dispatcher) error, error) {
 // reached through the client, so that the handling of the notifications can be tested on its own.
 type monitor struct {
 	status    func() *torrent.Status
-	extract   func()
-	remove    func()
+	extract   func() error
+	remove    func() error
 	complete  <-chan *torrent.Client
 	stopped   <-chan *torrent.Client
 	tick      <-chan time.Time
 	extracted bool
+	failed    bool
 }
 
 // run processes notifications until the client stops, returning whether it stopped without error. A torrent that
-// stopped in the errored state left its download incomplete, which the caller has no way to react to if the program
-// reports success all the same.
+// stopped in the errored state left its download incomplete, and one whose files couldn't be extracted left nothing
+// usable behind; neither is something the caller can react to if the program reports success all the same.
+//
+// The failures of the side effects are recorded and reported here rather than exited on where they happen, since the
+// exit handling runs on the goroutine that took the signal and waits for this one: exiting from here while that wait
+// is under way parks this goroutine for good, since xos.Exit never returns to a caller that finds an exit already
+// being handled, leaving the wait to run out its timeout instead of ending as soon as the work was done.
 func (m *monitor) run() bool {
 	for {
 		select {
@@ -187,11 +226,16 @@ func (m *monitor) run() bool {
 				// and it may not even have sent the completion one yet, so the files may still be waiting to be
 				// extracted. They have to be, since the storage they came from is about to be removed.
 				m.extractIfNeeded()
+				// The storage is only given up once its content is safely somewhere else, so an extraction that
+				// failed leaves it in place to be unpacked another time rather than throwing the download away.
 				if m.extracted {
-					m.remove()
+					if err := m.remove(); err != nil {
+						errs.Log(err)
+						m.failed = true
+					}
 				}
 			}
-			return true
+			return !m.failed
 		case <-m.tick:
 			slog.Info(m.status().String())
 		}
@@ -200,10 +244,15 @@ func (m *monitor) run() bool {
 
 // extractIfNeeded extracts the torrent's files if the download has finished and they haven't been extracted already.
 func (m *monitor) extractIfNeeded() {
-	if !m.extracted && m.status().RemainingBytes == 0 {
-		m.extract()
-		m.extracted = true
+	if m.extracted || m.failed || m.status().RemainingBytes != 0 {
+		return
 	}
+	if err := m.extract(); err != nil {
+		errs.Log(err)
+		m.failed = true
+		return
+	}
+	m.extracted = true
 }
 
 // unpack extracts the torrent's files from storage that has already been downloaded, refusing to do so unless that
@@ -216,8 +265,7 @@ func unpack(tf *tfs.File) error {
 	if err := verifyStorageIsComplete(tf); err != nil {
 		return err
 	}
-	extractFiles(tf)
-	return nil
+	return extractFiles(tf)
 }
 
 // verifyStorageIsComplete returns an error unless every piece of the torrent is present in its storage and hashes to
@@ -244,7 +292,8 @@ func verifyStorageIsComplete(tf *tfs.File) error {
 	return nil
 }
 
-func extractFiles(tf *tfs.File) {
+// extractFiles copies the whole of the torrent's content out of its storage and into the local filesystem.
+func extractFiles(tf *tfs.File) error {
 	dir := "."
 	// By convention, a multi-file torrent's content goes into a directory named for the torrent while a single-file
 	// torrent's content goes directly into the current directory. Which form a torrent uses is determined by whether
@@ -255,7 +304,7 @@ func extractFiles(tf *tfs.File) {
 	}
 	// The torrent's info only carries the base name of each entry, so walk the tree to recover the paths that Open
 	// expects and that determine where each file lands on disk.
-	xos.ExitIfErr(fs.WalkDir(tf, ".", func(p string, d fs.DirEntry, err error) error {
+	return fs.WalkDir(tf, ".", func(p string, d fs.DirEntry, err error) error {
 		if err != nil || p == "." {
 			return err
 		}
@@ -266,11 +315,23 @@ func extractFiles(tf *tfs.File) {
 		}
 		slog.Info("extract", "file", target)
 		return extractFile(tf, p, target)
-	}))
+	})
 }
 
-// extractFile copies a single file out of the torrent's storage and into the local filesystem at target.
+// extractFile copies a single file out of the torrent's storage and into the local filesystem at target. The target is
+// created exclusively, so that nothing already sitting there is destroyed to make room for it: a single-file torrent's
+// content lands directly in the current directory, where unrelated files of the caller's live, and a torrent names its
+// own content, so an extraction is otherwise free to overwrite whatever it likes. That also covers the
+// case-insensitive filesystems macOS and Windows use, on which two entries differing only in letter case — which the
+// library's duplicate-path validation accepts as distinct — would silently clobber each other.
 func extractFile(tf *tfs.File, p, target string) error {
+	// The storage file is never a valid target. Creating the file exclusively already refuses it, but the collision is
+	// worth naming: what it would destroy is the download itself rather than some unrelated file, and it takes nothing
+	// more than a single-file torrent naming its content after the storage file to arrange it, at which point the copy
+	// below reads the truncated storage back as EOF and a zero-byte file is reported as successfully extracted.
+	if sameFile(target, tf.StoragePath()) {
+		return fmt.Errorf("refusing to extract %q over the torrent's own storage file %q", target, tf.StoragePath())
+	}
 	r, err := tf.Open(p)
 	if err != nil {
 		return err
@@ -281,7 +342,7 @@ func extractFile(tf *tfs.File, p, target string) error {
 			return err
 		}
 	}
-	f, err := os.Create(target)
+	f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}
@@ -290,6 +351,21 @@ func extractFile(tf *tfs.File, p, target string) error {
 		return err
 	}
 	return f.Close()
+}
+
+// sameFile reports whether both paths name the same existing file. Comparing the paths themselves would miss ones
+// spelled differently, ones reached through a link, and ones differing only in letter case on the case-insensitive
+// filesystems macOS and Windows use.
+func sameFile(a, b string) bool {
+	aInfo, err := os.Stat(a)
+	if err != nil {
+		return false
+	}
+	bInfo, err := os.Stat(b)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(aInfo, bInfo)
 }
 
 // sanitizePath makes each component of a slash-separated virtual path safe to use as a local filesystem path. The

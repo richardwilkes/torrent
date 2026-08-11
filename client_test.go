@@ -539,13 +539,21 @@ func TestPeerRankingDoesNotRacePeerCounters(t *testing.T) {
 	d := newTestDispatcher(t)
 	client := newTestClient(d)
 
-	// Fewer peers are wanted than we have, so both the ranking that finds a peer to make room with and the one that
-	// finds a peer to drop have something to sort
+	// Fewer peers are wanted than we have, so the ranking that finds a peer to make room with has something to sort
 	client.peersWanted = 1
 	peers := make([]*peer, 0, 3)
 	conns := make([]net.Conn, 0, 3)
-	for range cap(peers) {
+	for i := range cap(peers) {
 		conn, p := newTestPeer(t, client)
+		// Every peer is left delivering a piece for us, which is what keeps the rotation from acting on what it
+		// ranked: the sort runs on every pass, but the peer it puts first is one that is downloading, so no
+		// connection is closed to make room for the alternate and no dial is made for it either. A rotation that did
+		// act would stop the very goroutines this is racing against after the first pass.
+		p.lock.Lock()
+		p.peerChoking = false
+		p.lock.Unlock()
+		p.queuePieceDownload(i)
+		c.True(p.updateInterest().downloading)
 		peers = append(peers, p)
 		conns = append(conns, conn)
 	}
@@ -554,6 +562,17 @@ func TestPeerRankingDoesNotRacePeerCounters(t *testing.T) {
 			xio.CloseIgnoringErrors(conn)
 		}
 	}()
+
+	// The rotation ranking is only sorted when the tracker has given us an alternate we aren't already connected to.
+	// Without one, adjustPeers never reaches worseForRotation at all and a reintroduced unsynchronized read of the
+	// counters there would sail through this test, so the premise is checked rather than assumed.
+	setTrackerPeerAddresses(client, map[string]int{testDialHost: testPeerPort})
+	pd := make([]*peerData, 0, len(peers))
+	for _, p := range peers {
+		pd = append(pd, &peerData{peer: p})
+	}
+	c.Equal(1, len(client.dialCandidates(client.hostsInUse(pd))),
+		"the rotation ranking is only reached when there is an alternate to make room for")
 
 	// Update the counters the way each peer's own read and write goroutines do
 	stop := make(chan struct{})
@@ -575,6 +594,20 @@ func TestPeerRankingDoesNotRacePeerCounters(t *testing.T) {
 	}
 	for range 10 {
 		client.adjustPeers()
+	}
+	for _, conn := range conns {
+		checkConnOpen(t, conn, true)
+	}
+
+	// Hand the pieces back, so that the ranking that finds a peer to drop has something to sort as well: only peers
+	// that are neither downloading nor of any interest to us are considered for that one
+	for i, p := range peers {
+		p.lock.Lock()
+		delete(p.pieces, i)
+		p.lock.Unlock()
+		client.tracker.clearDownload(i, p)
+	}
+	for range 10 {
 		c.True(client.dropPeerIfPossible())
 	}
 	close(stop)
