@@ -59,15 +59,20 @@ var (
 )
 
 type tracker struct {
-	client           *Client
-	stopAnnounceChan chan bool
+	client *Client
+	// stopAnnounceChan is closed to tell the periodic announce goroutine to stop. It is closed rather than sent to
+	// because that goroutine may be in the middle of an HTTP announce, which is bounded only by the client's 30 second
+	// timeout: a send would hold up the caller — and with it the stopped announce, the close of the storage file and
+	// the stopped notification — until the request it is waiting on finished.
+	stopAnnounceChan chan struct{}
 	trackerLockData
 	// The transfer totals are reported in every announce and are updated by each peer's read and write goroutines, so
 	// they are kept as atomics rather than under the tracker lock, which those hot paths would otherwise contend on
 	// for every message.
-	uploadedBytes   atomic.Int64
-	downloadedBytes atomic.Int64
-	lock            sync.RWMutex
+	uploadedBytes    atomic.Int64
+	downloadedBytes  atomic.Int64
+	stopAnnounceOnce sync.Once
+	lock             sync.RWMutex
 }
 
 type trackerLockData struct {
@@ -110,7 +115,7 @@ func newTracker(client *Client) *tracker {
 	totalPieces := client.torrentFile.PieceCount()
 	return &tracker{
 		client:           client,
-		stopAnnounceChan: make(chan bool),
+		stopAnnounceChan: make(chan struct{}),
 		trackerLockData: trackerLockData{
 			totalBytes:     totalBytes,
 			remainingBytes: totalBytes,
@@ -255,8 +260,15 @@ func (t *tracker) announceStopped() error {
 	if !t.hasStarted() {
 		return nil
 	}
-	t.stopAnnounceChan <- true
+	t.stopPeriodicAnnounce()
 	return t.announce(stoppedMsg)
+}
+
+// stopPeriodicAnnounce tells the periodic announce goroutine to stop, whether it is waiting for its next turn or in
+// the middle of one, and without waiting for it either way. A goroutine that never ran, because the start announce
+// failed, simply has nothing to hear it.
+func (t *tracker) stopPeriodicAnnounce() {
+	t.stopAnnounceOnce.Do(func() { close(t.stopAnnounceChan) })
 }
 
 // announceInterval returns how long to wait before the next announce. The tracker's requested interval is bounded at
@@ -376,7 +388,12 @@ func (t *tracker) announce(event string) error {
 	if in.Interval > 0 {
 		t.interval = in.Interval
 	}
-	t.trackerID = in.TrackerID
+	// A tracker id, once issued, is ours to send back on every announce that follows, and a response that simply
+	// leaves the key out isn't taking it away. Clearing it there would drop the trackerid parameter from the rest of
+	// our announces and lose us the association a tracker that tracks sessions is keeping.
+	if in.TrackerID != "" {
+		t.trackerID = in.TrackerID
+	}
 	t.seeders = in.Seeders
 	t.leechers = in.Leechers
 	t.peerAddresses = peerAddresses

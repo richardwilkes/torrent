@@ -120,6 +120,17 @@ func TestParsePeersMalformed(t *testing.T) {
 	c.HasError(err)
 }
 
+// noPeersResponse is a tracker response carrying an interval and an empty peer list, which is everything an announce
+// needs and nothing more.
+const noPeersResponse = "d8:intervali1800e5:peers0:e"
+
+// overflowSeconds is the smallest interval, in seconds, whose conversion to a time.Duration overflows. The arithmetic
+// is done in int64 and only then narrowed, since letting math.MaxInt64 become an int is a constant that overflows the
+// type on a 32-bit platform, where this file would no longer compile at all. The clamp is for the same platform, where
+// no int is large enough to overflow a Duration in the first place, but where the largest one still has to be bounded
+// to the maximum announce interval.
+const overflowSeconds = int(min(int64(math.MaxInt), math.MaxInt64/int64(time.Second)+1))
+
 // TestAnnounceIntervalIsBounded verifies the wait between announces stays within sane limits no matter what the
 // tracker asks for. A value large enough to overflow the conversion to a time.Duration yields a negative delay, whose
 // timer fires immediately and turns the periodic announce into a tight loop of HTTP round trips.
@@ -138,7 +149,7 @@ func TestAnnounceIntervalIsBounded(t *testing.T) {
 		{name: "at the maximum", seconds: int(maxAnnounceInterval / time.Second), expected: maxAnnounceInterval},
 		{name: "beyond the maximum", seconds: 30 * 24 * 60 * 60, expected: maxAnnounceInterval},
 		{name: "overflows a duration", seconds: math.MaxInt, expected: maxAnnounceInterval},
-		{name: "just past the overflow point", seconds: math.MaxInt64/int(time.Second) + 1, expected: maxAnnounceInterval},
+		{name: "just past the overflow point", seconds: overflowSeconds, expected: maxAnnounceInterval},
 	} {
 		t.Run(one.name, func(t *testing.T) {
 			c := check.New(t)
@@ -282,7 +293,7 @@ func TestAnnounceKeepsTheIntervalWhenOneIsNotReturned(t *testing.T) {
 	c := check.New(t)
 	d := newTestDispatcher(t)
 	client, body := newTestTrackerClient(t, d)
-	*body = "d8:intervali1800e5:peers0:e"
+	*body = noPeersResponse
 
 	c.NoError(client.tracker.announce(startedMsg))
 	c.True(client.tracker.hasStarted())
@@ -295,6 +306,70 @@ func TestAnnounceKeepsTheIntervalWhenOneIsNotReturned(t *testing.T) {
 	// A failure reason is still an error for anything but the shutdown announce
 	*body = "d14:failure reason9:not founde"
 	c.HasError(client.tracker.announce(""))
+}
+
+// TestAnnounceKeepsTheTrackerID verifies that a tracker id we were issued is sent back on every announce that
+// follows, including the ones answered without one. A tracker that issues an id with the start response and leaves it
+// out of the rest — which BEP 3 allows, and says we must go on returning the id we were given — would otherwise stop
+// being told which session we are as soon as the next announce went out.
+func TestAnnounceKeepsTheTrackerID(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client, body := newTestTrackerClient(t, d)
+
+	*body = "d8:intervali1800e5:peers0:10:tracker id5:abcdee"
+	c.NoError(client.tracker.announce(startedMsg))
+	c.Contains(client.tracker.announceURL(""), "&trackerid=abcde")
+
+	// A response that simply leaves the key out isn't taking the id away
+	*body = noPeersResponse
+	c.NoError(client.tracker.announce(""))
+	c.Contains(client.tracker.announceURL(""), "&trackerid=abcde")
+
+	// A new id does replace it, and is escaped for the query it goes into
+	*body = "d8:intervali1800e5:peers0:10:tracker id5:a b&ce"
+	c.NoError(client.tracker.announce(""))
+	c.Contains(client.tracker.announceURL(""), "&trackerid=a+b%26c")
+
+	// A tracker that never issues one leaves the parameter out entirely
+	client, body = newTestTrackerClient(t, d)
+	*body = noPeersResponse
+	c.NoError(client.tracker.announce(startedMsg))
+	c.NotContains(client.tracker.announceURL(""), "trackerid")
+}
+
+// TestStopAnnounceDoesNotWaitForThePeriodicAnnounce verifies that stopping doesn't have to wait for an announce that
+// is already under way. The periodic announce goroutine spends up to the 30 second HTTP timeout inside a single
+// request, and the stop being handed to it directly would hold up the stopped announce, the close of the storage file
+// and the stopped notification for all of that time, well beyond the timeout the caller gave Stop.
+func TestStopAnnounceDoesNotWaitForThePeriodicAnnounce(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client, body := newTestTrackerClient(t, d)
+	*body = noPeersResponse
+	c.NoError(client.tracker.announce(startedMsg))
+
+	// Nothing is listening for the stop, which is exactly the state the periodic announce is in for as long as one of
+	// its own requests is outstanding
+	stopped := make(chan error, 1)
+	go func() { stopped <- client.tracker.announceStopped() }()
+	select {
+	case err := <-stopped:
+		c.NoError(err)
+	case <-time.After(peerMgmtWait):
+		t.Fatal("the stopped announce waited on the periodic announce")
+	}
+	c.False(client.tracker.hasStarted())
+
+	// The stop is still there to be found by a periodic announce that only looks afterwards, rather than having been
+	// consumed by whoever happened to be listening first
+	returned := make(chan struct{})
+	go func() { defer close(returned); client.tracker.periodicAnnounce() }()
+	select {
+	case <-returned:
+	case <-time.After(peerMgmtWait):
+		t.Fatal("the periodic announce never saw the stop")
+	}
 }
 
 // newTestTrackerClient returns a client whose announces go to a stub tracker, along with a pointer to the response

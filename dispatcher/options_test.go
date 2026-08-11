@@ -10,6 +10,7 @@
 package dispatcher
 
 import (
+	"log/slog"
 	"math"
 	"testing"
 	"time"
@@ -20,6 +21,18 @@ import (
 // rateSettleTime is how long a test will wait for a rate limiter request that can never be satisfied to prove it isn't
 // going to be. It must be longer than the one second period the limiters use, so that the request is reconsidered.
 const rateSettleTime = 2500 * time.Millisecond
+
+// TestLogToReplacesTheDefaultLogger verifies both halves of what LogTo documents: that a dispatcher nobody gave a
+// logger to writes to the process's default logger, and that supplying one puts it in place of that. A caller has to
+// be able to trust which of the two it gets, since the dispatcher logs accept failures and a line apiece for starting
+// and stopping listening.
+func TestLogToReplacesTheDefaultLogger(t *testing.T) {
+	c := check.New(t)
+	c.Equal(slog.Default(), newTestDispatcher(t).Logger())
+
+	logger := slog.New(slog.DiscardHandler)
+	c.Equal(logger, newTestDispatcher(t, LogTo(logger)).Logger())
+}
 
 // TestGlobalRateCapsTooSmallForAPieceMessageAreRejected verifies that a global cap which would stall every client
 // using the dispatcher isn't accepted in the first place.

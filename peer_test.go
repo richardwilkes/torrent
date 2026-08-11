@@ -333,15 +333,30 @@ func TestDuplicateChunksDoNotRenewTheDownloadDeadline(t *testing.T) {
 	c.True(renewed.After(deadline), "a chunk with new data must renew the deadline for the piece")
 	c.True(renewedReceived.After(received), "a chunk with new data must count as progress for the peer")
 
-	// With the deadline no longer being renewed, the piece is given up and the peer dropped
+	// With the deadline no longer being renewed, the piece is given up. This peer is choking us, so it was told to
+	// discard what we asked it for and having nothing to show for the piece isn't something it can be blamed for: the
+	// connection is kept.
 	one.lock.Lock()
 	one.timeout = time.Now().Add(-time.Second)
 	one.lock.Unlock()
 	p.clearExpiredDownloads()
 	p.lock.RLock()
 	remaining := len(p.pieces)
+	bailing := p.bail
 	p.lock.RUnlock()
 	c.Equal(0, remaining, "the piece must be given up once its deadline passes")
+	c.False(bailing, "a peer that is choking us must not be dropped for failing to deliver")
+
+	// The same expiry for a peer that was free to send us data all along is what drops it
+	p.lock.Lock()
+	p.peerChoking = false
+	p.pieces[0] = &piece{buffer: make([]byte, chunkSize), timeout: time.Now().Add(-time.Second)}
+	p.lock.Unlock()
+	p.clearExpiredDownloads()
+	p.lock.RLock()
+	bailing = p.bail
+	p.lock.RUnlock()
+	c.True(bailing, "a peer that was free to deliver and didn't must be dropped")
 }
 
 // downloadDeadline returns the deadline for the given piece along with the last time the peer made progress.
@@ -478,6 +493,41 @@ func TestResumeOnlyAsksForTheChunksThatAreMissing(t *testing.T) {
 	timeout := one.timeout
 	one.lock.RUnlock()
 	c.True(timeout.After(time.Now()), "the deadline for the piece must be restarted")
+}
+
+// TestKeepAliveIsAnchoredToTheLastWrite verifies that the wait for the next keep-alive runs from the last thing we
+// put on the wire rather than from the previous attempt at one. A keep-alive that finds a write has just happened is
+// dropped as unnecessary, so measuring from the attempt leaves the next one a full period further out and lets the
+// wire go quiet for nearly 2×keepAlivePeriod. That is past the 2m30s this library itself waits for a message before
+// dropping the connection — and blocking the address for five minutes, since a read timeout is neither a peer hanging
+// up nor a connection we closed — and past the two minutes typical clients allow.
+func TestKeepAliveIsAnchoredToTheLastWrite(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	conn, p := newTestPeer(t, newTestClient(d))
+	defer xio.CloseIgnoringErrors(conn)
+
+	// A connection that has yet to send anything counts as quiet since it was made, so its first keep-alive is a full
+	// period out
+	c.Equal(p.created, p.lastWrite())
+	c.Equal(keepAlivePeriod, p.keepAliveDelay(p.created))
+
+	now := time.Now()
+
+	for _, quiet := range []time.Duration{
+		0, time.Second, keepAlivePeriod / 2, keepAlivePeriod - time.Millisecond, keepAlivePeriod, 2 * keepAlivePeriod,
+	} {
+		p.setLastWrite(now.Add(-quiet))
+		expected := max(keepAlivePeriod-quiet, 0)
+		c.Equal(expected, p.keepAliveDelay(now), "quiet for %v", quiet)
+	}
+
+	// The case the anchoring is for: a message goes out just after a keep-alive did, so the keep-alive coming due at
+	// the end of that period is dropped as unnecessary. What follows has to be due a period after that message — a
+	// second from now here — rather than a period after the attempt that was dropped.
+	p.setLastWrite(now.Add(time.Second - keepAlivePeriod))
+	c.True(now.Sub(p.lastWrite()) < keepAlivePeriod, "the keep-alive coming due now would be dropped as unnecessary")
+	c.Equal(time.Second, p.keepAliveDelay(now))
 }
 
 // TestReadDeadlines verifies that we're willing to wait longer than the keep-alive period for the next message from a
@@ -703,6 +753,68 @@ func TestPieceRequestForPieceWeDontHaveIsIgnored(t *testing.T) {
 	}
 }
 
+// TestChokingDiscardsQueuedPieceRequests verifies that the requests a peer made before we choked it are thrown away
+// rather than served once the queue in front of them clears. BEP 3 has the choked side treat everything it asked for
+// as discarded, so the up to 512 requests we're willing to hold — some 8MB of piece data — would otherwise be
+// uploaded to a peer we had just choked, and counted as wasted by the remote when it arrived. Shedding that upload is
+// the entire point of choking it.
+func TestChokingDiscardsQueuedPieceRequests(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	client.file = newTestStorage(t, client)
+	markTestPiecesAvailable(client, 0, 1, 2, 3)
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+	p.setChoked(false)
+	go p.pieceRequestQueue()
+
+	// Fill the write queue, so that the responses have nowhere to go and the requests pile up behind them. That is
+	// both the state that has us choking a peer in the first place and the one in which its requests are still there
+	// to be served later. The count stays well short of the flood limit, which would disconnect the peer for an
+	// entirely different reason.
+	for range cap(p.writeQueue) {
+		p.writeQueue <- make([]byte, 4)
+	}
+	const requests = maxPendingPieceRequests / 2
+	for i := range requests {
+		p.requestChan <- &pieceRequest{index: i % testPieceCount, length: chunkSize}
+	}
+	p.setChoked(true)
+
+	// Nothing else is being sent to the queue and its responses still have nowhere to go, so taking in the choke is
+	// the only thing left for it to do
+	time.Sleep(50 * time.Millisecond)
+
+	// Unchoking must not bring back the requests the peer was told to treat as discarded: the only response that may
+	// still arrive is the one already prepared when the write queue filled up
+	p.setChoked(false)
+	served := drainPieceMessages(t, p)
+	c.True(served <= 1, "%d of the %d requests made before choking were served", served, requests)
+
+	// A request that arrives while we're choking isn't served either, however it got to the queue
+	p.setChoked(true)
+	p.requestChan <- &pieceRequest{index: 0, length: chunkSize}
+	c.Equal(0, drainPieceMessages(t, p), "a request must not be served while we're choking the peer")
+}
+
+// drainPieceMessages returns the number of piece messages the peer has queued up for writing, once none have arrived
+// for long enough to say that no more are coming.
+func drainPieceMessages(t *testing.T, p *peer) int {
+	t.Helper()
+	count := 0
+	for {
+		select {
+		case buffer := <-p.writeQueue:
+			if len(buffer) > 4 && buffer[4] == pieceID {
+				count++
+			}
+		case <-time.After(250 * time.Millisecond):
+			return count
+		}
+	}
+}
+
 // TestPieceRequestFloodIsRejected verifies that a peer that asks for far more than we can deliver is disconnected
 // rather than allowed to grow the pending request queue without bound.
 func TestPieceRequestFloodIsRejected(t *testing.T) {
@@ -792,6 +904,46 @@ func TestUpdateInterestIsSerialized(t *testing.T) {
 	amInterested := p.amInterested
 	p.lock.RUnlock()
 	c.Equal(amInterested, sent[len(sent)-1][4] == interestedID, "the last message must match the interest we recorded")
+}
+
+// TestUpdateInterestDoesNotRecordAStaleDecision verifies that an interest update can't overwrite what one that looked
+// at the peer more recently decided. The decision is made from a snapshot and recorded afterwards, and both the
+// goroutine reading messages from the peer and the one managing peers make it, so an update that started earlier
+// finishing later would leave our stated interest contradicting what the peer has told us it has, with nothing to
+// correct it until the next peer adjustment 15 seconds later.
+func TestUpdateInterestDoesNotRecordAStaleDecision(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+
+	// Deciding whether a peer has anything we want needs the tracker's lock, so holding it parks an update that has
+	// already taken its snapshot of the peer, which at this point holds nothing of interest to us
+	client.tracker.lock.Lock()
+	first := make(chan struct{})
+	go func() { defer close(first); p.updateInterest() }()
+
+	// A second update starts while the first is still parked. The waits are only here to give each goroutine time to
+	// reach the point it will block at; whether they are long enough decides whether a stale decision could be
+	// recorded, not whether a fresh one is.
+	time.Sleep(50 * time.Millisecond)
+	second := make(chan struct{})
+	go func() { defer close(second); p.updateInterest() }()
+	time.Sleep(50 * time.Millisecond)
+
+	// The peer tells us it has a piece we need, which only an update that has yet to look at the peer can take in
+	p.lock.Lock()
+	p.has.Set(0)
+	p.lock.Unlock()
+	client.tracker.lock.Unlock()
+
+	<-first
+	<-second
+	p.lock.RLock()
+	amInterested := p.amInterested
+	p.lock.RUnlock()
+	c.True(amInterested, "the peer has a piece we need, so the interest recorded last must say we want it")
 }
 
 // collectStateMessages returns the messages the peer's state delivery goroutine has queued up, waiting until what the

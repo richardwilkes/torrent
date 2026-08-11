@@ -81,13 +81,20 @@ const (
 )
 
 type peer struct {
-	client      *Client
-	logger      *slog.Logger
-	conn        net.Conn
-	created     time.Time
-	has         *fixedbits.Bits
-	requestChan chan *pieceRequest
-	writeQueue  chan []byte
+	client *Client
+	logger *slog.Logger
+	conn   net.Conn
+	// lastWriteTime is when we last put something on the wire for this peer, which is what the keep-alive is measured
+	// from. Protected by lock.
+	lastWriteTime time.Time
+	created       time.Time
+	has           *fixedbits.Bits
+	requestChan   chan *pieceRequest
+	writeQueue    chan []byte
+	// chokedChan tells the goroutine holding this peer's outstanding piece requests that we have begun choking it, so
+	// that it can discard them. It has a capacity of one and is only ever sent to without blocking, since it says
+	// nothing more than that our choking state is worth looking at again.
+	chokedChan chan struct{}
 	// stateChanged tells the goroutine that delivers our state to the peer that there is something pending. It has a
 	// capacity of one and is only ever sent to without blocking, since all that goroutine needs to know is that
 	// something is waiting for it and it re-reads all of the pending state each time it wakes.
@@ -102,6 +109,10 @@ type peer struct {
 	toldChoking    bool
 	toldInterested bool
 	lock           sync.RWMutex
+	// interestLock serializes updateInterest from end to end. It is deliberately not the lock above, since the
+	// decision has to be made with the tracker's lock in hand and taking that one while holding the peer's would
+	// order the two.
+	interestLock sync.Mutex
 }
 
 type pieceRequest struct {
@@ -176,16 +187,21 @@ type piece struct {
 }
 
 func newPeer(client *Client, conn net.Conn, logger *slog.Logger) *peer {
+	now := time.Now()
 	return &peer{
-		client:       client,
-		logger:       logger,
-		conn:         conn,
-		created:      time.Now(),
-		has:          fixedbits.New(client.torrentFile.PieceCount()),
-		requestChan:  make(chan *pieceRequest),
-		writeQueue:   make(chan []byte, 32),
-		stateChanged: make(chan struct{}, 1),
-		pieces:       make(map[int]*piece),
+		client: client,
+		logger: logger,
+		conn:   conn,
+		// A connection that has yet to send anything has been quiet since it was made, so that is where the wait for
+		// the first keep-alive starts.
+		lastWriteTime: now,
+		created:       now,
+		has:           fixedbits.New(client.torrentFile.PieceCount()),
+		requestChan:   make(chan *pieceRequest),
+		writeQueue:    make(chan []byte, 32),
+		chokedChan:    make(chan struct{}, 1),
+		stateChanged:  make(chan struct{}, 1),
+		pieces:        make(map[int]*piece),
 		// Both ends of a new connection start out choked and uninterested, so there is nothing to tell the peer about
 		// until one of those changes.
 		toldChoking: true,
@@ -226,9 +242,14 @@ func (s *peerState) downloadStalled(now time.Time) bool {
 // updateInterest recomputes whether we're interested in what this peer has, records it, and makes sure the peer gets
 // told about any change. It is called from both the goroutine reading messages from the peer and the one managing
 // peers, so amInterested is only ever recorded while the lock is held and the delivery of the message is left to
-// processStateChanges.
+// processStateChanges. The whole of it is serialized as well, since the decision is made from a snapshot and recorded
+// afterwards: two callers left to interleave can have the one that looked first record last, leaving us claiming an
+// interest that contradicts what the peer has until something recomputes it, which may not be until the next peer
+// adjustment 15 seconds later.
 func (p *peer) updateInterest() peerState {
 	p.clearExpiredDownloads()
+	p.interestLock.Lock()
+	defer p.interestLock.Unlock()
 	p.lock.RLock()
 	has := p.has.Clone()
 	downloading := len(p.pieces) > 0
@@ -247,7 +268,9 @@ func (p *peer) updateInterest() peerState {
 }
 
 // setChoked records whether we're choking the peer, leaving the delivery of the message saying so to
-// processStateChanges.
+// processStateChanges. Beginning to choke also tells the queue of outstanding piece requests to throw them away: BEP 3
+// has the choked side treat everything it asked for as discarded, so serving those requests afterwards spends our
+// upload bandwidth on data the remote counts as wasted, which is the opposite of what choking it was for.
 func (p *peer) setChoked(choked bool) {
 	p.lock.Lock()
 	changed := p.amChoking != choked
@@ -255,7 +278,20 @@ func (p *peer) setChoked(choked bool) {
 	p.lock.Unlock()
 	if changed {
 		p.signalStateChange()
+		if choked {
+			select {
+			case p.chokedChan <- struct{}{}:
+			default:
+			}
+		}
 	}
+}
+
+// isChoking returns whether we're currently choking the peer, which is to say refusing to serve what it asks us for.
+func (p *peer) isChoking() bool {
+	p.lock.RLock()
+	defer p.lock.RUnlock()
+	return p.amChoking
 }
 
 // queueHave records that the peer has yet to be told that we now have the given piece, leaving the delivery of the
@@ -523,10 +559,7 @@ func (p *peer) processIncomingMessages() {
 					p.client.dispatcher.GateKeeper().BlockAddress(p.conn.RemoteAddr())
 					return
 				}
-				p.lock.RLock()
-				canRequest := !p.amChoking
-				p.lock.RUnlock()
-				if canRequest {
+				if !p.isChoking() {
 					p.requestChan <- req
 				}
 			case pieceID:
@@ -780,8 +813,15 @@ func (p *peer) pieceRequestQueue() {
 		var req *pieceRequest
 		var ok bool
 		if next := queue.next(); next == nil {
-			if req, ok = <-p.requestChan; !ok {
-				return
+			select {
+			case req, ok = <-p.requestChan:
+				if !ok {
+					return
+				}
+			case <-p.chokedChan:
+				// Nothing is being held, so there is nothing to discard, but the signal still has to be taken out of
+				// the way of the one that a later choke will send.
+				continue
 			}
 		} else {
 			select {
@@ -793,6 +833,14 @@ func (p *peer) pieceRequestQueue() {
 					}
 					return
 				}
+			case <-p.chokedChan:
+				// The state is re-read rather than trusted to the signal, which may have been sent for a choke that
+				// has since been lifted: discarding requests that arrived after the unchoke would leave the peer
+				// waiting on data that is never coming and never asked for again.
+				if p.isChoking() {
+					queue = newPendingRequests()
+				}
+				continue
 			case queueChan <- next:
 				queue.removeNext()
 				continue
@@ -813,6 +861,11 @@ func (p *peer) processPieceRequests(in chan *pieceRequest) {
 	process := true
 	for req := range in {
 		if !process {
+			continue
+		}
+		if p.isChoking() {
+			// The peer was told to treat everything it had asked us for as discarded, so a request that was already
+			// on its way through here when we began choking is dropped rather than served.
 			continue
 		}
 		if !p.client.tracker.hasPiece(req.index) {
@@ -846,20 +899,22 @@ func (p *peer) processPieceRequests(in chan *pieceRequest) {
 }
 
 func (p *peer) processWriteQueue(done chan bool) {
-	var lastWriteTime time.Time
 	go p.keepAlive(done)
 	for buffer := range p.writeQueue {
 		var err error
 		if buffer != nil {
 			if len(buffer) == 4 {
-				if time.Since(lastWriteTime) < keepAlivePeriod {
+				// A keep-alive that finds the wire hasn't actually been quiet is dropped, since anything else we sent
+				// within the last keepAlivePeriod has already told the remote we're still here. The goroutine that
+				// queues them measures from that write rather than from this attempt, so nothing is pushed out.
+				if time.Since(p.lastWrite()) < keepAlivePeriod {
 					continue
 				}
 			} else {
 				err = useRate(p.client.OutRate, len(buffer))
 			}
 			if err == nil {
-				lastWriteTime = time.Now()
+				p.setLastWrite(time.Now())
 				err = tio.WriteWithDeadline(p.conn, buffer, msgWriteDeadline)
 			}
 		}
@@ -888,15 +943,50 @@ func (p *peer) processWriteQueue(done chan bool) {
 	close(done)
 }
 
+// keepAlive queues a keep-alive whenever the connection is about to have been quiet for a full keepAlivePeriod. The
+// wait runs from the last thing we actually wrote rather than from the previous attempt, because processWriteQueue
+// drops a keep-alive that a recent write has already made unnecessary: measured from the attempt, a write early in one
+// period would suppress the keep-alive at the end of it and leave the next one a full period further out, stretching
+// the silence to nearly 2×keepAlivePeriod. That is past the 2m30s we ourselves are willing to wait for a message, and
+// past the two minutes typical clients allow, so an idle but perfectly healthy connection gets dropped — and by a
+// remote running this same library, blocked for five minutes on top of it, since a read timeout is neither EOF nor a
+// connection we closed.
 func (p *peer) keepAlive(done chan bool) {
 	for {
 		select {
-		case <-time.After(keepAlivePeriod):
-			p.writeQueue <- make([]byte, 4)
+		case <-time.After(p.keepAliveDelay(time.Now())):
+			select {
+			case p.writeQueue <- make([]byte, 4):
+			case <-done:
+				return
+			}
 		case <-done:
 			return
 		}
 	}
+}
+
+// keepAliveDelay returns how long is left before the connection will have been quiet for keepAlivePeriod, which is
+// when the next keep-alive is due. Zero means one is due now.
+func (p *peer) keepAliveDelay(now time.Time) time.Duration {
+	if delay := keepAlivePeriod - now.Sub(p.lastWrite()); delay > 0 {
+		return delay
+	}
+	return 0
+}
+
+// lastWrite returns when we last put something on the wire for this peer.
+func (p *peer) lastWrite() time.Time {
+	p.lock.RLock()
+	defer p.lock.RUnlock()
+	return p.lastWriteTime
+}
+
+// setLastWrite records that something is going out on the wire for this peer now.
+func (p *peer) setLastWrite(when time.Time) {
+	p.lock.Lock()
+	p.lastWriteTime = when
+	p.lock.Unlock()
 }
 
 func (p *peer) clearExpiredDownloads() {

@@ -52,7 +52,9 @@ func FixedExternalIP(ip net.IP) func(*Dispatcher) error {
 	}
 }
 
-// LogTo sets the logger the dispatcher should use. Default discards logs.
+// LogTo sets the logger the dispatcher should use. Default is slog.Default(), so a caller that wants the dispatcher's
+// logging — accept failures, and the lines saying we started and stopped listening — kept off of the process's default
+// logger has to say where it should go instead, which may be a logger built on slog.DiscardHandler.
 func LogTo(logger *slog.Logger) func(*Dispatcher) error {
 	return func(d *Dispatcher) error {
 		d.logger = logger

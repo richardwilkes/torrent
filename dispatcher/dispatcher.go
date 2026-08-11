@@ -44,6 +44,12 @@ const (
 	// from turning into a tight loop, while still recovering from it promptly once it clears.
 	minAcceptRetryDelay = 5 * time.Millisecond
 	maxAcceptRetryDelay = time.Second
+	// maxPendingHandshakes is the number of accepted connections that may be working through their handshake at the
+	// same time. Each one holds a socket and a goroutine for roughly 15 to 25 seconds — the three sequential reads of
+	// ReceiveTorrentHandshake, plus the handshake write and peer ID read the handler makes — before any peer count
+	// limit applies to it, so without a bound here a flood of connections that never say anything runs the process
+	// out of file descriptors, which breaks outbound dials and disk I/O along with the accept loop.
+	maxPendingHandshakes = 128
 )
 
 // ConnectionHandler defines the interface for handling torrent connections.
@@ -62,10 +68,14 @@ type Dispatcher struct {
 	handlers            sync.Map
 	lastExternalIPCheck time.Time // protected by lock
 	externalIP          net.IP    // protected by lock
-	internalPort        uint32
-	externalPort        uint32
-	externalIPProbing   bool // protected by lock
-	lock                sync.Mutex
+	// pendingHandshakes counts the accepted connections that have yet to finish handshaking. It is an atomic rather
+	// than lock-protected state because the accept loop touches it for every connection and each dispatch goroutine
+	// touches it again on its way out.
+	pendingHandshakes atomic.Int32
+	internalPort      uint32
+	externalPort      uint32
+	externalIPProbing bool // protected by lock
+	lock              sync.Mutex
 }
 
 // NewDispatcher creates a new dispatcher and starts listening for
@@ -254,7 +264,20 @@ func (d *Dispatcher) listen() {
 			continue
 		}
 		retryDelay = 0
-		go d.dispatch(conn)
+		if d.pendingHandshakes.Add(1) > maxPendingHandshakes {
+			// We're already holding as many un-handshaken connections as we're willing to. Hanging up returns the
+			// descriptor immediately and leaves the remote free to try again, which is a great deal better than
+			// letting connections that may never say anything accumulate until nothing else can open a file either.
+			d.pendingHandshakes.Add(-1)
+			d.logger.Debug("refused connection", "remote_addr", conn.RemoteAddr().String(),
+				"pending_handshakes", maxPendingHandshakes)
+			xio.CloseIgnoringErrors(conn)
+			continue
+		}
+		go func() {
+			defer d.pendingHandshakes.Add(-1)
+			d.dispatch(conn)
+		}()
 	}
 }
 

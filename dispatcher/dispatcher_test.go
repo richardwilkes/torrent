@@ -15,6 +15,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
 	"reflect"
 	"runtime"
 	"strconv"
@@ -28,6 +29,7 @@ import (
 	"github.com/richardwilkes/toolbox/v2/errs"
 	"github.com/richardwilkes/toolbox/v2/xio"
 	"github.com/richardwilkes/toolbox/v2/xnet"
+	"github.com/richardwilkes/torrent/tfs"
 )
 
 // goroutineWait is how long a test will wait for goroutines started by a failed constructor to go away. Anything
@@ -177,20 +179,26 @@ func TestListenerAcceptsWhileTheExternalIPIsBeingDetermined(t *testing.T) {
 // leave the listener open with nothing accepting from it, silently losing inbound connectivity for good.
 func TestAcceptRetriesTransientErrors(t *testing.T) {
 	c := check.New(t)
-	local, remote := net.Pipe()
-	defer xio.CloseIgnoringErrors(local)
+	local, remote := newAddressedPipe(t)
 	listener := &scriptedListener{script: []acceptResult{
 		{err: syscall.EMFILE},
 		{err: syscall.ENFILE},
 		{conn: remote},
 	}}
-	d := &Dispatcher{
-		listener:         listener,
-		logger:           slog.New(slog.DiscardHandler),
-		gatekeeper:       NewGateKeeper(),
-		lookupExternalIP: func(_ context.Context, _ time.Duration) net.IP { return nil },
-	}
+	d := newScriptedDispatcher(listener)
 	defer d.gatekeeper.Close()
+
+	// A handler of our own, so that the connection reaching it is what says it was dispatched. Without one, a
+	// connection refused before the handshake — which is what the gatekeeper does with an address it can't parse —
+	// would be closed just the same, and the test would pass whether dispatch worked or not.
+	infoHash := tfs.InfoHash{1, 2, 3}
+	dispatched := make(chan tfs.InfoHash, 1)
+	d.Register(infoHash, handlerFunc(func(_ net.Conn, _ *slog.Logger, _ ProtocolExtensions, hash tfs.InfoHash,
+		sendHandshake bool,
+	) {
+		c.True(sendHandshake, "an inbound connection is still owed a handshake of our own")
+		dispatched <- hash
+	}))
 
 	stopped := make(chan struct{})
 	go func() {
@@ -198,10 +206,18 @@ func TestAcceptRetriesTransientErrors(t *testing.T) {
 		d.listen()
 	}()
 
-	// The connection accepted after the transient failures must still be dispatched, which closes it
+	// The connection accepted after the transient failures must still be dispatched to its handler. The handshake is
+	// written from a goroutine because the handler doesn't read the peer ID that trails it, so the last of it stays
+	// unread until the dispatch is over and the connection closed.
 	c.NoError(local.SetDeadline(time.Now().Add(goroutineWait)))
-	_, err := local.Read(make([]byte, 1))
-	c.HasError(err, "the connection accepted after the transient failures was never dispatched")
+	sent := make(chan error, 1)
+	go func() { sent <- SendTorrentHandshake(local, ProtocolExtensions{}, infoHash, PeerID{}) }()
+	select {
+	case hash := <-dispatched:
+		c.Equal(infoHash, hash)
+	case <-time.After(goroutineWait):
+		t.Fatal("the connection accepted after the transient failures was never dispatched")
+	}
 
 	// Only the listener being closed, which the script reports once it has been used up, ends the loop
 	select {
@@ -210,6 +226,91 @@ func TestAcceptRetriesTransientErrors(t *testing.T) {
 		t.Fatal("the accept loop never stopped")
 	}
 	c.Equal(len(listener.script)+1, listener.accepts(), "every scripted result must have been consumed")
+}
+
+// TestPendingHandshakesAreBounded verifies that connections which have been accepted but haven't handshaken yet can't
+// pile up without limit. Each one holds a socket and a goroutine for tens of seconds before any peer count limit
+// applies to it, so a flood of remotes that connect and then say nothing would otherwise run us out of file
+// descriptors, taking outbound dials and disk I/O down with the accept loop.
+func TestPendingHandshakesAreBounded(t *testing.T) {
+	c := check.New(t)
+	const beyondTheLimit = 4
+	script := make([]acceptResult, 0, maxPendingHandshakes+beyondTheLimit)
+	locals := make([]net.Conn, 0, maxPendingHandshakes+beyondTheLimit)
+	for range maxPendingHandshakes + beyondTheLimit {
+		local, remote := newAddressedPipe(t)
+		locals = append(locals, local)
+		script = append(script, acceptResult{conn: remote})
+	}
+	d := newScriptedDispatcher(&scriptedListener{script: script})
+	defer d.gatekeeper.Close()
+
+	// The loop runs to the end of the script, so every decision about every connection has been made by the time it
+	// returns. None of the accepted connections can have finished with its slot, since each is parked waiting for a
+	// handshake that is never written.
+	d.listen()
+	c.Equal(int32(maxPendingHandshakes), d.pendingHandshakes.Load())
+
+	// Only a handful of the connections that were kept are checked, since proving one is still open costs a read
+	// deadline's worth of waiting apiece
+	for i := range 3 {
+		c.False(hungUpOn(locals[i]), "connection %d must still be working through its handshake", i)
+	}
+	for i := maxPendingHandshakes; i < len(locals); i++ {
+		c.True(hungUpOn(locals[i]), "connection %d was past the limit and must have been refused", i)
+	}
+}
+
+// newScriptedDispatcher returns a dispatcher that accepts from the supplied listener, with everything that would
+// otherwise reach outside the test stubbed out. The caller is responsible for closing its gatekeeper.
+func newScriptedDispatcher(listener net.Listener) *Dispatcher {
+	return &Dispatcher{
+		listener:         listener,
+		logger:           slog.New(slog.DiscardHandler),
+		gatekeeper:       NewGateKeeper(),
+		lookupExternalIP: func(_ context.Context, _ time.Duration) net.IP { return nil },
+	}
+}
+
+// hungUpOn reports whether the far end of the connection has been closed, which is what the accept loop does with a
+// connection it refuses. One that is still being worked on leaves the read waiting instead.
+func hungUpOn(conn net.Conn) bool {
+	// A pipe refuses to set a deadline at all once either of its ends has been closed
+	if conn.SetReadDeadline(time.Now().Add(50*time.Millisecond)) != nil {
+		return true
+	}
+	_, err := conn.Read(make([]byte, 1))
+	return err != nil && !errors.Is(err, os.ErrDeadlineExceeded)
+}
+
+// newAddressedPipe returns the two ends of an in-memory connection, with the end handed to the dispatcher reporting a
+// routable remote address. A net.Pipe's own address is "pipe", which SplitHostPort can't parse, so the gatekeeper's
+// fail-closed branch refuses it before any handshake is attempted and none of the dispatch path runs.
+func newAddressedPipe(t *testing.T) (local, remote net.Conn) {
+	t.Helper()
+	local, other := net.Pipe()
+	t.Cleanup(func() {
+		xio.CloseIgnoringErrors(local)
+		xio.CloseIgnoringErrors(other)
+	})
+	return local, &addressedConn{Conn: other, addr: &net.TCPAddr{IP: net.IPv4(203, 0, 113, 1), Port: 6881}}
+}
+
+// addressedConn is a connection reporting a remote address other than the one it actually has.
+type addressedConn struct {
+	net.Conn
+	addr net.Addr
+}
+
+func (c *addressedConn) RemoteAddr() net.Addr { return c.addr }
+
+// handlerFunc adapts a function to the ConnectionHandler interface.
+type handlerFunc func(conn net.Conn, log *slog.Logger, extensions ProtocolExtensions, infoHash tfs.InfoHash, sendHandshake bool)
+
+func (f handlerFunc) HandleConnection(conn net.Conn, log *slog.Logger, extensions ProtocolExtensions,
+	infoHash tfs.InfoHash, sendHandshake bool,
+) {
+	f(conn, log, extensions, infoHash, sendHandshake)
 }
 
 // scriptedListener hands out a canned sequence of accept results, then reports that it has been closed.
