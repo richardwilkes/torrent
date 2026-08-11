@@ -10,6 +10,7 @@
 package main
 
 import (
+	"maps"
 	"os"
 	"path/filepath"
 	"testing"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/richardwilkes/toolbox/v2/check"
 	"github.com/richardwilkes/torrent"
+	"github.com/richardwilkes/torrent/dispatcher"
 	"github.com/richardwilkes/torrent/tfs"
 	"github.com/zeebo/bencode"
 )
@@ -29,7 +31,15 @@ const (
 	removeAction  = "remove"
 
 	lengthKey = "length"
+	pathKey   = "path"
 	fileB     = "b.txt"
+
+	// torrentName is the name carried by the torrents the extraction tests build, and therefore the directory a
+	// multi-file one is expected to land in.
+	torrentName = "example"
+	// sampleContent is the storage content of the torrents the extraction tests build. Its length has to agree with
+	// the piece length and piece count newTorrentFile supplies.
+	sampleContent = "0123456789abcdefghij"
 )
 
 // TestMonitorStop verifies what is done when the client stops. The completion and stopped notifications are sent in
@@ -130,15 +140,23 @@ func TestMonitorCompleteThenStop(t *testing.T) {
 	c.Equal([]string{extractAction, removeAction}, actions)
 }
 
-// newTorrentFile builds a torrent whose storage lives in the current directory and holds the supplied content.
-func newTorrentFile(t *testing.T, info map[string]any, content string) *tfs.File {
+// newTorrentFile builds a torrent whose storage lives in the current directory and holds sampleContent. Only the part
+// of the info dictionary that describes the content's layout is supplied by the caller, since that is what the
+// extraction tests vary: either a length, for the single-file form, or a file list, for the multi-file one.
+func newTorrentFile(t *testing.T, name string, layout map[string]any) *tfs.File {
 	t.Helper()
 	c := check.New(t)
+	info := map[string]any{
+		"name":         name,
+		"piece length": int64(16),
+		"pieces":       make([]byte, 40),
+	}
+	maps.Copy(info, layout)
 	data, err := bencode.EncodeBytes(map[string]any{"info": info})
 	c.NoError(err)
 	f, err := tfs.NewFileFromBytes(data)
 	c.NoError(err)
-	c.NoError(os.WriteFile(f.StoragePath(), []byte(content), 0o600))
+	c.NoError(os.WriteFile(f.StoragePath(), []byte(sampleContent), 0o600))
 	return f
 }
 
@@ -148,21 +166,18 @@ func TestExtractFiles(t *testing.T) {
 	c := check.New(t)
 	t.Chdir(t.TempDir())
 
-	tf := newTorrentFile(t, map[string]any{
-		"name":         "example",
-		"piece length": int64(16),
-		"pieces":       make([]byte, 40),
+	tf := newTorrentFile(t, torrentName, map[string]any{
 		"files": []any{
-			map[string]any{lengthKey: int64(12), "path": []any{"sub", "a.txt"}},
-			map[string]any{lengthKey: int64(8), "path": []any{fileB}},
+			map[string]any{lengthKey: int64(12), pathKey: []any{"sub", "a.txt"}},
+			map[string]any{lengthKey: int64(8), pathKey: []any{fileB}},
 		},
-	}, "0123456789abcdefghij")
+	})
 	extractFiles(tf)
 
-	data, err := os.ReadFile(filepath.Join("example", "sub", "a.txt"))
+	data, err := os.ReadFile(filepath.Join(torrentName, "sub", "a.txt"))
 	c.NoError(err)
 	c.Equal("0123456789ab", string(data))
-	data, err = os.ReadFile(filepath.Join("example", fileB))
+	data, err = os.ReadFile(filepath.Join(torrentName, fileB))
 	c.NoError(err)
 	c.Equal("cdefghij", string(data))
 }
@@ -173,17 +188,88 @@ func TestExtractFilesSingle(t *testing.T) {
 	c := check.New(t)
 	t.Chdir(t.TempDir())
 
-	tf := newTorrentFile(t, map[string]any{
-		"name":         "example.bin",
-		"piece length": int64(16),
-		"pieces":       make([]byte, 40),
-		lengthKey:      int64(20),
-	}, "0123456789abcdefghij")
+	tf := newTorrentFile(t, "example.bin", map[string]any{lengthKey: int64(20)})
 	extractFiles(tf)
 
 	data, err := os.ReadFile("example.bin")
 	c.NoError(err)
-	c.Equal("0123456789abcdefghij", string(data))
+	c.Equal(sampleContent, string(data))
+}
+
+// TestExtractFilesMultiFileWithOneEntry verifies that a torrent using the multi-file form still lands in a directory
+// named for the torrent when its file list holds exactly one entry. Which form the torrent uses is what decides this,
+// not how many files it happens to carry.
+func TestExtractFilesMultiFileWithOneEntry(t *testing.T) {
+	c := check.New(t)
+	t.Chdir(t.TempDir())
+
+	tf := newTorrentFile(t, torrentName, map[string]any{
+		"files": []any{map[string]any{lengthKey: int64(20), pathKey: []any{fileB}}},
+	})
+	extractFiles(tf)
+
+	data, err := os.ReadFile(filepath.Join(torrentName, fileB))
+	c.NoError(err)
+	c.Equal(sampleContent, string(data))
+	_, err = os.Stat(fileB)
+	c.HasError(err, "the file must not be extracted into the current directory")
+}
+
+// TestTorrentFilePath verifies that exactly one torrent file must be named, since only one is processed per run and
+// silently dropping the rest would leave the caller thinking they had all been handled.
+func TestTorrentFilePath(t *testing.T) {
+	c := check.New(t)
+	for _, one := range []struct {
+		name    string
+		want    string
+		args    []string
+		wantErr bool
+	}{
+		{name: "no torrent file", wantErr: true},
+		{name: "one torrent file", args: []string{"a.torrent"}, want: "a.torrent"},
+		{name: "more than one torrent file", args: []string{"first.torrent", "second.torrent"}, wantErr: true},
+	} {
+		p, err := torrentFilePath(one.args)
+		if one.wantErr {
+			c.HasError(err, one.name)
+			continue
+		}
+		c.NoError(err, one.name)
+		c.Equal(one.want, p, one.name)
+	}
+}
+
+// TestPortRangeOption verifies that the requested port is range-checked before it is narrowed to the 32 bits the
+// dispatcher option takes, so a value too large to be a port can't wrap into one the dispatcher accepts.
+func TestPortRangeOption(t *testing.T) {
+	c := check.New(t)
+	for _, one := range []struct {
+		name    string
+		port    uint64
+		wantOpt bool
+		wantErr bool
+	}{
+		{name: "zero leaves the choice to the system"},
+		{name: "the lowest valid port", port: 1, wantOpt: true},
+		{name: "the highest valid port", port: 65535, wantOpt: true},
+		{name: "one past the highest valid port", port: 65536, wantErr: true},
+		{name: "a value that would truncate to zero", port: 1 << 32, wantErr: true},
+		{name: "a value that would truncate to a valid port", port: 1<<32 + 1, wantErr: true},
+	} {
+		opt, err := portRangeOption(one.port)
+		if one.wantErr {
+			c.HasError(err, one.name)
+			c.Nil(opt, one.name)
+			continue
+		}
+		c.NoError(err, one.name)
+		if !one.wantOpt {
+			c.Nil(opt, one.name)
+			continue
+		}
+		c.NotNil(opt, one.name)
+		c.NoError(opt(&dispatcher.Dispatcher{}), one.name)
+	}
 }
 
 func TestSanitizePath(t *testing.T) {

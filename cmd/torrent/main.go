@@ -10,10 +10,13 @@
 package main
 
 import (
+	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"io/fs"
 	"log/slog"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
@@ -50,14 +53,20 @@ func main() {
 	logCfg.Console = true
 	logCfg.AddFlags()
 	xflag.AddVersionFlags()
-	xflag.SetUsage(nil, "", "")
+	xflag.SetUsage(nil, "", "<torrent file>")
 	xflag.Parse()
-	files := flag.Args()
-	if len(files) == 0 {
-		xos.ExitWithMsg("No file specified")
+
+	torrentPath, err := torrentFilePath(flag.Args())
+	if err != nil {
+		xos.ExitWithMsg(err.Error())
+	}
+	portOpt, err := portRangeOption(uint64(*port))
+	if err != nil {
+		xos.ExitWithMsg(err.Error())
 	}
 
-	f, err := tfs.NewFileFromPath(files[0])
+	var f *tfs.File
+	f, err = tfs.NewFileFromPath(torrentPath)
 	xos.ExitIfErr(err)
 
 	if *unpackOnly {
@@ -68,8 +77,8 @@ func main() {
 
 	opts := make([]func(*dispatcher.Dispatcher) error, 0, 3)
 	opts = append(opts, dispatcher.GlobalDownloadCap(*downloadCap), dispatcher.GlobalUploadCap(*uploadCap))
-	if *port != 0 {
-		opts = append(opts, dispatcher.PortRange(uint32(*port), uint32(*port)))
+	if portOpt != nil {
+		opts = append(opts, portOpt)
 	}
 
 	var d *dispatcher.Dispatcher
@@ -97,6 +106,33 @@ func main() {
 	}
 	m.run()
 	xos.Exit(0)
+}
+
+// torrentFilePath returns the path of the torrent file to work with. Exactly one is required: only one torrent is
+// processed per run, so extra arguments are refused rather than quietly dropped.
+func torrentFilePath(args []string) (string, error) {
+	switch len(args) {
+	case 0:
+		return "", errors.New("no torrent file specified")
+	case 1:
+		return args[0], nil
+	default:
+		return "", errors.New("only one torrent file may be specified")
+	}
+}
+
+// portRangeOption turns the requested port into a dispatcher option, returning a nil option when the system should
+// choose the port itself. The range has to be checked here rather than left to dispatcher.PortRange, since the flag
+// accepts any unsigned value and narrowing it to the uint32 that PortRange takes would wrap a larger one into the
+// valid range and quietly listen on the wrong port.
+func portRangeOption(port uint64) (func(*dispatcher.Dispatcher) error, error) {
+	if port == 0 {
+		return nil, nil
+	}
+	if port > math.MaxUint16 {
+		return nil, fmt.Errorf("port must be in the range 1 to %d", math.MaxUint16)
+	}
+	return dispatcher.PortRange(uint32(port), uint32(port)), nil
 }
 
 // monitor acts on a client's notifications until it stops. The side effects are supplied by the caller, rather than
@@ -149,7 +185,11 @@ func (m *monitor) extractIfNeeded() {
 
 func extractFiles(tf *tfs.File) {
 	dir := "."
-	if len(tf.EmbeddedFiles()) > 1 {
+	// By convention, a multi-file torrent's content goes into a directory named for the torrent while a single-file
+	// torrent's content goes directly into the current directory. Which form a torrent uses is determined by whether
+	// it carries a file list, not by how many files that list holds: a multi-file torrent with exactly one entry still
+	// gets the wrapping directory.
+	if len(tf.Info.Files) != 0 {
 		dir = filepath.Join(dir, sanitizePath(tf.Info.Name))
 	}
 	// The torrent's info only carries the base name of each entry, so walk the tree to recover the paths that Open
