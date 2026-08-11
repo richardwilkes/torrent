@@ -43,6 +43,11 @@ const (
 	// downloadCompleteNotifyTimeout is how long the goroutine delivering the download complete notification will wait
 	// for it to be accepted before giving up, for a consumer that isn't listening when it arrives.
 	downloadCompleteNotifyTimeout = time.Minute
+	// peerMgmtStopWait is how long a shutdown that has no caller-supplied bound of its own will wait for the peer
+	// management goroutine to notice the stop and return. A pass through peer management can send piece requests into
+	// peers' bounded write queues, which drain at rate-limited speed, so this has to allow for more than the work
+	// itself takes. Stop() bounds the wait by the timeout it was given instead.
+	peerMgmtStopWait = time.Minute
 )
 
 const urlQuerySafeBytes = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_.~"
@@ -156,9 +161,13 @@ func (c *Client) Stop(timeout time.Duration) {
 	}
 	c.stopRequested = true
 	c.lock.Unlock()
-	c.closeAllPeers()
+	// The whole stop has to fit within the timeout, so the wait for peer management to return is bounded by it too and
+	// whatever it consumes comes out of what is left for the shutdown itself. Waiting for peer management on its own
+	// schedule first would let a Stop with a short timeout block for far longer than the caller asked for.
+	deadline := time.Now().Add(timeout)
+	c.closeAllPeers(timeout)
 	select {
-	case <-time.After(timeout):
+	case <-time.After(time.Until(deadline)):
 		// The shutdown is still under way, so no notification is made here. Peers may still be writing to the storage
 		// file and the stopped announce may not have been sent yet, so a consumer told that we've stopped could act on
 		// state we still hold. The notification is left to run(), which delivers it once the client has actually
@@ -431,7 +440,7 @@ func (c *Client) HandleConnection(conn net.Conn, logger *slog.Logger, _ dispatch
 // window before this goroutine runs, and stays claimed for as long as we're working with the connection.
 func (c *Client) connectToPeer(addr string, port int) {
 	defer c.finishDial(addr)
-	slog.Debug("dialing peer", "address", addr, "port", port)
+	c.logger.Debug("dialing peer", "address", addr, "port", port)
 	conn, err := net.DialTimeout("tcp", net.JoinHostPort(addr, strconv.Itoa(port)), peerDialTimeout)
 	if err != nil {
 		if tio.ShouldLogIOError(err) {
@@ -477,7 +486,7 @@ func (c *Client) finish(err error) {
 			errs.LogTo(c.logger, err)
 		}
 	}
-	c.closeAllPeers()
+	c.closeAllPeers(peerMgmtStopWait)
 	c.peerWaitGroup.Wait()
 	if err = c.tracker.announceStopped(); err != nil {
 		errs.LogTo(c.logger, err)
@@ -507,7 +516,10 @@ func (c *Client) closeRateLimiters() {
 	c.OutRate.Close()
 }
 
-func (c *Client) closeAllPeers() {
+// closeAllPeers tells peer management to stop and closes every peer connection we hold. 'wait' bounds how long we'll
+// wait for the peer management goroutine to return before closing the connections anyway; a value of zero or less
+// doesn't wait for it at all.
+func (c *Client) closeAllPeers(wait time.Duration) {
 	c.peerMgmtLock.Lock()
 	if !c.peerMgmtStopping {
 		c.peerMgmtStopping = true
@@ -515,10 +527,12 @@ func (c *Client) closeAllPeers() {
 	}
 	done := c.peerMgmtDone
 	c.peerMgmtLock.Unlock()
-	if done != nil {
+	if done != nil && wait > 0 {
+		timer := time.NewTimer(wait)
 		select {
-		case <-time.After(time.Minute):
+		case <-timer.C:
 		case <-done:
+			timer.Stop()
 		}
 	}
 	for _, p := range c.currentPeers() {
@@ -707,7 +721,7 @@ func (c *Client) adjustPeers() {
 		}
 		pd = append(pd, data)
 	}
-	slog.Debug("managing peers", "download_count", downloadCount, "seeding_complete", c.tracker.isSeedingComplete())
+	c.logger.Debug("managing peers", "download_count", downloadCount, "seeding_complete", c.tracker.isSeedingComplete())
 	if downloadCount < c.concurrentDownloads && !c.tracker.isSeedingComplete() {
 		existing := c.hostsInUse(pd)
 		count := min(c.peersWanted-len(pd), 4)
@@ -726,19 +740,19 @@ func (c *Client) adjustPeers() {
 				count = 1
 			}
 		}
-		slog.Debug("managing peers", "wanted", count)
+		c.logger.Debug("managing peers", "wanted", count)
 		if count > 0 {
 			peerAddressMap := c.tracker.peerAddressesMap()
 			pam := make(map[string]int, len(peerAddressMap))
 			for addr, port := range peerAddressMap {
 				blocked := c.dispatcher.GateKeeper().IsAddressStringBlocked(addr)
-				slog.Debug("managing peers", "address", addr, "port", port, "exists", existing[addr],
+				c.logger.Debug("managing peers", "address", addr, "port", port, "exists", existing[addr],
 					"blocked", blocked)
 				if _, exists := existing[addr]; !exists && !blocked {
 					pam[addr] = port
 				}
 			}
-			slog.Debug("managing peers", "available", len(pam))
+			c.logger.Debug("managing peers", "available", len(pam))
 			for i := 0; i < count; i++ {
 				added := false
 				for addr, port := range pam {

@@ -10,10 +10,13 @@
 package torrent
 
 import (
+	"encoding/binary"
 	"errors"
+	"log/slog"
 	"net"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -39,7 +42,7 @@ func TestPeerManagementStopsWhenStoppedBeforeStarting(t *testing.T) {
 	client := newTestClient(d)
 
 	// Stop before peer management has been started, which must not block, since there is nothing to wait for
-	waitFor(t, "closeAllPeers", func() { client.closeAllPeers() })
+	waitFor(t, "closeAllPeers", func() { client.closeAllPeers(peerMgmtStopWait) })
 
 	// Startup continues on and starts peer management, which must immediately stop again
 	waitFor(t, "startPeerManagement", client.startPeerManagement)
@@ -63,7 +66,7 @@ func TestPeerManagementStopsWhenRunning(t *testing.T) {
 	default:
 	}
 
-	waitFor(t, "closeAllPeers", func() { client.closeAllPeers() })
+	waitFor(t, "closeAllPeers", func() { client.closeAllPeers(peerMgmtStopWait) })
 	select {
 	case <-done:
 	case <-time.After(peerMgmtWait):
@@ -71,7 +74,7 @@ func TestPeerManagementStopsWhenRunning(t *testing.T) {
 	}
 
 	// Stopping a second time must neither panic nor block
-	waitFor(t, "second closeAllPeers", func() { client.closeAllPeers() })
+	waitFor(t, "second closeAllPeers", func() { client.closeAllPeers(peerMgmtStopWait) })
 }
 
 // TestConnectionsRefusedWhileStopping verifies that the stop state incoming connections check remains in sync with the
@@ -86,7 +89,7 @@ func TestConnectionsRefusedWhileStopping(t *testing.T) {
 	client.peerMgmtLock.Unlock()
 	c.False(stopping)
 
-	client.closeAllPeers()
+	client.closeAllPeers(peerMgmtStopWait)
 
 	client.peerMgmtLock.Lock()
 	stopping = client.peerMgmtStopping
@@ -813,12 +816,21 @@ func TestStorageIsNotClearedOutFromUnderPeers(t *testing.T) {
 	markTestPiecesAvailable(client, 1)
 	conn, p := newTestPeer(t, client)
 	defer xio.CloseIgnoringErrors(conn)
+	// A peer starts out choked, and processPieceRequests discards everything a choked peer asks for before it ever
+	// reaches the storage, so without this nothing here would touch the file the test is about
+	p.setChoked(false)
 
-	// Drain whatever the peer queues up for writing, so that it never blocks on a full queue
+	// Drain whatever the peer queues up for writing, so that it never blocks on a full queue, handing each message to
+	// the test as it goes so that requests which were actually served can be told apart from ones that were discarded
 	drained := make(chan struct{})
+	written := make(chan []byte, 1)
 	go func() {
 		defer close(drained)
-		for range p.writeQueue { //nolint:revive // Draining the queue is all that is wanted
+		for buffer := range p.writeQueue {
+			select {
+			case written <- buffer:
+			default:
+			}
 		}
 	}()
 
@@ -830,6 +842,20 @@ func TestStorageIsNotClearedOutFromUnderPeers(t *testing.T) {
 		defer close(served)
 		p.processPieceRequests(requests)
 	}()
+
+	// Serve one request while the storage is still in place, so that the read path is known to be reachable before the
+	// file is taken away. Without this, a shutdown that wins the race feeds nothing and the test proves nothing.
+	requests <- &pieceRequest{index: 1, length: chunkSize}
+	select {
+	case buffer := <-written:
+		c.Equal(13+chunkSize, len(buffer))
+		c.Equal(pieceID, buffer[4])
+		c.Equal(uint32(1), binary.BigEndian.Uint32(buffer[5:9]))
+		c.Equal(testStorageBytes(1, 0, chunkSize), buffer[13:])
+	case <-time.After(peerMgmtWait):
+		t.Fatal("the piece request was never served, so the storage was never read")
+	}
+
 	fed := make(chan struct{})
 	go func() {
 		defer close(fed)
@@ -870,6 +896,97 @@ func TestStopIsIdempotentOnceStopped(t *testing.T) {
 	c.False(requested, "Stop must not re-run the shutdown path once the client has stopped")
 }
 
+// TestStopHonorsItsTimeoutWhilePeerManagementLags verifies that the timeout Stop is given bounds the whole stop, the
+// wait for the peer management goroutine included. A pass through peer management sends piece requests into peers'
+// bounded write queues, which drain at rate-limited speed, so it can realistically take far longer to notice the stop
+// than the caller allowed for; waiting for it on a schedule of its own breaks the contract Stop documents.
+func TestStopHonorsItsTimeoutWhilePeerManagementLags(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+
+	// Peer management that never notices the stop: nothing ever closes this, nor the channel Stop watches for the
+	// shutdown having finished
+	client.peerMgmtLock.Lock()
+	client.peerMgmtDone = make(chan struct{})
+	client.peerMgmtLock.Unlock()
+
+	const timeout = 100 * time.Millisecond
+	started := time.Now()
+	stopped := make(chan time.Duration, 1)
+	go func() {
+		client.Stop(timeout)
+		stopped <- time.Since(started)
+	}()
+	select {
+	case elapsed := <-stopped:
+		c.True(elapsed < peerMgmtWait, "Stop was given %v but took %v", timeout, elapsed)
+	case <-time.After(peerMgmtWait):
+		t.Fatal("Stop waited on peer management rather than honoring the timeout it was given")
+	}
+}
+
+// TestPeerManagementLogsThroughTheClientLogger verifies that the debug output peer management and dialing produce goes
+// to the client's logger rather than the process default one. A host application that pointed the dispatcher's logging
+// somewhere of its own with LogTo would otherwise never see these lines, and they'd lack the per-torrent context every
+// other line the client logs carries.
+func TestPeerManagementLogsThroughTheClientLogger(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	sink := &logSink{}
+	client.logger = slog.New(slog.NewTextHandler(sink, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	defaultSink := captureDefaultLogger(t)
+
+	client.adjustPeers()
+	c.Contains(sink.contents(), `msg="managing peers"`)
+
+	// A port nothing is listening on, so the dial fails at once rather than making the test wait out peerDialTimeout
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	c.NoError(err)
+	addr, ok := listener.Addr().(*net.TCPAddr)
+	c.True(ok)
+	c.NoError(listener.Close())
+	client.connectToPeer(addr.IP.String(), addr.Port)
+	c.Contains(sink.contents(), `msg="dialing peer"`)
+
+	c.NotContains(defaultSink.contents(), "managing peers",
+		"peer management must log through the client's logger, not the process default one")
+	c.NotContains(defaultSink.contents(), "dialing peer",
+		"dialing must log through the client's logger, not the process default one")
+}
+
+// captureDefaultLogger replaces the process default logger with one that records what it is given for the duration of
+// the test, so that a test can tell whether anything reached it, and puts the original back afterwards.
+func captureDefaultLogger(t *testing.T) *logSink {
+	t.Helper()
+	sink := &logSink{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(sink, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return sink
+}
+
+// logSink collects log output. Writes are serialized because a client logs from its own goroutines while the test that
+// made it is reading what has been logged so far.
+type logSink struct {
+	buffer strings.Builder
+	lock   sync.Mutex
+}
+
+func (s *logSink) Write(p []byte) (int, error) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	return s.buffer.Write(p)
+}
+
+// contents returns everything logged so far.
+func (s *logSink) contents() string {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	return s.buffer.String()
+}
+
 // TestPeerIsNotLeftBehindWhileStopping verifies that a connection arriving while the client is stopping doesn't leave
 // a peer behind in the map, since nothing would ever drain its write queue or close its connection.
 func TestPeerIsNotLeftBehindWhileStopping(t *testing.T) {
@@ -881,7 +998,7 @@ func TestPeerIsNotLeftBehindWhileStopping(t *testing.T) {
 	for i := range client.id {
 		client.id[i] = urlQuerySafeBytes[i%len(urlQuerySafeBytes)]
 	}
-	client.closeAllPeers()
+	client.closeAllPeers(peerMgmtStopWait)
 
 	conn, remote := newTestConnPair(t)
 	defer xio.CloseIgnoringErrors(conn)
@@ -981,7 +1098,7 @@ func TestPeerManagementIntervalsAreIndependent(t *testing.T) {
 			}
 			waitForDownloadsCleared(t, p)
 
-			waitFor(t, "closeAllPeers", func() { client.closeAllPeers() })
+			waitFor(t, "closeAllPeers", func() { client.closeAllPeers(peerMgmtStopWait) })
 			select {
 			case <-done:
 			case <-time.After(peerMgmtWait):
