@@ -12,9 +12,11 @@ package torrent
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"runtime"
 	"strconv"
 	"strings"
@@ -75,7 +77,7 @@ func TestParsePeersDictModel(t *testing.T) {
 		testPeerDict("", "10.0.0.3", 0),    // No port, so it is dropped
 		testPeerDict("", "10.0.0.9", 6889), // Our own address, so it is dropped
 	})
-	peers, err := parsePeers(in.PeerAddresses, "10.0.0.9")
+	peers, err := parsePeers(discardLogger(), in.PeerAddresses, "10.0.0.9")
 	c.NoError(err)
 	c.Equal(2, len(peers))
 	c.Equal(6881, peers["10.0.0.1"])
@@ -83,7 +85,7 @@ func TestParsePeersDictModel(t *testing.T) {
 
 	// An empty list is legal and simply yields no peers
 	in = decodeTestTrackerResponse(t, []any{})
-	peers, err = parsePeers(in.PeerAddresses, "10.0.0.9")
+	peers, err = parsePeers(discardLogger(), in.PeerAddresses, "10.0.0.9")
 	c.NoError(err)
 	c.Equal(0, len(peers))
 }
@@ -95,7 +97,7 @@ func TestParsePeersCompact(t *testing.T) {
 		10, 0, 0, 1, 0x1A, 0xE1, // 10.0.0.1:6881
 		10, 0, 0, 2, 0x1A, 0xE2, // 10.0.0.2:6882
 	}))
-	peers, err := parsePeers(in.PeerAddresses, "<unknown>")
+	peers, err := parsePeers(discardLogger(), in.PeerAddresses, "<unknown>")
 	c.NoError(err)
 	c.Equal(2, len(peers))
 	c.Equal(6881, peers["10.0.0.1"])
@@ -110,16 +112,16 @@ func TestParsePeersMalformed(t *testing.T) {
 	// A response with no "peers" key at all leaves nothing to parse
 	var missing trackerWire
 	c.NoError(bencode.DecodeBytes([]byte("d8:intervali1800ee"), &missing))
-	peers, err := parsePeers(missing.PeerAddresses, "<unknown>")
+	peers, err := parsePeers(discardLogger(), missing.PeerAddresses, "<unknown>")
 	c.NoError(err)
 	c.Equal(0, len(peers))
 
 	// Neither a string nor a list, so there is nothing sensible to make of it
-	_, err = parsePeers(decodeTestTrackerResponse(t, 5).PeerAddresses, "<unknown>")
+	_, err = parsePeers(discardLogger(), decodeTestTrackerResponse(t, 5).PeerAddresses, "<unknown>")
 	c.HasError(err)
 
 	// A list holding something other than peer dictionaries
-	_, err = parsePeers(decodeTestTrackerResponse(t, []any{"10.0.0.1"}).PeerAddresses, "<unknown>")
+	_, err = parsePeers(discardLogger(), decodeTestTrackerResponse(t, []any{"10.0.0.1"}).PeerAddresses, "<unknown>")
 	c.HasError(err)
 }
 
@@ -264,7 +266,7 @@ func TestTrackerResponseIsBounded(t *testing.T) {
 	c.Equal(1800, in.Interval)
 	c.Equal(2, in.Seeders)
 	c.Equal(1, in.Leechers)
-	peers, err := parsePeers(in.PeerAddresses, "<unknown>")
+	peers, err := parsePeers(discardLogger(), in.PeerAddresses, "<unknown>")
 	c.NoError(err)
 	c.Equal(6881, peers["10.0.0.1"])
 }
@@ -420,13 +422,130 @@ func TestAnnounceKeepsTheTrackerID(t *testing.T) {
 	// A new id does replace it, and is escaped for the query it goes into
 	response.body = "d8:intervali1800e5:peers0:10:tracker id5:a b&ce"
 	c.NoError(client.tracker.announce(context.Background(), ""))
-	c.Contains(client.tracker.announceURL(""), "&trackerid=a+b%26c")
+	c.Contains(client.tracker.announceURL(""), "&trackerid=a%20b%26c")
 
 	// A tracker that never issues one leaves the parameter out entirely
 	client, response = newTestTrackerClient(t, d)
 	response.body = noPeersResponse
 	c.NoError(client.tracker.announce(context.Background(), startedMsg))
 	c.NotContains(client.tracker.announceURL(""), "trackerid")
+}
+
+// TestPercentEncodeEscapesEveryNonUnreservedByte verifies that an announce parameter carrying arbitrary bytes is
+// percent-encoded rather than form-encoded. Form encoding, which is what url.QueryEscape does, writes the byte 0x20 as
+// "+" and leaves a real "+" as %2B, so a tracker that percent-decodes the query string rather than form-decoding it
+// cannot tell the two apart and reads a 0x2B where the 0x20 belongs.
+func TestPercentEncodeEscapesEveryNonUnreservedByte(t *testing.T) {
+	c := check.New(t)
+
+	// Everything in RFC 3986's unreserved set, which is what the peer ID is already restricted to, passes through
+	c.Equal(urlQuerySafeBytes, percentEncode(urlQuerySafeBytes))
+	c.Equal("", percentEncode(""))
+
+	// A space is %20 and never "+", and a literal "+" stays distinct from it
+	c.Equal("a%20b", percentEncode("a b"))
+	c.Equal("a%2Bb", percentEncode("a+b"))
+
+	// Every other byte, the high ones a binary hash is full of included, becomes an uppercase %XX pair
+	for i := range 256 {
+		one := string([]byte{byte(i)})
+		if strings.IndexByte(urlQuerySafeBytes, byte(i)) >= 0 {
+			c.Equal(one, percentEncode(one), "byte 0x%02X is unreserved", i)
+			continue
+		}
+		c.Equal(fmt.Sprintf("%%%02X", i), percentEncode(one), "byte 0x%02X must be percent-encoded", i)
+	}
+
+	// A plain percent-decode, which is all a tracker may do, hands every byte back unchanged
+	all := make([]byte, 256)
+	for i := range all {
+		all[i] = byte(i)
+	}
+	decoded, err := url.PathUnescape(percentEncode(string(all)))
+	c.NoError(err)
+	c.Equal(string(all), decoded)
+}
+
+// TestAnnounceURLPercentEncodesTheInfoHash verifies that an info hash holding bytes a query cannot carry literally
+// reaches the tracker as %XX pairs. Roughly one hash in thirteen contains a 0x20 byte, and form encoding sends that as
+// "+": a tracker doing a plain percent-decode then reconstructs a hash with 0x2B in its place, finds no such torrent
+// and refuses the announce, leaving those torrents unable to reach it at all.
+func TestAnnounceURLPercentEncodesTheInfoHash(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client, _ := newTestTrackerClient(t, d)
+	for i := range client.torrentFile.InfoHash {
+		client.torrentFile.InfoHash[i] = byte(i + 100)
+	}
+	client.torrentFile.InfoHash[0] = ' '
+	client.torrentFile.InfoHash[1] = '+'
+	client.torrentFile.InfoHash[2] = '&'
+	client.torrentFile.InfoHash[3] = 'a'
+
+	urlStr := client.tracker.announceURL(startedMsg)
+	c.Contains(urlStr, "info_hash=%20%2B%26a")
+
+	// A tracker that form-decodes the query and one that only percent-decodes it must both recover the same 20 bytes
+	parsed, err := url.Parse(urlStr)
+	c.NoError(err)
+	c.Equal(string(client.torrentFile.InfoHash[:]), parsed.Query().Get("info_hash"))
+	decoded, err := url.PathUnescape(rawQueryValue(urlStr, "info_hash"))
+	c.NoError(err)
+	c.Equal(string(client.torrentFile.InfoHash[:]), decoded)
+
+	// The same holds for a tracker id, which is likewise the tracker's own bytes handed back to it
+	client.tracker.trackerID = "a b+c&d"
+	urlStr = client.tracker.announceURL("")
+	c.Contains(urlStr, "&trackerid=a%20b%2Bc%26d")
+	decoded, err = url.PathUnescape(rawQueryValue(urlStr, "trackerid"))
+	c.NoError(err)
+	c.Equal(client.tracker.trackerID, decoded)
+}
+
+// TestAnnounceLogsThroughTheClientLogger verifies that the debug output an announce produces goes to the client's
+// logger rather than the process default one. An application that pointed the client's logging somewhere of its own
+// would otherwise never see these lines, and the announce URL — the tracker id it carries included — and the peer
+// lists would land in the process-default sink at whatever level and format that happens to have.
+func TestAnnounceLogsThroughTheClientLogger(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client, response := newTestTrackerClient(t, d)
+	sink := &logSink{}
+	client.logger = slog.New(slog.NewTextHandler(sink, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	defaultSink := captureDefaultLogger(t)
+
+	// The compact peer list, which is what we ask for
+	response.body = "d8:intervali1800e5:peers6:" + string([]byte{10, 0, 0, 1, 0x1A, 0xE1}) + "e"
+	c.NoError(client.tracker.announce(context.Background(), startedMsg))
+	c.Contains(sink.contents(), "url=")
+	c.Contains(sink.contents(), "peers_list=")
+
+	// The dict model, which a tracker is free to answer with instead
+	raw, err := bencode.EncodeBytes(map[string]any{
+		"interval": 1800,
+		"peers":    []any{testPeerDict("", "10.0.0.2", 6882)},
+	})
+	c.NoError(err)
+	response.body = string(raw)
+	c.NoError(client.tracker.announce(context.Background(), ""))
+	c.Contains(sink.contents(), `msg="announce map"`)
+
+	for _, one := range []string{"url=", "peers_list=", "announce map"} {
+		c.NotContains(defaultSink.contents(), one,
+			"announce must log through the client's logger, not the process default one")
+	}
+}
+
+// rawQueryValue pulls one parameter's value out of a URL's query string without decoding it, which is what a tracker
+// doing its own percent-decoding is handed.
+func rawQueryValue(urlStr, key string) string {
+	_, query, _ := strings.Cut(urlStr, "?")
+	for _, one := range strings.Split(query, "&") {
+		if value, ok := strings.CutPrefix(one, key+"="); ok {
+			return value
+		}
+	}
+	return ""
 }
 
 // TestStopWaitsForThePeriodicAnnounce verifies that the stopped announce isn't made while a periodic one is still
@@ -567,7 +686,7 @@ func TestParsePeersRejectsUnusablePorts(t *testing.T) {
 		testPeerDict("", "10.0.0.7", math.MaxUint16+1),
 		testPeerDict("", "10.0.0.8", math.MaxInt32),
 	})
-	peers, err := parsePeers(in.PeerAddresses, "<unknown>")
+	peers, err := parsePeers(discardLogger(), in.PeerAddresses, "<unknown>")
 	c.NoError(err)
 	c.Equal(3, len(peers))
 	c.Equal(6881, peers["10.0.0.1"])
@@ -758,6 +877,12 @@ func newTestTrackerClientWithHandler(t *testing.T, d *dispatcher.Dispatcher, han
 		client.id[i] = urlQuerySafeBytes[i%len(urlQuerySafeBytes)]
 	}
 	return client
+}
+
+// discardLogger is the logger handed to parsePeers by the tests that care about the peer list it returns rather than
+// what it logged along the way.
+func discardLogger() *slog.Logger {
+	return slog.New(slog.DiscardHandler)
 }
 
 // unreachableTrackerURL is an announce URL that no request can ever be made to, standing in for a tracker that never

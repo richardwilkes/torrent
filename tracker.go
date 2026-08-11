@@ -19,7 +19,6 @@ import (
 	"math"
 	"net"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -430,8 +429,10 @@ func parseCompactPeers(value, externalAddr string) map[string]int {
 // parsePeers extracts the peer addresses from a tracker's "peers" value. Although we always ask for the compact form,
 // a tracker is free to ignore that and answer with the dict model instead, so both are accepted: a bencoded string is
 // the compact form and a bencoded list is the dict model. A missing or empty value simply yields no peers. Our own
-// address, which the caller passes in, is omitted, as are entries whose port isn't one that can be dialed.
-func parsePeers(raw bencode.RawMessage, externalAddr string) (map[string]int, error) {
+// address, which the caller passes in, is omitted, as are entries whose port isn't one that can be dialed. What was
+// found is logged to the caller's logger, since a peer list is per-torrent detail that belongs wherever the rest of
+// that client's logging goes.
+func parsePeers(logger *slog.Logger, raw bencode.RawMessage, externalAddr string) (map[string]int, error) {
 	if len(raw) == 0 {
 		return make(map[string]int), nil
 	}
@@ -441,14 +442,14 @@ func parsePeers(raw bencode.RawMessage, externalAddr string) (map[string]int, er
 		if err := bencode.DecodeBytes(raw, &compact); err != nil {
 			return nil, errs.NewWithCause("unable to decode compact peer list", err)
 		}
-		slog.Debug("announce string", "peers_list", compact)
+		logger.Debug("announce string", "peers_list", compact)
 		return parseCompactPeers(compact, externalAddr), nil
 	case raw[0] == 'l': // A bencoded list, so the dict model
 		var list []peerWire
 		if err := bencode.DecodeBytes(raw, &list); err != nil {
 			return nil, errs.NewWithCause("unable to decode peer list", err)
 		}
-		slog.Debug("announce map", "count", len(list))
+		logger.Debug("announce map", "count", len(list))
 		peerAddresses := make(map[string]int, len(list))
 		for _, one := range list {
 			// The dict model carries the port as a bencoded integer, so unlike the compact form — whose ports are
@@ -467,7 +468,7 @@ func parsePeers(raw bencode.RawMessage, externalAddr string) (map[string]int, er
 
 func (t *tracker) announce(ctx context.Context, event string) error {
 	urlStr := t.announceURL(event)
-	slog.Debug("announce", "url", urlStr)
+	t.client.logger.Debug("announce", "url", urlStr)
 	resp, err := t.request(ctx, urlStr)
 	if err != nil {
 		return err
@@ -512,7 +513,7 @@ func (t *tracker) announce(ctx context.Context, event string) error {
 	if extIP := t.client.ExternalIP(); extIP != nil {
 		externalAddr = extIP.String()
 	}
-	peerAddresses, err := parsePeers(in.PeerAddresses, externalAddr)
+	peerAddresses, err := parsePeers(t.client.logger, in.PeerAddresses, externalAddr)
 	if err != nil {
 		return err
 	}
@@ -557,7 +558,7 @@ func (t *tracker) announceURL(event string) string {
 		buffer.WriteString("?")
 	}
 	buffer.WriteString("info_hash=")
-	buffer.WriteString(url.QueryEscape(string(t.client.torrentFile.InfoHash[:])))
+	buffer.WriteString(percentEncode(string(t.client.torrentFile.InfoHash[:])))
 	buffer.WriteString("&peer_id=")
 	buffer.Write(t.client.id[:])
 	fmt.Fprintf(&buffer, "&port=%d", t.client.dispatcher.ExternalPort())
@@ -566,13 +567,37 @@ func (t *tracker) announceURL(event string) string {
 	t.lock.RLock()
 	fmt.Fprintf(&buffer, "&left=%d", t.remainingBytes)
 	if t.trackerID != "" {
-		fmt.Fprintf(&buffer, "&trackerid=%s", url.QueryEscape(t.trackerID))
+		fmt.Fprintf(&buffer, "&trackerid=%s", percentEncode(t.trackerID))
 	}
 	t.lock.RUnlock()
 	fmt.Fprintf(&buffer, "&numwant=%d", t.client.peersWanted)
 	buffer.WriteString("&compact=1")
 	if event != "" {
 		fmt.Fprintf(&buffer, "&event=%s", event)
+	}
+	return buffer.String()
+}
+
+// percentEncode escapes every byte outside RFC 3986's unreserved set as %XX, which is what an announce parameter
+// carrying arbitrary bytes needs. url.QueryEscape is form encoding: it writes the byte 0x20 as "+" rather than "%20",
+// and a tracker that percent-decodes the query string instead of form-decoding it then reconstructs a "+" (0x2B) where
+// that byte belongs. Roughly one info hash in thirteen contains a 0x20, so the tracker looks up a hash that isn't ours,
+// answers that it has never heard of the torrent, and those torrents cannot announce to it at all. Mainstream clients
+// percent-encode every non-unreserved byte for exactly this reason.
+func percentEncode(s string) string {
+	const hexDigits = "0123456789ABCDEF"
+	var buffer strings.Builder
+	buffer.Grow(len(s))
+	for i := range len(s) {
+		switch ch := s[i]; {
+		case ch >= 'A' && ch <= 'Z', ch >= 'a' && ch <= 'z', ch >= '0' && ch <= '9',
+			ch == '-', ch == '_', ch == '.', ch == '~':
+			buffer.WriteByte(ch)
+		default:
+			buffer.WriteByte('%')
+			buffer.WriteByte(hexDigits[ch>>4])
+			buffer.WriteByte(hexDigits[ch&0x0F])
+		}
 	}
 	return buffer.String()
 }
