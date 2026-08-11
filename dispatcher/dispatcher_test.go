@@ -66,7 +66,7 @@ func TestPortFromAddr(t *testing.T) {
 // running.
 func TestNewDispatcherOptionFailureCleansUp(t *testing.T) {
 	c := check.New(t)
-	before := runtime.NumGoroutine()
+	before := settledGoroutineCount(t)
 	d, err := NewDispatcher(func(_ *Dispatcher) error { return errs.New("option failed") })
 	c.HasError(err)
 	c.Nil(d)
@@ -80,7 +80,7 @@ func TestNewDispatcherPortRangeFailureCleansUp(t *testing.T) {
 	port, listener := occupiedPort(t)
 	defer xio.CloseIgnoringErrors(listener)
 
-	before := runtime.NumGoroutine()
+	before := settledGoroutineCount(t)
 	d, err := NewDispatcher(PortRange(port, port))
 	c.HasError(err)
 	c.Nil(d)
@@ -97,7 +97,11 @@ func TestPortRangeFailureReportsWhyItFailed(t *testing.T) {
 	_, err := NewDispatcher(PortRange(port, port))
 	c.HasError(err)
 	var opErr *net.OpError
-	c.True(errors.As(err, &opErr), "the underlying listen failure must be preserved: %v", err)
+	if !errors.As(err, &opErr) {
+		// Fatal, since the checks that follow would dereference a nil pointer and panic, aborting the whole test
+		// binary rather than failing this one test
+		t.Fatalf("the underlying listen failure must be preserved: %v", err)
+	}
 	c.Equal("listen", opErr.Op)
 	c.Contains(err.Error(), opErr.Error())
 }
@@ -123,7 +127,7 @@ func occupiedPort(t *testing.T) (uint32, net.Listener) {
 // goroutine and a ticker, so a dispatcher that doesn't close them leaks both on every create and stop cycle.
 func TestStopReleasesResources(t *testing.T) {
 	c := check.New(t)
-	before := runtime.NumGoroutine()
+	before := settledGoroutineCount(t)
 	d, err := NewDispatcher(FixedExternalIP(nil))
 	c.NoError(err)
 	d.Stop()
@@ -162,7 +166,10 @@ func TestListenerAcceptsWhileTheExternalIPIsBeingDetermined(t *testing.T) {
 	}
 
 	conn, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(d.InternalPort()))))
-	c.NoError(err)
+	if err != nil {
+		// Fatal, since everything that follows, the deferred close included, would use a nil connection and panic
+		t.Fatal(err)
+	}
 	defer xio.CloseIgnoringErrors(conn)
 
 	// A handshake that doesn't start with the protocol identifier is refused and the connection closed, which can only
@@ -261,6 +268,51 @@ func TestPendingHandshakesAreBounded(t *testing.T) {
 	}
 }
 
+// TestPendingHandshakeSlotIsReleasedBeforeTheSessionRuns verifies that the slot an accepted connection takes is given
+// back as soon as its handshake is over, rather than when its handler returns. The handler runs the whole peer
+// session, which keep-alives sustain for as long as the remote likes, so a slot held for that long would make the
+// bound on connections that haven't handshaken a cap on how many inbound peers we may ever have at once: once that
+// many long-lived peers had accumulated, every new inbound connection would be refused for good.
+func TestPendingHandshakeSlotIsReleasedBeforeTheSessionRuns(t *testing.T) {
+	c := check.New(t)
+	local, remote := newAddressedPipe(t)
+	d := newScriptedDispatcher(&scriptedListener{script: []acceptResult{{conn: remote}}})
+	defer d.gatekeeper.Close()
+
+	infoHash := tfs.InfoHash{1, 2, 3}
+	pending := make(chan int32, 1)
+	release := make(chan struct{})
+	d.Register(infoHash, handlerFunc(func(_ net.Conn, _ *slog.Logger, _ ProtocolExtensions, _ tfs.InfoHash, _ bool) {
+		pending <- d.pendingHandshakes.Load()
+		<-release // Stands in for a peer session the remote holds open with keep-alives
+	}))
+
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		d.listen()
+	}()
+	c.NoError(local.SetDeadline(time.Now().Add(goroutineWait)))
+	// The handshake is written from a goroutine because the handler doesn't read the peer ID that trails it, so the
+	// last of it stays unread until the connection is closed
+	sent := make(chan error, 1)
+	go func() { sent <- SendTorrentHandshake(local, ProtocolExtensions{}, infoHash, PeerID{}) }()
+
+	select {
+	case count := <-pending:
+		c.Equal(int32(0), count, "the handshake slot must be given back before the peer session is handed the connection")
+	case <-time.After(goroutineWait):
+		t.Fatal("the connection was never dispatched to its handler")
+	}
+	close(release)
+
+	select {
+	case <-stopped:
+	case <-time.After(goroutineWait):
+		t.Fatal("the accept loop never stopped")
+	}
+}
+
 // newScriptedDispatcher returns a dispatcher that accepts from the supplied listener, with everything that would
 // otherwise reach outside the test stubbed out. The caller is responsible for closing its gatekeeper.
 func newScriptedDispatcher(listener net.Listener) *Dispatcher {
@@ -296,13 +348,38 @@ func newAddressedPipe(t *testing.T) (local, remote net.Conn) {
 	return local, &addressedConn{Conn: other, addr: &net.TCPAddr{IP: net.IPv4(203, 0, 113, 1), Port: 6881}}
 }
 
-// addressedConn is a connection reporting a remote address other than the one it actually has.
+// addressedConn is a connection reporting a remote address other than the one it actually has, which also ignores the
+// read deadline the handshake sets on it. Tests hand this end to the dispatcher and then make assertions about the
+// connections it is holding: without this, an overloaded machine could let the handshake deadline elapse partway
+// through those assertions, so the connections would be closed and their slots given back while the test was still
+// looking at them and it would fail for reasons of its own making. The local end keeps its deadlines, since that is
+// what the tests use to bound their own reads and writes.
 type addressedConn struct {
 	net.Conn
 	addr net.Addr
 }
 
 func (c *addressedConn) RemoteAddr() net.Addr { return c.addr }
+
+func (c *addressedConn) SetReadDeadline(_ time.Time) error { return nil }
+
+// TestTheDispatcherEndOfAPipeIgnoresReadDeadlines verifies the premise the tests that park handshakes rest on: the end
+// of the pipe the dispatcher is given can't have a read of its time out from underneath them.
+func TestTheDispatcherEndOfAPipeIgnoresReadDeadlines(t *testing.T) {
+	c := check.New(t)
+	_, remote := newAddressedPipe(t)
+	c.NoError(remote.SetReadDeadline(time.Now().Add(-time.Hour)))
+	read := make(chan error, 1)
+	go func() {
+		_, err := remote.Read(make([]byte, 1))
+		read <- err // Buffered, so this is released by the pipe being closed when the test ends
+	}()
+	select {
+	case err := <-read:
+		t.Fatalf("the read honored a deadline that had already passed: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
 
 // handlerFunc adapts a function to the ConnectionHandler interface.
 type handlerFunc func(conn net.Conn, log *slog.Logger, extensions ProtocolExtensions, infoHash tfs.InfoHash, sendHandshake bool)
@@ -470,6 +547,53 @@ func ageExternalIPCheck(d *Dispatcher, age time.Duration) {
 	d.lock.Lock()
 	defer d.lock.Unlock()
 	d.lastExternalIPCheck = d.lastExternalIPCheck.Add(-age)
+}
+
+// settledGoroutineCount returns the number of running goroutines once it has stopped changing, for use as the baseline
+// a leak check measures against. A count taken while goroutines an earlier test abandoned are still winding down —
+// which a failed constructor leaves behind, since the gatekeeper's pruner and the rate limiters' tickers are only
+// signaled to exit — is inflated by however many of them are left, and a baseline that is too high hides a leak of
+// exactly that size: the very thing the check exists to catch.
+func settledGoroutineCount(t *testing.T) int {
+	t.Helper()
+	// Consecutive samples that agree, rather than a single one, since goroutines on their way out go a few at a time
+	const settledSamples = 5
+	deadline := time.Now().Add(goroutineWait)
+	count := runtime.NumGoroutine()
+	for agreed := 0; agreed < settledSamples; {
+		time.Sleep(10 * time.Millisecond)
+		current := runtime.NumGoroutine()
+		if current == count {
+			agreed++
+			continue
+		}
+		count = current
+		agreed = 0 // Start the run over, since the count is still moving
+		if time.Now().After(deadline) {
+			t.Fatalf("the goroutine count never settled; last at %d", count)
+		}
+	}
+	return count
+}
+
+// TestSettledGoroutineCountWaitsOutStragglers verifies that the baseline a leak check starts from doesn't count
+// goroutines that are already on their way out, since a baseline inflated by them would let a leak of the same size
+// through unnoticed.
+func TestSettledGoroutineCountWaitsOutStragglers(t *testing.T) {
+	c := check.New(t)
+	baseline := settledGoroutineCount(t)
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Go(func() { <-release })
+	}
+	c.True(runtime.NumGoroutine() > baseline, "the stragglers must be running before they are told to finish")
+
+	// Told to finish, but not waited for: a count taken right now includes them
+	close(release)
+	count := settledGoroutineCount(t)
+	wg.Wait()
+	c.True(count <= baseline, "the baseline of %d counted goroutines that were on their way out (%d)", baseline, count)
 }
 
 // waitForGoroutines waits for the number of running goroutines to drop back to the count that was present before the

@@ -274,10 +274,7 @@ func (d *Dispatcher) listen() {
 			xio.CloseIgnoringErrors(conn)
 			continue
 		}
-		go func() {
-			defer d.pendingHandshakes.Add(-1)
-			d.dispatch(conn)
-		}()
+		go d.dispatch(conn)
 	}
 }
 
@@ -286,22 +283,41 @@ func (d *Dispatcher) logListening() {
 	d.logger.Info("listening", "port", d.InternalPort(), "external_ip", d.ExternalIP(), "external_port", d.ExternalPort())
 }
 
+// dispatch works an accepted connection through its handshake and, if it is for a torrent we have a handler for, hands
+// it off to that handler. The pending handshake slot the accept loop took for this connection is given back as soon as
+// the handshake is over rather than when this returns: the handler runs for the whole life of the peer session, which
+// keep-alives sustain for as long as the remote likes, so a slot held until then would turn the bound on connections
+// that haven't handshaken into a cap on how many inbound peers we may ever have at once.
 func (d *Dispatcher) dispatch(conn net.Conn) {
 	logger := d.logger.With("remote_addr", conn.RemoteAddr().String())
 	defer xio.CloseIgnoringErrors(conn)
-	if d.gatekeeper.IsAddressBlocked(conn.RemoteAddr()) {
+	handler, extensions, infoHash := d.handshake(conn, logger)
+	d.pendingHandshakes.Add(-1)
+	if handler == nil {
 		return
+	}
+	handler.HandleConnection(conn, logger, extensions, infoHash, true)
+}
+
+// handshake takes an accepted connection through the handshake exchange and returns the handler registered for the
+// torrent the remote asked for, or nil if the connection is not one we'll be servicing.
+func (d *Dispatcher) handshake(conn net.Conn, logger *slog.Logger) (ConnectionHandler, ProtocolExtensions, tfs.InfoHash) {
+	var extensions ProtocolExtensions
+	var infoHash tfs.InfoHash
+	if d.gatekeeper.IsAddressBlocked(conn.RemoteAddr()) {
+		return nil, extensions, infoHash
 	}
 	extensions, infoHash, err := ReceiveTorrentHandshake(conn)
 	if err != nil {
 		if tio.ShouldLogIOError(err) {
 			errs.LogTo(logger, err)
 		}
-		return
+		return nil, extensions, infoHash
 	}
 	if handler, ok := d.handlers.Load(infoHash); ok {
 		if connHandler, ok2 := handler.(ConnectionHandler); ok2 {
-			connHandler.HandleConnection(conn, logger, extensions, infoHash, true)
+			return connHandler, extensions, infoHash
 		}
 	}
+	return nil, extensions, infoHash
 }
