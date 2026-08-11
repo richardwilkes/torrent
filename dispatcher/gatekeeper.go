@@ -21,13 +21,19 @@ const blockDuration = 5 * time.Minute
 // GateKeeper controls whether peers with a given address may connect with us.
 type GateKeeper struct {
 	done      chan bool
+	logger    *slog.Logger
 	addresses sync.Map
 	closeOnce sync.Once
 }
 
-// NewGateKeeper creates a new GateKeeper.
-func NewGateKeeper() *GateKeeper {
-	r := &GateKeeper{done: make(chan bool)}
+// NewGateKeeper creates a new GateKeeper that logs to the supplied logger, or to slog.Default() if it is nil. The
+// logger is taken here rather than being settable later because the pruning goroutine started below reaches for it
+// without any synchronization of its own.
+func NewGateKeeper(logger *slog.Logger) *GateKeeper {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	r := &GateKeeper{done: make(chan bool), logger: logger}
 	go r.prune()
 	return r
 }
@@ -44,7 +50,7 @@ func (r *GateKeeper) BlockAddress(addr net.Addr) {
 // BlockAddressString adds the specified address to the incoming blocked list.
 func (r *GateKeeper) BlockAddressString(addr string) {
 	r.addresses.Store(addr, time.Now().Add(blockDuration))
-	slog.Debug("blocked peer", "address", addr)
+	r.logger.Debug("blocked peer", "address", addr)
 }
 
 // IsAddressBlocked returns true if the address is blocked.
@@ -91,7 +97,7 @@ func (r *GateKeeper) pruneExpired() {
 func (r *GateKeeper) unblockIfExpired(addr, expires any) {
 	if t, ok := expires.(time.Time); ok && t.Before(time.Now()) {
 		if r.addresses.CompareAndDelete(addr, expires) {
-			slog.Debug("unblocked peer", "address", addr)
+			r.logger.Debug("unblocked peer", "address", addr)
 		}
 	}
 }

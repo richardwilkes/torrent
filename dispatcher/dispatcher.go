@@ -85,7 +85,6 @@ func NewDispatcher(options ...func(*Dispatcher) error) (*Dispatcher, error) {
 		InRate:           rate.New(math.MaxInt32, time.Second),
 		OutRate:          rate.New(math.MaxInt32, time.Second),
 		logger:           slog.Default(),
-		gatekeeper:       NewGateKeeper(),
 		lookupExternalIP: xnet.ExternalIPAddress,
 	}
 	var err error
@@ -94,6 +93,9 @@ func NewDispatcher(options ...func(*Dispatcher) error) (*Dispatcher, error) {
 			return nil, d.abandon(err)
 		}
 	}
+	// The gatekeeper is created once the options have been applied, so that it logs wherever LogTo said the
+	// dispatcher's logging should go rather than to whatever the logger happened to be beforehand
+	d.gatekeeper = NewGateKeeper(d.logger)
 	if d.internalPort == 0 {
 		if d.listener, err = net.Listen("tcp", ":0"); err != nil { //nolint:gosec // We intentionally want all network interfaces
 			return nil, d.abandon(errs.Wrap(err))
@@ -125,7 +127,10 @@ func NewDispatcher(options ...func(*Dispatcher) error) (*Dispatcher, error) {
 // abandon releases the resources a partially constructed Dispatcher acquired and returns the non-nil error that caused
 // the construction to fail, with any errors encountered during the cleanup appended to it.
 func (d *Dispatcher) abandon(err error) error {
-	d.gatekeeper.Close()
+	// The gatekeeper isn't created until the options have been applied, so an option that failed leaves us without one
+	if d.gatekeeper != nil {
+		d.gatekeeper.Close()
+	}
 	d.closeRateLimiters()
 	if d.listener != nil {
 		if closeErr := d.listener.Close(); closeErr != nil {

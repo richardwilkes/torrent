@@ -19,6 +19,7 @@ import (
 	"reflect"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -316,10 +317,11 @@ func TestPendingHandshakeSlotIsReleasedBeforeTheSessionRuns(t *testing.T) {
 // newScriptedDispatcher returns a dispatcher that accepts from the supplied listener, with everything that would
 // otherwise reach outside the test stubbed out. The caller is responsible for closing its gatekeeper.
 func newScriptedDispatcher(listener net.Listener) *Dispatcher {
+	logger := slog.New(slog.DiscardHandler)
 	return &Dispatcher{
 		listener:         listener,
-		logger:           slog.New(slog.DiscardHandler),
-		gatekeeper:       NewGateKeeper(),
+		logger:           logger,
+		gatekeeper:       NewGateKeeper(logger),
 		lookupExternalIP: func(_ context.Context, _ time.Duration) net.IP { return nil },
 	}
 }
@@ -437,6 +439,59 @@ func newTestDispatcher(t *testing.T, options ...func(*Dispatcher) error) *Dispat
 	}
 	t.Cleanup(d.Stop)
 	return d
+}
+
+// TestGateKeeperLogsWhereLogToSaid verifies that the logger LogTo supplies governs the gatekeeper's logging as well.
+// LogTo exists so that a caller can keep the dispatcher's logging off of the process default logger, which a
+// gatekeeper reaching for the package level slog functions would quietly ignore.
+func TestGateKeeperLogsWhereLogToSaid(t *testing.T) {
+	c := check.New(t)
+	logger, sink := newTestLogger()
+	defaultSink := captureDefaultLogger(t)
+	d := newTestDispatcher(t, LogTo(logger))
+
+	d.GateKeeper().BlockAddressString("10.0.0.1")
+	c.Contains(sink.contents(), `msg="blocked peer"`)
+	c.NotContains(defaultSink.contents(), "blocked peer",
+		"LogTo must keep the dispatcher's logging, the gatekeeper's included, off the process default logger")
+}
+
+// newTestLogger returns a logger that records everything written to it, down to the debug level the gatekeeper uses,
+// along with the sink holding what it recorded.
+func newTestLogger() (*slog.Logger, *logSink) {
+	sink := &logSink{}
+	return slog.New(slog.NewTextHandler(sink, &slog.HandlerOptions{Level: slog.LevelDebug})), sink
+}
+
+// captureDefaultLogger replaces the process default logger with one that records what it is given for the duration of
+// the test, so that a test can tell whether anything reached it, and puts the original back afterwards.
+func captureDefaultLogger(t *testing.T) *logSink {
+	t.Helper()
+	logger, sink := newTestLogger()
+	previous := slog.Default()
+	slog.SetDefault(logger)
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return sink
+}
+
+// logSink collects log output. Writes are serialized because a dispatcher logs from its own goroutines while the test
+// that made it is reading what has been logged so far.
+type logSink struct {
+	buffer strings.Builder
+	lock   sync.Mutex
+}
+
+func (s *logSink) Write(p []byte) (int, error) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	return s.buffer.Write(p)
+}
+
+// contents returns everything logged so far.
+func (s *logSink) contents() string {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	return s.buffer.String()
 }
 
 // TestFixedExternalIP verifies that a supplied address is reported as our external one without any lookup being made,

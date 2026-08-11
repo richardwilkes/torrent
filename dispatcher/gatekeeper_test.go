@@ -19,7 +19,7 @@ import (
 // TestGateKeeperBlocking verifies the basic block life cycle, so that the pruning tests are working from a known state.
 func TestGateKeeperBlocking(t *testing.T) {
 	c := check.New(t)
-	gk := NewGateKeeper()
+	gk := NewGateKeeper(nil)
 	defer gk.Close()
 
 	const addr = "10.0.0.1"
@@ -35,7 +35,7 @@ func TestGateKeeperBlocking(t *testing.T) {
 // TestPruneRemovesExpiredBlocks verifies that pruning drops the blocks that have run out while leaving the rest alone.
 func TestPruneRemovesExpiredBlocks(t *testing.T) {
 	c := check.New(t)
-	gk := NewGateKeeper()
+	gk := NewGateKeeper(nil)
 	defer gk.Close()
 
 	gk.addresses.Store("10.0.0.1", time.Now().Add(-time.Minute))
@@ -52,7 +52,7 @@ func TestPruneRemovesExpiredBlocks(t *testing.T) {
 // peer that had just been blocked, which is precisely the peer we least want to let back in.
 func TestPruneDoesNotUnblockRecentlyReblockedPeer(t *testing.T) {
 	c := check.New(t)
-	gk := NewGateKeeper()
+	gk := NewGateKeeper(nil)
 	defer gk.Close()
 
 	const addr = "10.0.0.1"
@@ -71,17 +71,54 @@ func TestPruneDoesNotUnblockRecentlyReblockedPeer(t *testing.T) {
 	c.False(stillThere)
 }
 
+// TestGateKeeperLogsToTheLoggerItWasGiven verifies that the lines saying a peer was blocked and unblocked go to the
+// gatekeeper's own logger rather than to the package level slog functions, which write to the process default logger
+// no matter what the dispatcher was told to use.
+func TestGateKeeperLogsToTheLoggerItWasGiven(t *testing.T) {
+	c := check.New(t)
+	logger, sink := newTestLogger()
+	defaultSink := captureDefaultLogger(t)
+	gk := NewGateKeeper(logger)
+	defer gk.Close()
+
+	const addr = "10.0.0.1"
+	gk.BlockAddressString(addr)
+	expired := time.Now().Add(-time.Minute)
+	gk.addresses.Store(addr, expired)
+	gk.unblockIfExpired(addr, expired)
+
+	logged := sink.contents()
+	// The whole message, since "blocked peer" is also a part of "unblocked peer"
+	c.Contains(logged, `msg="blocked peer"`)
+	c.Contains(logged, `msg="unblocked peer"`)
+	c.Contains(logged, addr)
+	c.NotContains(defaultSink.contents(), "blocked peer",
+		"the gatekeeper's logging must stay off the process default logger")
+}
+
+// TestGateKeeperWithoutALoggerUsesTheDefault verifies that a gatekeeper handed no logger of its own still logs, rather
+// than going silent or dereferencing a nil logger.
+func TestGateKeeperWithoutALoggerUsesTheDefault(t *testing.T) {
+	c := check.New(t)
+	defaultSink := captureDefaultLogger(t)
+	gk := NewGateKeeper(nil)
+	defer gk.Close()
+
+	gk.BlockAddressString("10.0.0.1")
+	c.Contains(defaultSink.contents(), `msg="blocked peer"`)
+}
+
 // TestGateKeeperCloseIsIdempotent verifies that a second Close is a no-op rather than a panic, since nothing prevents
 // Dispatcher.Stop from being called more than once.
 func TestGateKeeperCloseIsIdempotent(t *testing.T) {
 	c := check.New(t)
-	gk := NewGateKeeper()
+	gk := NewGateKeeper(nil)
 	c.NotPanics(gk.Close)
 	c.NotPanics(gk.Close)
 
 	// Concurrent closes must be no less safe than sequential ones. A panic in one of these goroutines can't be
 	// recovered by the test, so it takes the whole run down with it, which is failure enough.
-	gk2 := NewGateKeeper()
+	gk2 := NewGateKeeper(nil)
 	done := make(chan struct{}, 4)
 	for range 4 {
 		go func() {
