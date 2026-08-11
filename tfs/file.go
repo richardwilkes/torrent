@@ -54,6 +54,14 @@ const (
 	// NewFileFromReader may be a network stream with no end to it.
 	MaxTorrentFileLength = 64 * 1024 * 1024
 
+	// MaxFileCount is the largest number of file entries a torrent may declare. Each entry is materialized several
+	// times over — twice while its path is validated, again in the map backing the virtual file system, and again as a
+	// node in the tree it hangs from — so the resident cost of a torrent is a sizable multiple of the bytes it spent
+	// describing its files, and MaxTorrentFileLength alone leaves that unbounded: a maximally sized file of minimal
+	// entries carries millions of them. Real torrents run to the thousands of files, so this sits far above anything
+	// legitimate while keeping what the metadata can cost us in the tens of megabytes.
+	MaxFileCount = 1 << 17
+
 	// MaxNestingDepth is the deepest that bencoded lists and dictionaries may nest. The decoder recurses once per
 	// level, and a torrent may be as little as a megabyte of nothing but list heads, so the depth has to be bounded
 	// before decoding rather than after. Real torrents sit at five levels or so, and even the per-component
@@ -166,12 +174,16 @@ func NewFileFromBytes(data []byte) (*File, error) {
 	return &f, nil
 }
 
-// checkNesting rejects data whose bencoded lists and dictionaries nest more than MaxNestingDepth levels deep. The
-// decoder recurses once per level, so a file that is little more than a long run of list heads drives it past the
-// goroutine stack limit, and the resulting stack overflow is a fatal runtime error that no recover() can catch. The
-// depth therefore has to be measured before the decoder ever sees the bytes. Only the nesting is judged here: input
-// this scan can't make sense of is left for the decoder to report, since the decoder walks the same tokens the same
-// way and stops at the same place, without ever recursing deeper than what was measured up to it.
+// checkNesting rejects data the decoder can't be handed safely: bencoded lists and dictionaries that nest more than
+// MaxNestingDepth levels deep, and strings claiming more bytes than the data actually holds. The decoder recurses once
+// per level, so a file that is little more than a long run of list heads drives it past the goroutine stack limit, and
+// the resulting stack overflow is a fatal runtime error that no recover() can catch. It also allocates a string's
+// declared length before reading it, so a few dozen bytes claiming a gigabyte make it allocate a gigabyte and only
+// then report that the file was truncated — a bound on the size of the file is no help there, since it is the claimed
+// length rather than the bytes present that sizes the allocation. Both therefore have to be judged before the decoder
+// ever sees the bytes. Nothing else is: input this scan can't make sense of is left for the decoder to report, since
+// the decoder walks the same tokens the same way and stops at the same place, without ever recursing deeper or
+// allocating more than what was measured up to it.
 func checkNesting(data []byte) error {
 	depth := 0
 	for i := 0; i < len(data); {
@@ -192,8 +204,11 @@ func checkNesting(data []byte) error {
 			}
 			i += end + 2
 		case c >= '0' && c <= '9':
-			next, ok := skipBencodedString(data, i)
-			if !ok {
+			next, err := skipBencodedString(data, i)
+			if err != nil {
+				return err
+			}
+			if next < 0 {
 				return nil
 			}
 			i = next
@@ -208,23 +223,30 @@ func checkNesting(data []byte) error {
 	return nil
 }
 
-// skipBencodedString returns the index just past the bencoded string starting at i, or false if what is there isn't
-// one the decoder could read either.
-func skipBencodedString(data []byte, i int) (int, bool) {
+// skipBencodedString returns the index just past the bencoded string starting at i. A negative index means what is
+// there isn't a string the decoder could read either, which is left for the decoder to report along with everything
+// else this scan doesn't judge. An error is returned for the one case that can't wait for the decoder: a string
+// claiming more bytes than the data holds, which the decoder allocates in full before discovering there is nothing to
+// fill it with.
+func skipBencodedString(data []byte, i int) (int, error) {
 	length := 0
 	for ; i < len(data) && data[i] >= '0' && data[i] <= '9'; i++ {
 		length = length*10 + int(data[i]-'0')
 		if length > len(data) {
-			return 0, false // Longer than everything we hold, so no decoder could satisfy it.
+			// Already beyond everything we hold, so no digit that follows could bring it back within reach, and
+			// accumulating more of them is how the length itself overflows.
+			return 0, errs.Newf("torrent data declares a string of at least %d bytes, but holds only %d", length,
+				len(data))
 		}
 	}
 	if i == len(data) || data[i] != ':' {
-		return 0, false
+		return -1, nil
 	}
-	if i += 1 + length; i > len(data) {
-		return 0, false
+	i++
+	if length > len(data)-i {
+		return 0, errs.Newf("torrent data declares a %d byte string, but only %d bytes remain", length, len(data)-i)
 	}
-	return i, true
+	return i + length, nil
 }
 
 // validate rejects metadata that is internally inconsistent. Without this, a corrupt or hostile .torrent file can
@@ -247,6 +269,11 @@ func (f *File) validate() error {
 	}
 	if f.Info.Length > 0 && len(f.Info.Files) != 0 {
 		return errs.New("torrent must specify either a length or a file list, but not both")
+	}
+	// Checked before the entries are walked, since the walk is what turns each of them into the structures the bound
+	// exists to limit.
+	if len(f.Info.Files) > MaxFileCount {
+		return errs.Newf("torrent file count of %d exceeds the maximum of %d", len(f.Info.Files), MaxFileCount)
 	}
 	size, err := f.validateEntries()
 	if err != nil {

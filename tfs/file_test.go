@@ -18,6 +18,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -312,11 +313,91 @@ func TestNewFileFromBytesRejectsDeeplyNestedData(t *testing.T) {
 		{name: "inside the info dictionary", data: "d" + bstr("info") + "d" + bstr("name") + deep},
 		{name: "mixed", data: strings.Repeat("dl", 500000)},
 	} {
-		t.Run(one.name, func(_ *testing.T) {
+		t.Run(one.name, func(t *testing.T) {
 			_, decodeErr := tfs.NewFileFromBytes([]byte(one.data))
-			c.HasError(decodeErr, one.name)
+			check.New(t).HasError(decodeErr)
 		})
 	}
+}
+
+// TestNewFileFromBytesRejectsOverlongStrings covers the length a bencoded string declares for itself. The decoder
+// allocates that length before reading it, so a few dozen bytes claiming a gigabyte make it allocate a gigabyte and
+// only then report that the file was truncated. MaxTorrentFileLength is no defense, since what sizes the allocation is
+// the length claimed rather than the bytes that arrived.
+func TestNewFileFromBytesRejectsOverlongStrings(t *testing.T) {
+	const claimed = 1 << 30
+	for _, one := range []struct {
+		name string
+		data string
+	}{
+		{name: "the reported case", data: "d4:infod4:name1500000000:xe"},
+		{name: "as a value", data: "d8:announce" + strconv.Itoa(claimed) + ":xe"},
+		{name: "as a key", data: "d" + strconv.Itoa(claimed) + ":xi0ee"},
+		{name: "one byte more than remains", data: "d4:name5:abcde"},
+		{name: "nested inside the info dictionary", data: "d4:infod6:pieces" + strconv.Itoa(claimed) + ":xee"},
+		{name: "no digits could bring it back", data: "d4:name99999999999999999999:xe"},
+	} {
+		t.Run(one.name, func(t *testing.T) {
+			c := check.New(t)
+			var f *tfs.File
+			var err error
+			allocated := allocatedBy(func() { f, err = tfs.NewFileFromBytes([]byte(one.data)) })
+			c.Nil(f)
+			c.HasError(err)
+			// The point of refusing it before the decoder sees it: the claim never becomes an allocation.
+			c.True(allocated < 1<<20, "%d bytes were allocated for a %d byte input", allocated, len(one.data))
+		})
+	}
+
+	// A string that exactly fills what remains is not over-long, and a valid torrent still parses.
+	c := check.New(t)
+	f, err := tfs.NewFileFromBytes(encodeTorrent(t, singleFileInfo()))
+	c.NoError(err)
+	c.Equal(int64(20), f.Size())
+}
+
+// allocatedBy returns the number of bytes allocated while f runs.
+func allocatedBy(f func()) uint64 {
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	f()
+	runtime.ReadMemStats(&after)
+	return after.TotalAlloc - before.TotalAlloc
+}
+
+// TestNewFileFromBytesRejectsTooManyFileEntries covers the number of file entries, the one dimension of the metadata
+// that the bound on the file's size leaves open. Every entry is materialized several times over as it is validated and
+// turned into the virtual tree, so a file of nothing but minimal entries costs many times its own size in memory.
+func TestNewFileFromBytesRejectsTooManyFileEntries(t *testing.T) {
+	c := check.New(t)
+
+	// The largest permitted number of entries is still accepted, with every one of them accounted for.
+	f, err := tfs.NewFileFromBytes(torrentWithFileCount(tfs.MaxFileCount))
+	c.NoError(err)
+	c.Equal(int64(tfs.MaxFileCount), f.Size())
+	c.Equal(tfs.MaxFileCount, len(f.Info.Files))
+
+	// One entry beyond it is refused rather than parsed.
+	_, err = tfs.NewFileFromBytes(torrentWithFileCount(tfs.MaxFileCount + 1))
+	c.HasError(err)
+}
+
+// torrentWithFileCount bencodes a torrent whose info dictionary carries the given number of one-byte file entries. The
+// bytes are assembled here rather than routed through the encoder, which spends far longer building a map per entry
+// than the parse under test takes. The piece length is one byte, so the piece count matches the number of entries.
+func torrentWithFileCount(count int) []byte {
+	var buf strings.Builder
+	buf.WriteString("d" + bstr("announce") + bstr("http://example.com/announce") + bstr("info") + "d")
+	buf.WriteString(bstr("files") + "l")
+	for i := range count {
+		buf.WriteString("d" + bstr(lengthKey) + "i1e" + bstr(pathKey) + "l" + bstr(strconv.Itoa(i)) + "ee")
+	}
+	buf.WriteString("e" + bstr("name") + bstr("example"))
+	buf.WriteString(bstr("piece length") + "i1e")
+	buf.WriteString(bstr("pieces") + strconv.Itoa(count*sha1Size) + ":")
+	buf.Write(hashes(count))
+	buf.WriteString("ee")
+	return []byte(buf.String())
 }
 
 // endlessReader stands in for a reader with nothing bounding it, such as a network stream, reporting every byte asked
@@ -416,13 +497,14 @@ func TestNewFileFromBytesBoundsFilePaths(t *testing.T) {
 		{name: "components hidden inside one string", parts: []string{strings.Join(deepest, "/") + "/" + fileA}},
 		{name: "the reported case", parts: []string{strings.Repeat("a/", 79999) + fileA}},
 	} {
-		t.Run(one.name, func(_ *testing.T) {
+		t.Run(one.name, func(t *testing.T) {
+			sub := check.New(t)
 			_, pathErr := tfs.NewFileFromBytes(encodeTorrent(t, infoWithPath(one.parts...)))
-			c.HasError(pathErr, one.name)
+			sub.HasError(pathErr)
 			if pathErr != nil {
 				// The rejected path came out of the torrent, so the message may not quote all of it back.
 				message, _, _ := strings.Cut(pathErr.Error(), "\n")
-				c.True(len(message) < 256, "%s: %d byte message", one.name, len(message))
+				sub.True(len(message) < 256, "%d byte message", len(message))
 			}
 		})
 	}
@@ -536,8 +618,12 @@ func TestOpenReportsMissingStorageAsAPathError(t *testing.T) {
 
 	_, err = f.Open(fileB)
 	c.HasError(err)
+	// Fatal rather than recorded and stepped over: everything below reaches through the pointer errors.As fills in,
+	// and a nil one would panic and take the whole test binary with it instead of failing this one test.
 	var pathErr *fs.PathError
-	c.True(errors.As(err, &pathErr), "must yield an *fs.PathError")
+	if !errors.As(err, &pathErr) {
+		t.Fatalf("must yield an *fs.PathError, got %T", err)
+	}
 	c.Equal("open", pathErr.Op)
 	// The path must name the virtual file, not the on-disk storage file behind it.
 	c.Equal(fileB, pathErr.Path)
@@ -593,15 +679,22 @@ func TestOpenObeysTheFSContract(t *testing.T) {
 	for _, name := range []string{"", "/", "/b.txt", "./b.txt", "b.txt/", "sub/../b.txt", "../b.txt"} {
 		_, err := f.Open(name)
 		c.HasError(err, "open %q", name)
+		// Reaching through the pointer errors.As fills in only once it actually filled one in, since a nil one would
+		// panic and take the whole test binary down rather than fail this case. The remaining names are still checked.
 		var pathErr *fs.PathError
-		c.True(errors.As(err, &pathErr), "open %q should yield an *fs.PathError", name)
+		if !errors.As(err, &pathErr) {
+			t.Errorf("open %q should yield an *fs.PathError, got %T", name, err)
+			continue
+		}
 		c.True(errors.Is(err, fs.ErrInvalid), "open %q should report fs.ErrInvalid", name)
 		c.Equal(name, pathErr.Path)
 	}
 
 	_, err := f.Open("nope.txt")
 	var pathErr *fs.PathError
-	c.True(errors.As(err, &pathErr))
+	if !errors.As(err, &pathErr) {
+		t.Fatalf("opening a name that isn't there should yield an *fs.PathError, got %T", err)
+	}
 	c.True(errors.Is(err, fs.ErrNotExist))
 	c.Equal("open", pathErr.Op)
 

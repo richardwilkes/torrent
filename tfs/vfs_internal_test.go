@@ -127,7 +127,6 @@ func TestReaddirOnAnEmptyDirectory(t *testing.T) {
 }
 
 func TestCleanVirtualPath(t *testing.T) {
-	c := check.New(t)
 	const (
 		fileB = "b.txt"
 		abTxt = "a/" + fileB
@@ -147,10 +146,11 @@ func TestCleanVirtualPath(t *testing.T) {
 		{name: "only empties", parts: []string{"", ""}},
 		{name: "only dots", parts: []string{".", "..", "/"}},
 	} {
-		t.Run(one.name, func(_ *testing.T) {
+		t.Run(one.name, func(t *testing.T) {
+			c := check.New(t)
 			actual, ok := cleanVirtualPath(one.parts)
-			c.Equal(one.ok, ok, one.name)
-			c.Equal(one.expected, actual, one.name)
+			c.Equal(one.ok, ok)
+			c.Equal(one.expected, actual)
 		})
 	}
 }
