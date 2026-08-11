@@ -12,10 +12,13 @@ package tio
 import (
 	"io"
 	"net"
+	"os"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/richardwilkes/toolbox/v2/check"
+	"github.com/richardwilkes/toolbox/v2/errs"
 	"github.com/richardwilkes/toolbox/v2/xio"
 )
 
@@ -84,6 +87,94 @@ func TestWriteWithNoDeadlineClearsAPreviousOne(t *testing.T) {
 	case <-time.After(testDeadlineWait * 20):
 		t.Fatal("the write never reached the other end")
 	}
+}
+
+// TestShouldLogIOErrorIgnoresRoutinePeerErrors verifies that the ordinary ways a peer connection ends stay out of the
+// log. A peer departing mid-write, a dial nothing answers and a route that doesn't exist happen constantly across a
+// swarm and say nothing about this client, so logging them buries whatever else the log had to say.
+func TestShouldLogIOErrorIgnoresRoutinePeerErrors(t *testing.T) {
+	for _, one := range []struct {
+		err  error
+		name string
+		log  bool
+	}{
+		{name: "no error", err: nil},
+		{name: "end of stream", err: io.EOF},
+		{name: "truncated read", err: errs.Wrap(io.ErrUnexpectedEOF)},
+		{name: "our own close", err: errs.Wrap(net.ErrClosed)},
+		{name: "deadline", err: errs.Wrap(os.ErrDeadlineExceeded)},
+		{name: "peer gone mid-write", err: wrappedOpError("write", syscall.EPIPE)},
+		{name: "peer reset", err: wrappedOpError("read", syscall.ECONNRESET)},
+		{name: "dial refused", err: wrappedOpError("dial", syscall.ECONNREFUSED)},
+		{name: "host unreachable", err: wrappedOpError("dial", syscall.EHOSTUNREACH)},
+		{name: "network unreachable", err: wrappedOpError("dial", syscall.ENETUNREACH)},
+		{name: "broken pipe by text alone", err: errs.New("write tcp 10.0.0.1:6881->10.0.0.2:51413: broken pipe")},
+		{name: "no route to host by text alone", err: errs.New("dial tcp 10.0.0.2:51413: no route to host")},
+		{name: "unreachable network by text alone", err: errs.New("dial tcp 10.0.0.2:51413: network is unreachable")},
+		{name: "anything else", err: errs.New("the piece hash didn't match"), log: true},
+		{name: "a wrapped anything else", err: errs.Wrap(io.ErrShortWrite), log: true},
+	} {
+		t.Run(one.name, func(t *testing.T) {
+			check.New(t).Equal(one.log, ShouldLogIOError(one.err))
+		})
+	}
+}
+
+// wrappedOpError builds the error a connection actually hands back for a failed operation: the operating system's
+// error, inside the net package's own, inside the wrapper every call site here puts around it. Matching has to hold
+// through all of that, since nothing above the syscall ever sees the bare error.
+func wrappedOpError(op string, err error) error {
+	return errs.Wrap(&net.OpError{Op: op, Net: "tcp", Err: &os.SyscallError{Syscall: op, Err: err}})
+}
+
+// TestShouldLogIOErrorIgnoresARealPeerHangingUp exercises the same against an error the operating system produced,
+// rather than one assembled to look like it, since the wording and the errno both vary by platform.
+func TestShouldLogIOErrorIgnoresARealPeerHangingUp(t *testing.T) {
+	c := check.New(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	c.NoError(err)
+	defer xio.CloseIgnoringErrors(listener)
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			close(accepted)
+			return
+		}
+		accepted <- conn
+	}()
+	conn, err := net.Dial("tcp", listener.Addr().String())
+	c.NoError(err)
+	defer xio.CloseIgnoringErrors(conn)
+
+	// A nil here is the accept having failed, which the receive below is bounded against in any case; everything that
+	// follows dereferences it, so it ends the test rather than merely failing an assertion.
+	var remote net.Conn
+	select {
+	case remote = <-accepted:
+	case <-time.After(testDeadlineWait * 100):
+	}
+	if remote == nil {
+		t.Fatal("the connection was never accepted")
+	}
+
+	// The peer goes away without reading a thing, which is what a peer disconnecting mid-transfer looks like from
+	// here. A zero linger makes the close a reset, so what follows fails the way it would against a peer that vanished
+	// rather than one that shut down politely.
+	if tcp, ok := remote.(*net.TCPConn); ok {
+		c.NoError(tcp.SetLinger(0))
+	}
+	c.NoError(remote.Close())
+
+	// Writing into that takes a few passes to fail: the first of them only fills the send buffer.
+	buffer := make([]byte, 64*1024)
+	var writeErr error
+	deadline := time.Now().Add(testDeadlineWait * 100)
+	for writeErr == nil && time.Now().Before(deadline) {
+		writeErr = WriteWithDeadline(conn, buffer, testDeadlineWait*10)
+	}
+	c.HasError(writeErr)
+	c.False(ShouldLogIOError(writeErr), "a peer hanging up mid-write isn't worth a log line: %v", writeErr)
 }
 
 // TestDeadlineStillApplies verifies that the deadline a caller asks for is still armed, since clearing a stale one is

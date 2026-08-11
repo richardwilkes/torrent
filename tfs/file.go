@@ -150,21 +150,28 @@ func NewFileFromBytes(data []byte) (*File, error) {
 	if err := checkNesting(data); err != nil {
 		return nil, err
 	}
-	var f File
-	if err := bencode.DecodeBytes(data, &f); err != nil {
-		return nil, errs.Wrap(err)
-	}
 	// The info hash must be taken over the info dictionary's bytes exactly as they appeared in the file. Hashing a
 	// re-encoding of the decoded form would normalize key order and collapse duplicate keys, silently yielding a hash
 	// that no tracker or peer agrees with for any torrent that wasn't already canonically encoded.
 	var raw struct {
-		Info bencode.RawMessage `bencode:"info"`
+		Announce string             `bencode:"announce"`
+		Info     bencode.RawMessage `bencode:"info"`
 	}
 	if err := bencode.DecodeBytes(data, &raw); err != nil {
 		return nil, errs.Wrap(err)
 	}
 	if len(raw.Info) == 0 {
 		return nil, errs.New("torrent info dictionary is missing")
+	}
+	// The metadata is decoded from those same bytes rather than from the file a second time, so that what we hold and
+	// what we hashed can't describe different torrents. A file carrying two top-level "info" keys is decoded by
+	// merging the two dictionaries field by field, last one to name a field winning, while the bytes above are only
+	// the last dictionary: the metadata in use would then match neither what was hashed nor anything a peer or tracker
+	// could agree with, leaving a torrent that parses and then fails every handshake.
+	var f File
+	f.Announce = raw.Announce
+	if err := bencode.DecodeBytes(raw.Info, &f.Info); err != nil {
+		return nil, errs.Wrap(err)
 	}
 	if err := f.validate(); err != nil {
 		return nil, err
@@ -365,11 +372,13 @@ func (f *File) Size() int64 {
 	return total
 }
 
-// StoragePath returns the path that will be used for torrent file storage.
+// StoragePath returns the path that will be used for torrent file storage. The extension is trimmed with
+// xfilepath.TrimExtension rather than filepath.Ext, since the whole of a dotfile-style name (".config") is an
+// extension as far as the latter is concerned: trimming that leaves nothing but DownloadExt, so every such torrent
+// sharing a download directory would be handed the same storage file to write its data into.
 func (f *File) StoragePath() string {
 	dir, filename := filepath.Split(f.Path)
-	ext := filepath.Ext(filename)
-	filename = filename[:len(filename)-len(ext)]
+	filename = xfilepath.TrimExtension(filename)
 	return filepath.Join(dir, truncateName(filename, maxStorageNameLength-len(DownloadExt))+DownloadExt)
 }
 

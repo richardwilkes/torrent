@@ -60,10 +60,27 @@ const (
 )
 
 var (
-	// TrackerUserAgent will be used as the http client user agent header if not empty.
-	TrackerUserAgent = ""
+	// trackerUserAgent is read by every announce, which are made from the client's run goroutine and from each
+	// tracker's periodic announce goroutine, and may be set by the application at any point. A plain string would make
+	// any set that isn't strictly ordered before every client start a data race, which is not a constraint an
+	// application can be expected to honor for a package-level knob.
+	trackerUserAgent atomic.Pointer[string]
 	httpClient       = &http.Client{Timeout: 30 * time.Second}
 )
+
+// SetTrackerUserAgent sets the user agent header sent with tracker announces. An empty string, which is the default,
+// sends none. It is safe to call at any time, including while clients are announcing.
+func SetTrackerUserAgent(agent string) {
+	trackerUserAgent.Store(&agent)
+}
+
+// TrackerUserAgent returns the user agent header sent with tracker announces. An empty string means none is sent.
+func TrackerUserAgent() string {
+	if agent := trackerUserAgent.Load(); agent != nil {
+		return *agent
+	}
+	return ""
+}
 
 type tracker struct {
 	client *Client
@@ -349,11 +366,16 @@ func (t *tracker) announceStopping() bool {
 
 // announceInterval returns how long to wait before the next announce. The tracker's requested interval is bounded at
 // both ends: it is unverified data, and the conversion to a time.Duration is only safe once the value is known to be
-// small enough not to overflow it.
+// small enough not to overflow it. Non-positive values are answered before that conversion is made at all, since a
+// large enough negative one overflows it just as a large positive one does, and lands back in the positive range: an
+// interval of about 292 years, which would silence the periodic announce for the life of the process.
 func (t *tracker) announceInterval() time.Duration {
 	t.lock.RLock()
 	seconds := t.interval
 	t.lock.RUnlock()
+	if seconds <= 0 {
+		return minAnnounceInterval
+	}
 	if seconds > int(maxAnnounceInterval/time.Second) {
 		return maxAnnounceInterval
 	}
@@ -564,8 +586,8 @@ func (t *tracker) request(ctx context.Context, urlStr string) (*http.Response, e
 	if err != nil {
 		return nil, errs.Wrap(err)
 	}
-	if TrackerUserAgent != "" {
-		req.Header.Set("user-agent", TrackerUserAgent)
+	if agent := TrackerUserAgent(); agent != "" {
+		req.Header.Set("user-agent", agent)
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {

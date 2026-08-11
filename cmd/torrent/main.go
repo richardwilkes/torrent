@@ -52,7 +52,7 @@ func main() {
 	uploadCap := flag.Int("up", 100*1024, "Maximum upload rate in `bytes`/second")
 	port := flag.Uint("port", 0, "Port to use for incoming connections (use 0 for random)")
 	seedDuration := flag.Duration("seed", 0, "Seed time")
-	flag.StringVar(&torrent.TrackerUserAgent, "agent", torrent.TrackerUserAgent, "User agent to use")
+	userAgent := flag.String("agent", torrent.TrackerUserAgent(), "User agent to use")
 	unpackOnly := flag.Bool("unpack", false, "Only unpack the torrent")
 
 	var logCfg xslog.Config
@@ -61,6 +61,7 @@ func main() {
 	xflag.AddVersionFlags()
 	xflag.SetUsage(nil, "", "<torrent file>")
 	xflag.Parse()
+	torrent.SetTrackerUserAgent(*userAgent)
 
 	torrentPath, err := torrentFilePath(flag.Args())
 	if err != nil {

@@ -18,6 +18,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -134,6 +135,13 @@ const (
 	// failureResponse is a tracker refusing the announce, the one thing in a response that is an error in its own
 	// right rather than something missing from it.
 	failureResponse = "d14:failure reason9:not founde"
+
+	// testUserAgent stands in for whatever an application puts in the user agent header of its announces.
+	testUserAgent = "torrent-test-agent"
+
+	// concurrentAgentSetters is how many goroutines change the user agent while announces are being made, each of them
+	// paired with an announce of its own.
+	concurrentAgentSetters = 4
 )
 
 // overflowSeconds is the smallest interval, in seconds, whose conversion to a time.Duration overflows. The arithmetic
@@ -143,9 +151,16 @@ const (
 // to the maximum announce interval.
 const overflowSeconds = int(min(int64(math.MaxInt), math.MaxInt64/int64(time.Second)+1))
 
+// wrapSeconds is the negative interval closest to zero whose conversion to a time.Duration overflows the other way,
+// landing back in the positive range at roughly 292 years. The clamp is again for a 32-bit platform, where no int
+// reaches far enough to wrap and the most negative one stands in for it.
+const wrapSeconds = int(max(int64(math.MinInt), -(math.MaxInt64/int64(time.Second) + 1)))
+
 // TestAnnounceIntervalIsBounded verifies the wait between announces stays within sane limits no matter what the
 // tracker asks for. A value large enough to overflow the conversion to a time.Duration yields a negative delay, whose
-// timer fires immediately and turns the periodic announce into a tight loop of HTTP round trips.
+// timer fires immediately and turns the periodic announce into a tight loop of HTTP round trips, while one negative
+// enough to overflow it the other way lands back in the positive range at a delay measured in centuries, which
+// silences the periodic announce entirely.
 func TestAnnounceIntervalIsBounded(t *testing.T) {
 	for _, one := range []struct {
 		name     string
@@ -155,6 +170,7 @@ func TestAnnounceIntervalIsBounded(t *testing.T) {
 		{name: "unset", seconds: 0, expected: minAnnounceInterval},
 		{name: "negative", seconds: -1, expected: minAnnounceInterval},
 		{name: "hugely negative", seconds: math.MinInt, expected: minAnnounceInterval},
+		{name: "negative enough to wrap positive", seconds: wrapSeconds, expected: minAnnounceInterval},
 		{name: "too frequent", seconds: 60, expected: minAnnounceInterval},
 		{name: "at the minimum", seconds: int(minAnnounceInterval / time.Second), expected: minAnnounceInterval},
 		{name: "reasonable", seconds: 1800, expected: 30 * time.Minute},
@@ -588,7 +604,7 @@ func TestCompletedAnnounceIsNotMadeOnThePeerGoroutine(t *testing.T) {
 		fmt.Fprint(w, noPeersResponse)
 	})
 	c.NoError(client.tracker.announceStart())
-	c.Equal(startedMsg, <-events)
+	c.Equal(startedMsg, nextAnnounceValue(t, events))
 
 	// Completing the download has to come back at once rather than sit on the tracker's answer
 	waitFor(t, "markBlockValid", func() {
@@ -638,13 +654,75 @@ func TestCompletedIsNotAnnouncedForADownloadThatNeverHappened(t *testing.T) {
 	c.True(client.tracker.isDownloadComplete())
 
 	c.NoError(client.tracker.announceStart())
-	c.Equal(startedMsg, <-events)
+	c.Equal(startedMsg, nextAnnounceValue(t, events))
 	defer client.tracker.stopPeriodicAnnounce()
 	select {
 	case event := <-events:
 		t.Fatalf("a %q event was announced for a download that never happened", event)
 	case <-time.After(100 * time.Millisecond):
 	}
+}
+
+// nextAnnounceValue returns what the stub tracker recorded for the next announce it is asked to make. The wait is
+// bounded because the announce that would record one may fail before it ever reaches the stub: a bare receive would
+// then block for as long as the test binary is allowed to run, turning what should be one failed assertion into a
+// timeout panic that takes the whole package's test run down with it.
+func nextAnnounceValue(t *testing.T, recorded <-chan string) string {
+	t.Helper()
+	select {
+	case value := <-recorded:
+		return value
+	case <-time.After(peerMgmtWait):
+		t.Fatal("no announce reached the tracker")
+		return ""
+	}
+}
+
+// TestTrackerUserAgentIsSafeToSetWhileAnnouncing verifies that the user agent reaches the tracker and that setting it
+// while announces are being made is not a data race. Announces are made from the client's run goroutine and from each
+// tracker's periodic announce goroutine, neither of which an application setting a package-level knob knows anything
+// about, so nothing but the value's own synchronization stands between the two.
+func TestTrackerUserAgentIsSafeToSetWhileAnnouncing(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	agents := make(chan string, 2*concurrentAgentSetters+2)
+	client := newTestTrackerClientWithHandler(t, d, func(w http.ResponseWriter, r *http.Request) {
+		agents <- r.UserAgent()
+		fmt.Fprint(w, noPeersResponse)
+	})
+	original := TrackerUserAgent()
+	defer SetTrackerUserAgent(original)
+
+	// An empty agent, which is the default, sets no header of our own, leaving the HTTP client's to stand
+	SetTrackerUserAgent("")
+	c.Equal("", TrackerUserAgent())
+	c.NoError(client.tracker.announce(context.Background(), ""))
+	c.NotContains(nextAnnounceValue(t, agents), testUserAgent)
+
+	// What was set is what the tracker sees
+	SetTrackerUserAgent(testUserAgent)
+	c.Equal(testUserAgent, TrackerUserAgent())
+	c.NoError(client.tracker.announce(context.Background(), ""))
+	c.Equal(testUserAgent, nextAnnounceValue(t, agents))
+
+	// And setting it alongside announces already in flight is something an application is free to do, which is what
+	// the race detector is here to judge
+	var wg sync.WaitGroup
+	for i := range concurrentAgentSetters {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			SetTrackerUserAgent(fmt.Sprintf("%s/%d", testUserAgent, i))
+		}()
+		go func() {
+			defer wg.Done()
+			// Whether the announce itself succeeds isn't what is being judged here, only that reading the agent
+			// alongside a set of it is safe.
+			_ = client.tracker.announce(context.Background(), "") //nolint:errcheck // See above
+		}()
+	}
+	wg.Wait()
+	c.HasPrefix(TrackerUserAgent(), testUserAgent)
 }
 
 // testTrackerResponse is what the stub tracker answers with. Either field may be changed between announces; a status

@@ -34,6 +34,10 @@ import (
 const (
 	sha1Size = 20
 
+	// allocationRuns is how many times allocatedBy runs the function it is measuring, taking the smallest measurement
+	// of the set as the one least polluted by allocations made elsewhere in the process while it ran.
+	allocationRuns = 3
+
 	// maxStorageNameLength mirrors the limit tfs applies to a single path element of the storage path.
 	maxStorageNameLength = 255
 
@@ -356,13 +360,23 @@ func TestNewFileFromBytesRejectsOverlongStrings(t *testing.T) {
 	c.Equal(int64(20), f.Size())
 }
 
-// allocatedBy returns the number of bytes allocated while f runs.
+// allocatedBy returns an upper bound on the number of bytes f allocates. TotalAlloc counts the whole process, so a
+// single difference across a call also carries whatever the runtime's own goroutines allocated while it ran, and
+// attributes all of it to f. That over-count can only make a bound on f's allocations fail, never pass wrongly, but it
+// is still noise standing in for the thing being measured, so the smallest of several runs is taken: f allocates the
+// same amount every time, while the noise alongside it does not.
 func allocatedBy(f func()) uint64 {
-	var before, after runtime.MemStats
-	runtime.ReadMemStats(&before)
-	f()
-	runtime.ReadMemStats(&after)
-	return after.TotalAlloc - before.TotalAlloc
+	var smallest uint64
+	for i := range allocationRuns {
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		f()
+		runtime.ReadMemStats(&after)
+		if allocated := after.TotalAlloc - before.TotalAlloc; i == 0 || allocated < smallest {
+			smallest = allocated
+		}
+	}
+	return smallest
 }
 
 // TestNewFileFromBytesRejectsTooManyFileEntries covers the number of file entries, the one dimension of the metadata
@@ -538,6 +552,48 @@ func TestInfoHashComesFromTheRawInfoDictionary(t *testing.T) {
 	c.Equal(tfs.InfoHash(sha1.Sum(reencoded)), f.InfoHash) //nolint:gosec // The spec requires sha1
 }
 
+// TestMetadataComesFromTheHashedInfoDictionary verifies that what we hold as the torrent's metadata is the same
+// dictionary the info hash was taken over. A file carrying two top-level "info" keys is decoded by merging them field
+// by field, so any field the second leaves out is filled in from the first, while the hash covers only the second: the
+// torrent would parse and then fail every handshake and announce, describing a torrent that exists nowhere else.
+func TestMetadataComesFromTheHashedInfoDictionary(t *testing.T) {
+	c := check.New(t)
+	first := singleFileInfo()
+	first["name"] = "decoy.bin"
+	first["private"] = 1
+	second := singleFileInfo()
+	data, hashed := torrentWithTwoInfoDictionaries(t, first, second)
+
+	f, err := tfs.NewFileFromBytes(data)
+	c.NoError(err)
+	c.Equal(tfs.InfoHash(sha1.Sum(hashed)), f.InfoHash) //nolint:gosec // The spec requires sha1
+
+	// Every field is the hashed dictionary's, including the one only the discarded dictionary named, which a merge
+	// would have carried over.
+	c.Equal("example.bin", f.Info.Name)
+	c.False(f.Info.Private)
+}
+
+// torrentWithTwoInfoDictionaries returns a bencoded torrent carrying two top-level "info" keys, along with the exact
+// bytes of the second one, which is the dictionary a decoder keeps when asked for the key's raw bytes.
+func torrentWithTwoInfoDictionaries(t *testing.T, first, second map[string]any) (torrent, hashed []byte) {
+	t.Helper()
+	c := check.New(t)
+	firstBytes, err := bencode.EncodeBytes(first)
+	c.NoError(err)
+	hashed, err = bencode.EncodeBytes(second)
+	c.NoError(err)
+	var buf bytes.Buffer
+	buf.WriteString("d")
+	buf.WriteString(bstr("announce") + bstr("http://example.com/announce"))
+	buf.WriteString(bstr("info"))
+	buf.Write(firstBytes)
+	buf.WriteString(bstr("info"))
+	buf.Write(hashed)
+	buf.WriteString("e")
+	return buf.Bytes(), hashed
+}
+
 // TestStoragePathStaysAValidFilename covers names long enough to require truncation: the cut may not split a
 // multi-byte rune or one of SanitizeName's two-character escapes, since the result has to be a name the filesystem
 // will actually create.
@@ -578,6 +634,34 @@ func TestStoragePathStaysAValidFilename(t *testing.T) {
 	f, err := tfs.NewFileFromBytes(encodeTorrent(t, singleFileInfo()))
 	c.NoError(err)
 	c.Equal("example"+tfs.DownloadExt, f.StoragePath())
+}
+
+// TestStoragePathKeepsDotfileNamesDistinct covers names that filepath.Ext considers to be nothing but an extension.
+// Trimming that from ".config" leaves an empty name, so every torrent whose name starts with a dot and carries no
+// other extension would be handed the same storage file and write its data over whatever the last one put there.
+func TestStoragePathKeepsDotfileNamesDistinct(t *testing.T) {
+	c := check.New(t)
+	dir := t.TempDir()
+	owner := make(map[string]string)
+	for _, name := range []string{".config", ".env", ".hidden.bin", "example.bin"} {
+		info := singleFileInfo()
+		info["name"] = name
+		f, err := tfs.NewFileFromBytes(encodeTorrent(t, info))
+		c.NoError(err)
+		f.Path = filepath.Join(dir, f.Path)
+		storage := f.StoragePath()
+		c.True(strings.HasSuffix(storage, tfs.DownloadExt))
+		if other, taken := owner[storage]; taken {
+			t.Fatalf("%q and %q were both given the storage file %q", other, name, storage)
+		}
+		owner[storage] = name
+	}
+
+	// The leading dot is part of the name rather than an extension, so it stays; a real extension behind one is still
+	// trimmed.
+	c.Equal(".config", owner[filepath.Join(dir, ".config"+tfs.DownloadExt)])
+	c.Equal(".env", owner[filepath.Join(dir, ".env"+tfs.DownloadExt)])
+	c.Equal(".hidden.bin", owner[filepath.Join(dir, ".hidden"+tfs.DownloadExt)])
 }
 
 // TestEmbeddedFilesOrderIsStable verifies the order doesn't shift from call to call. The input order comes from map
