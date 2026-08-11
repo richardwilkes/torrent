@@ -127,6 +127,74 @@ func wrappedOpError(op string, err error) error {
 	return errs.Wrap(&net.OpError{Op: op, Net: "tcp", Err: &os.SyscallError{Syscall: op, Err: err}})
 }
 
+// TestShouldLogIOErrorIgnoresWindowsPeerErrors verifies that the routine peer errors stay out of the log on Windows
+// too, which reports them with neither the errno nor the wording the POSIX systems use. A Windows socket fails with a
+// Winsock code, while the syscall.ECONNRESET and friends that exist on Windows are synthetic values nothing ever
+// returns, so matching against those alone would log every reset, refused dial and unreachable host the swarm produces.
+// The codes are written as numbers rather than named constants for the same reason the library writes them that way:
+// they aren't exported off Windows, and running this everywhere is the point, since a platform nothing here runs on is
+// where the mistake was made in the first place.
+func TestShouldLogIOErrorIgnoresWindowsPeerErrors(t *testing.T) {
+	for _, one := range []struct {
+		err  error
+		name string
+		log  bool
+	}{
+		// The Winsock code as the socket hands it back, inside the wrapping it has by the time anything sees it
+		{name: "peer reset by code", err: wrappedOpError("wsarecv", syscall.Errno(10054))},
+		{name: "connection aborted by code", err: wrappedOpError("wsasend", syscall.Errno(10053))},
+		{name: "dial refused by code", err: wrappedOpError("connectex", syscall.Errno(10061))},
+		{name: "host unreachable by code", err: wrappedOpError("connectex", syscall.Errno(10065))},
+		{name: "network unreachable by code", err: wrappedOpError("connectex", syscall.Errno(10051))},
+		{name: "network down by code", err: wrappedOpError("wsasend", syscall.Errno(10050))},
+		{name: "socket shut down by code", err: wrappedOpError("wsasend", syscall.Errno(10058))},
+		{name: "connect timed out by code", err: wrappedOpError("connectex", syscall.Errno(10060))},
+
+		// A Winsock code that isn't one of the routine departures still has to reach the log, since matching the range
+		// rather than the specific codes would silence everything the platform reports
+		{name: "a Winsock error worth hearing about", err: wrappedOpError("wsarecv", syscall.Errno(10014)), log: true},
+	} {
+		t.Run(one.name, func(t *testing.T) {
+			check.New(t).Equal(one.log, ShouldLogIOError(one.err))
+		})
+	}
+}
+
+// TestShouldLogIOErrorIgnoresWindowsPeerErrorWordings verifies the same against the messages Windows words those codes
+// with, which is all an error carries once it has crossed a boundary that kept only the text.
+func TestShouldLogIOErrorIgnoresWindowsPeerErrorWordings(t *testing.T) {
+	for _, one := range []struct {
+		name string
+		msg  string
+	}{
+		{name: "peer reset by wording", msg: "An existing connection was forcibly closed by the remote host."},
+		{name: "connection aborted by wording", msg: "An established connection was aborted by the software in your host machine."},
+		{name: "dial refused by wording", msg: "No connection could be made because the target machine actively refused it."},
+		{name: "host unreachable by wording", msg: "A socket operation was attempted to an unreachable host."},
+		{name: "network unreachable by wording", msg: "A socket operation was attempted to an unreachable network."},
+		{name: "network down by wording", msg: "A socket operation encountered a dead network."},
+		{name: "connect timed out by wording", msg: "A connection attempt failed because the connected party did not properly " +
+			"respond after a period of time, or established connection failed because connected host has failed to " +
+			"respond."},
+		{name: "socket shut down by wording", msg: "A request to send or receive data was disallowed because the socket had " +
+			"already been shut down in that direction with a previous shutdown call."},
+
+		// The peer vanishing mid-read also surfaces as ERROR_NETNAME_DELETED, whose value collides with a POSIX errno
+		// and so can only ever be recognized by its wording
+		{name: "network name deleted by wording", msg: "The specified network name is no longer available."},
+	} {
+		t.Run(one.name, func(t *testing.T) {
+			c := check.New(t)
+			c.False(ShouldLogIOError(errs.New("wsarecv: "+one.msg)), "the bare message: %s", one.msg)
+			c.False(ShouldLogIOError(errs.Wrap(&net.OpError{
+				Op:  "read",
+				Net: "tcp",
+				Err: errs.New(one.msg),
+			})), "the wrapped message: %s", one.msg)
+		})
+	}
+}
+
 // TestShouldLogIOErrorIgnoresARealPeerHangingUp exercises the same against an error the operating system produced,
 // rather than one assembled to look like it, since the wording and the errno both vary by platform.
 func TestShouldLogIOErrorIgnoresARealPeerHangingUp(t *testing.T) {
