@@ -40,6 +40,17 @@ func FirstAvailable(has, downloading, have *Bits) int {
 	return avail.NextSet(0)
 }
 
+// FirstMissing returns the first index that is set in 'has' and is not set in
+// 'have', or -1 if no such index exists. Unlike FirstAvailable, an index that
+// something else has already claimed still counts.
+func FirstMissing(has, have *Bits) int {
+	missing := New(min(has.size, have.size))
+	for i := range missing.data {
+		missing.data[i] = has.data[i] &^ have.data[i]
+	}
+	return missing.NextSet(0)
+}
+
 // Clone the bits into a fresh copy.
 func (b *Bits) Clone() *Bits {
 	c := &Bits{

@@ -61,6 +61,7 @@ type Client struct {
 	tracker                  *tracker
 	peerWaitGroup            *sync.WaitGroup
 	file                     *os.File
+	fatalErr                 error              // protected by lock
 	peerMgmtStop             chan struct{}      // closed when peer management should stop
 	peerMgmtDone             chan struct{}      // protected by peerMgmtLock
 	peers                    map[net.Conn]*peer // protected by lock
@@ -220,6 +221,29 @@ func (c *Client) shouldStop() bool {
 	return c.stopRequested
 }
 
+// failWithStorageError records a failure to use the torrent's storage and stops the torrent because of it. Nothing the
+// peers do can recover from storage we can't read or write, so the alternative is to keep trying at network speed and
+// never make any progress. Storage that has already been closed isn't a failure: peer goroutines the wait group
+// doesn't track can still be draining work while the client shuts down, and the shutdown that closed it is what they
+// are running behind.
+func (c *Client) failWithStorageError(err error) {
+	if errors.Is(err, errStorageClosed) {
+		return
+	}
+	c.lock.Lock()
+	if c.fatalErr == nil {
+		c.fatalErr = err
+	}
+	c.lock.Unlock()
+}
+
+// fatalError returns the error the torrent has to stop for, or nil if there isn't one.
+func (c *Client) fatalError() error {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+	return c.fatalErr
+}
+
 // Status returns the current status of the torrent.
 func (c *Client) Status() *Status {
 	c.tracker.lock.RLock()
@@ -250,6 +274,12 @@ func (c *Client) run() {
 	for {
 		if c.tracker.isSeedingComplete() {
 			c.finish(nil)
+			return
+		}
+		// Checked ahead of the stop request, so that a stop arriving alongside the failure can't turn what went wrong
+		// into an ordinary shutdown and leave the caller believing the torrent finished
+		if err := c.fatalError(); err != nil {
+			c.finish(err)
 			return
 		}
 		if c.shouldStop() {

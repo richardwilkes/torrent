@@ -557,9 +557,14 @@ func (t *tracker) hasPiece(index int) bool {
 	return t.have.IsSet(index)
 }
 
+// isInteresting returns true if the peer these pieces belong to has anything we don't. A piece another peer has
+// already claimed still counts: near the end of a download every piece we're missing can be claimed at once, and
+// answering that we aren't interested then costs us exactly the connections we still need — typical remotes choke a
+// peer that says it wants nothing, and worseForRotation ranks an uninterested peer first to drop — while getting one
+// back once a claim frees up takes an interested/unchoke round trip, or a reconnect, every time.
 func (t *tracker) isInteresting(has *fixedbits.Bits) bool {
 	t.lock.RLock()
-	i := fixedbits.FirstAvailable(has, t.downloading, t.have)
+	i := fixedbits.FirstMissing(has, t.have)
 	t.lock.RUnlock()
 	return i != -1
 }

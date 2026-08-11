@@ -41,7 +41,12 @@ const (
 	// choking us. A choked peer has been told to discard our requests, so the time it spends choking us can't be held
 	// against it, but the piece can't stay claimed forever either, since no other peer can take it while it is.
 	maxChokedDownloadWait = time.Minute
-	chunkSize             = dispatcher.ChunkSize
+	// maxDownloadStall is the longest a piece may stay claimed by a peer without any of it arriving, no matter what the
+	// peer does. The deadline for a piece is pushed out each time the peer chokes us and restarted each time it
+	// unchokes us, both of which are legitimate, so a remote that alternates the two never has to deliver anything at
+	// all: this is the bound that nothing but data we don't already have can renew.
+	maxDownloadStall = 2 * maxChokedDownloadWait
+	chunkSize        = dispatcher.ChunkSize
 	// maxPendingPieceRequests is the number of unfulfilled piece requests we'll hold onto for a peer before deciding
 	// it is flooding us.
 	maxPendingPieceRequests = 512
@@ -182,8 +187,12 @@ func (p *peer) validPieceRequest(req *pieceRequest) bool {
 type piece struct {
 	spans   spanlist.SpanList
 	timeout time.Time
-	buffer  []byte
-	lock    sync.RWMutex
+	// lastProgress is when a chunk of this piece that we didn't already have last arrived, or when the piece was
+	// claimed if none has. Unlike timeout, which the peer choking and unchoking us pushes out, nothing but actual
+	// progress renews it, so it is what bounds how long a peer that never delivers can keep the piece to itself.
+	lastProgress time.Time
+	buffer       []byte
+	lock         sync.RWMutex
 }
 
 func newPeer(client *Client, conn net.Conn, logger *slog.Logger) *peer {
@@ -452,13 +461,7 @@ func (p *peer) processIncomingMessages() {
 			p.lock.Lock()
 			if len(p.pieces) == 0 {
 				p.lock.Unlock()
-				// Notify other peers on the client to check for potential downloads, since we may have freed up some
-				// pieces to download
-				for _, other := range p.client.currentPeers() {
-					if other != p {
-						other.startDownloadIfNeeded()
-					}
-				}
+				p.startDownloadsOnOtherPeers()
 				return
 			}
 		}
@@ -517,14 +520,29 @@ func (p *peer) processIncomingMessages() {
 			switch buffer[0] {
 			case chokeID:
 				p.lock.Lock()
+				changed := !p.peerChoking
 				p.peerChoking = true
 				p.lock.Unlock()
-				p.suspendDownloads()
+				// Only an actual transition may act on the choke. Suspending pushes the deadline for every piece we're
+				// in the middle of downloading out to maxChokedDownloadWait, so a remote that merely re-sends choke
+				// often enough would otherwise keep a piece it never delivers claimed indefinitely: nothing could
+				// expire it, no other peer could take it, and the peer is excused from the stall check for as long as
+				// it is choking us.
+				if changed {
+					p.suspendDownloads()
+				}
 			case unchokeID:
 				p.lock.Lock()
+				changed := p.peerChoking
 				p.peerChoking = false
 				p.lock.Unlock()
-				p.resumeDownloads()
+				// As with the choke above, only an actual transition may act on it. Resuming restarts the deadline for
+				// every piece we hold, restarts the clock the stall check measures from, and asks again for every chunk
+				// that hasn't arrived, so a duplicate unchoke is both a way to hold a piece without delivering any of
+				// it and a way to have us send far more than the five bytes it cost to ask.
+				if changed {
+					p.resumeDownloads()
+				}
 				p.startDownloadIfNeeded()
 			case interestedID:
 				p.lock.Lock()
@@ -635,6 +653,18 @@ func (p *peer) resumeDownloads() {
 	}
 }
 
+// startDownloadsOnOtherPeers tells every peer but this one to look for something to download. It is called whenever
+// this peer gives a piece back, since nothing else nudges a peer that is already connected, unchoked and idle: neither
+// adjustPeers nor updateInterest starts a download, so in a small or static swarm the freed piece would otherwise sit
+// unclaimed until some peer happened to disconnect or to unchoke us.
+func (p *peer) startDownloadsOnOtherPeers() {
+	for _, other := range p.client.currentPeers() {
+		if other != p {
+			other.startDownloadIfNeeded()
+		}
+	}
+}
+
 func (p *peer) startDownloadIfNeeded() {
 	var has *fixedbits.Bits
 	p.lock.RLock()
@@ -660,8 +690,9 @@ func (p *peer) queuePieceDownload(index int) {
 	if !bailing && !ok {
 		now := time.Now()
 		p.pieces[index] = &piece{
-			buffer:  make([]byte, length),
-			timeout: now.Add(downloadReadDeadline),
+			buffer:       make([]byte, length),
+			timeout:      now.Add(downloadReadDeadline),
+			lastProgress: now,
 		}
 		p.downloadStarted = now
 	}
@@ -703,6 +734,7 @@ func (p *peer) receivedChunk(index, begin int, buffer []byte) error {
 	progressed := !one.spans.Contains(&span)
 	if progressed {
 		one.timeout = now.Add(downloadReadDeadline)
+		one.lastProgress = now
 	}
 	copy(one.buffer[begin:last], buffer)
 	one.spans.Insert(&span)
@@ -724,13 +756,19 @@ func (p *peer) receivedChunk(index, begin int, buffer []byte) error {
 			p.lock.Unlock()
 			if err != nil && (!errors.Is(err, io.EOF) || n != len(one.buffer)) {
 				p.client.tracker.clearDownload(index, p)
-				errs.LogTo(p.logger, errs.NewWithCause("unable to write piece", err), "index", index)
-			} else {
-				p.client.tracker.markBlockValid(index)
-				p.client.tracker.setProgress(-1)
-				if p.client.tracker.isDownloadComplete() {
-					p.client.tracker.setState(Seeding)
-				}
+				writeErr := errs.NewWithCause("unable to write piece", err)
+				errs.LogTo(p.logger, writeErr, "index", index)
+				// Nothing a peer can do fixes storage we can't write to, so the piece is not simply downloaded again:
+				// doing that would have us pull whole pieces off the network, forever, for as long as the disk stayed
+				// full or the file unwritable, making no progress and saying nothing about it beyond another log line
+				// each time around. The torrent is stopped with the error instead.
+				p.client.failWithStorageError(writeErr)
+				return nil
+			}
+			p.client.tracker.markBlockValid(index)
+			p.client.tracker.setProgress(-1)
+			if p.client.tracker.isDownloadComplete() {
+				p.client.tracker.setState(Seeding)
 			}
 			p.updateInterest()
 			p.startDownloadIfNeeded()
@@ -996,9 +1034,13 @@ func (p *peer) clearExpiredDownloads() {
 	p.lock.RUnlock()
 	now := time.Now()
 	giveUpOnPeer := false
+	released := false
 	for k, v := range m {
 		v.lock.RLock()
-		remove := v.timeout.Before(now)
+		// The deadline is what the ordinary cases turn on, but it is pushed out whenever the peer chokes or unchokes
+		// us, so on its own it can be kept ahead of the clock by a remote that alternates the two without ever
+		// delivering anything. The time since the piece last saw progress can't be, so it bounds the whole affair.
+		remove := v.timeout.Before(now) || now.Sub(v.lastProgress) > maxDownloadStall
 		v.lock.RUnlock()
 		if !remove {
 			continue
@@ -1014,10 +1056,14 @@ func (p *peer) clearExpiredDownloads() {
 		p.lock.Unlock()
 		if ours {
 			p.client.tracker.clearDownload(k, p)
+			released = true
 			// A peer that is choking us was told to discard our requests, so having nothing to show for the piece
 			// isn't its fault: give up the piece so another peer can take it, but keep the connection.
 			giveUpOnPeer = giveUpOnPeer || !choking
 		}
+	}
+	if released {
+		p.startDownloadsOnOtherPeers()
 	}
 	if giveUpOnPeer {
 		p.bailOut()

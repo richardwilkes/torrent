@@ -196,6 +196,35 @@ func TestFirstAvailableLimitsToLogicalSize(t *testing.T) {
 	c.Equal(2, FirstAvailable(has, downloading, shortHave))
 }
 
+// TestFirstMissing verifies that an index only has to be one we don't have, whether or not anything has claimed it,
+// which is what deciding our interest in a peer turns on.
+func TestFirstMissing(t *testing.T) {
+	c := check.New(t)
+	const pieceCount = 5
+	has := New(pieceCount)
+	have := New(pieceCount)
+	c.Equal(-1, FirstMissing(has, have))
+
+	has.SetBytes([]byte{0xFF})
+	c.Equal(0, FirstMissing(has, have))
+	have.Set(0)
+	c.Equal(1, FirstMissing(has, have))
+
+	// Every real piece accounted for leaves nothing, even though the peer set the spare bits as well
+	for i := range pieceCount {
+		have.Set(i)
+	}
+	c.Equal(-1, FirstMissing(has, have))
+
+	// The smaller of the two limits the result, since anything beyond that isn't known to both
+	shortHave := New(3)
+	has.data[0] = 0
+	has.Set(3)
+	c.Equal(-1, FirstMissing(has, shortHave))
+	has.Set(2)
+	c.Equal(2, FirstMissing(has, shortHave))
+}
+
 // TestByteLength verifies the storage size reported for a given number of bits, which peer.go relies on to validate the
 // length of an incoming bit field message.
 func TestByteLength(t *testing.T) {

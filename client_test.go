@@ -648,6 +648,29 @@ func TestRateLimitersAreClosed(t *testing.T) {
 	c.True(partial.OutRate.Closed())
 }
 
+// TestAStorageFailureLeavesTheTorrentErrored verifies that the failure a peer records when it can't store a piece is
+// what the torrent then stops for, so that a download which couldn't be written is reported as having failed rather
+// than as having finished normally.
+func TestAStorageFailureLeavesTheTorrentErrored(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+
+	// Storage that has been closed because we're already shutting down isn't a failure. Peer goroutines the wait group
+	// doesn't track can still be draining work at that point, and the shutdown that closed it is what they're behind.
+	client.failWithStorageError(errs.NewWithCause("unable to write piece", errStorageClosed))
+	c.NoError(client.fatalError())
+
+	// The first failure is the one kept, since it is the one that explains what went wrong
+	first := errors.New("no space left on device")
+	client.failWithStorageError(errs.NewWithCause("unable to write piece", first))
+	client.failWithStorageError(errs.New("unable to write piece"))
+	c.True(errors.Is(client.fatalError(), first), "the failure that stopped the torrent must be the one reported")
+
+	waitFor(t, "finish", func() { client.finish(client.fatalError()) })
+	c.Equal(Errored, client.Status().State, "a torrent that stopped for a storage failure must not report success")
+}
+
 // TestStoppedNotification verifies that exactly one stopped notification is delivered.
 func TestStoppedNotification(t *testing.T) {
 	c := check.New(t)

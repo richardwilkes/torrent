@@ -10,6 +10,7 @@
 package torrent
 
 import (
+	"crypto/sha1" //nolint:gosec // The spec requires sha1
 	"encoding/binary"
 	"io"
 	"log/slog"
@@ -327,11 +328,22 @@ func TestDuplicateChunksDoNotRenewTheDownloadDeadline(t *testing.T) {
 	c.Equal(deadline, repeated, "a duplicate chunk must not renew the deadline for the piece")
 	c.Equal(received, repeatedReceived, "a duplicate chunk must not count as progress for the peer")
 
-	// A chunk holding data we don't have yet does renew it
+	// A chunk holding data we don't have yet does renew both. They are pushed out to a marker further ahead than
+	// anything the code sets rather than compared against the values the duplicate above left behind, since a platform
+	// whose clock has a coarse granularity can read the same instant for two calls made back to back, which would
+	// leave a renewal indistinguishable from no renewal at all. The marker is in the future so that the piece doesn't
+	// look expired while the chunk is being taken in, which would have us give up on the peer.
+	marker := time.Now().Add(time.Hour)
+	one.lock.Lock()
+	one.timeout = marker
+	one.lock.Unlock()
+	p.lock.Lock()
+	p.lastReceived = marker
+	p.lock.Unlock()
 	c.NoError(p.receivedChunk(0, chunkSize/2, testStorageBytes(0, chunkSize/2, chunkSize/4)))
 	renewed, renewedReceived := downloadDeadline(p, one)
-	c.True(renewed.After(deadline), "a chunk with new data must renew the deadline for the piece")
-	c.True(renewedReceived.After(received), "a chunk with new data must count as progress for the peer")
+	c.True(renewed.Before(marker), "a chunk with new data must renew the deadline for the piece")
+	c.True(renewedReceived.Before(marker), "a chunk with new data must count as progress for the peer")
 
 	// With the deadline no longer being renewed, the piece is given up. This peer is choking us, so it was told to
 	// discard what we asked it for and having nothing to show for the piece isn't something it can be blamed for: the
@@ -368,6 +380,63 @@ func downloadDeadline(p *peer, one *piece) (deadline, lastReceived time.Time) {
 	lastReceived = p.lastReceived
 	p.lock.RUnlock()
 	return deadline, lastReceived
+}
+
+// TestAStorageWriteFailureStopsTheTorrent verifies that a piece that can't be written to storage isn't simply
+// downloaded all over again. A full disk or a file we have no permission to write doesn't heal, so re-selecting the
+// piece pulls it off the network again and again at whatever rate the swarm can manage, marks no progress, and says
+// nothing about any of it beyond another log line each time around.
+func TestAStorageWriteFailureStopsTheTorrent(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClientForTorrent(d, newTestTorrentFileWithHashes())
+	defer client.closeRateLimiters()
+	client.file = newReadOnlyTestStorage(t, client)
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+
+	// The peer has the whole torrent and isn't choking us, so it has somewhere to go next if the failure to store what
+	// it just delivered isn't treated as final
+	p.lock.Lock()
+	p.peerChoking = false
+	p.has = everyTestPiece()
+	p.lock.Unlock()
+	c.Equal(0, client.tracker.selectForDownloading(p, everyTestPiece()))
+	p.queuePieceDownload(0)
+	c.NoError(p.receivedChunk(0, 0, testStorageBytes(0, 0, chunkSize)))
+
+	c.HasError(client.fatalError(), "a piece that can't be written must stop the torrent")
+	c.False(client.tracker.hasPiece(0), "a piece that can't be written must not be counted as one we have")
+	p.lock.RLock()
+	claimed := slices.Sorted(maps.Keys(p.pieces))
+	p.lock.RUnlock()
+	c.Equal(0, len(claimed), "the piece must not be claimed again, indexes: %v", claimed)
+	client.tracker.lock.RLock()
+	who := client.tracker.who[0]
+	client.tracker.lock.RUnlock()
+	c.Nil(who)
+}
+
+// newReadOnlyTestStorage creates the storage file for the test torrent and hands back a handle that can only be read
+// from, so that writing a piece to it fails the way a full disk or a file we have no permission to write would.
+func newReadOnlyTestStorage(t *testing.T, client *Client) *os.File {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "test"+tfs.DownloadExt)
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.Write(make([]byte, client.torrentFile.Size())); err != nil {
+		t.Fatal(err)
+	}
+	if err = f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if f, err = os.Open(path); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { xio.CloseIgnoringErrors(f) })
+	return f
 }
 
 // TestChunkOutsideThePieceIsRejected verifies that a chunk whose range doesn't fit inside the piece it claims to be
@@ -447,6 +516,187 @@ func TestChokeDoesNotCostTheConnectionOrThePiece(t *testing.T) {
 	c.Equal(newTestPieceRequest(requestID, 0, 0, chunkSize), buffer)
 }
 
+// TestRepeatedChokesDoNotExtendTheClaim verifies that only an actual transition into being choked pushes the deadline
+// for a piece we're in the middle of downloading out. Acting on every choke message instead would let a remote that
+// claimed a piece and then re-sent choke often enough keep it for as long as it liked: the piece could never expire,
+// no other peer could take it while it was claimed, and a peer that is choking us is excused from the stall check, so
+// nothing would drop the connection either.
+func TestRepeatedChokesDoNotExtendTheClaim(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	conn, p, _ := startTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+	c.NoError(conn.SetDeadline(time.Now().Add(peerMgmtWait)))
+
+	// The peer unchokes us, we ask it for a piece, and it chokes us before sending any of it. The unchoke is waited for
+	// rather than merely sent, since resuming what we hold is part of taking it in and the piece must not be claimed
+	// while that is still under way.
+	_, err := conn.Write(newTestMessage(unchokeID))
+	c.NoError(err)
+	waitForMessagesToBeProcessed(t, conn, p)
+	p.queuePieceDownload(0)
+	buffer := make([]byte, 17)
+	_, err = io.ReadFull(conn, buffer)
+	c.NoError(err)
+	c.Equal(newTestPieceRequest(requestID, 0, 0, chunkSize), buffer)
+	_, err = conn.Write(newTestMessage(chokeID))
+	c.NoError(err)
+	p.lock.RLock()
+	one := p.pieces[0]
+	p.lock.RUnlock()
+	waitForDeadlineBeyond(t, one, time.Now().Add(downloadReadDeadline))
+	one.lock.RLock()
+	suspended := one.timeout
+	one.lock.RUnlock()
+
+	// A second choke, with nothing in between, must leave the deadline exactly where the first one put it
+	_, err = conn.Write(newTestMessage(chokeID))
+	c.NoError(err)
+	waitForMessagesToBeProcessed(t, conn, p)
+	one.lock.RLock()
+	repeated := one.timeout
+	one.lock.RUnlock()
+	c.Equal(suspended, repeated, "a repeated choke must not push the deadline for the piece out again")
+}
+
+// TestRepeatedUnchokesDoNotResendRequests verifies that only an actual transition out of being choked resumes the
+// downloads we hold. Acting on every unchoke message instead would have a remote that re-sends it restart the deadline
+// for each piece it holds, restart the clock the stall check measures from, and make us send the whole outstanding set
+// of requests again — seventeen bytes for every chunk still missing, in answer to the five it cost to ask.
+func TestRepeatedUnchokesDoNotResendRequests(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	conn, p, _ := startTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+	c.NoError(conn.SetDeadline(time.Now().Add(peerMgmtWait)))
+
+	// The peer unchokes us and we ask it for a piece, which it never answers. The unchoke is waited for rather than
+	// merely sent, since resuming what we hold is part of taking it in and the piece must not be claimed while that is
+	// still under way.
+	_, err := conn.Write(newTestMessage(unchokeID))
+	c.NoError(err)
+	waitForMessagesToBeProcessed(t, conn, p)
+	p.queuePieceDownload(0)
+	buffer := make([]byte, 17)
+	_, err = io.ReadFull(conn, buffer)
+	c.NoError(err)
+	c.Equal(newTestPieceRequest(requestID, 0, 0, chunkSize), buffer)
+	p.lock.RLock()
+	one := p.pieces[0]
+	p.lock.RUnlock()
+	one.lock.RLock()
+	deadline := one.timeout
+	one.lock.RUnlock()
+
+	// A second unchoke, with nothing in between, must neither restart the deadline nor ask for the chunk again
+	_, err = conn.Write(newTestMessage(unchokeID))
+	c.NoError(err)
+	waitForMessagesToBeProcessed(t, conn, p)
+	one.lock.RLock()
+	repeated := one.timeout
+	one.lock.RUnlock()
+	c.Equal(deadline, repeated, "a repeated unchoke must not restart the deadline for the piece")
+	for _, message := range remainingMessages(t, conn) {
+		c.False(len(message) != 0 && message[0] == requestID, "a repeated unchoke must not ask for the chunk again")
+	}
+}
+
+// TestAlternatingChokesCannotHoldAPieceForever verifies that the deadline juggling a peer choking and unchoking us
+// causes is bounded by when the piece last saw data. Pushing the deadline out for a choke and restarting it for an
+// unchoke are both right on their own, so without that bound a remote that alternates the two never has to deliver
+// anything at all, and no other peer can take the piece while it doesn't.
+func TestAlternatingChokesCannotHoldAPieceForever(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+	p.queuePieceDownload(0)
+	p.lock.RLock()
+	one := p.pieces[0]
+	p.lock.RUnlock()
+
+	// The deadline has been kept ahead of the clock, but nothing has arrived for the piece since it was claimed
+	one.lock.Lock()
+	one.timeout = time.Now().Add(maxChokedDownloadWait)
+	one.lastProgress = time.Now().Add(-maxDownloadStall - time.Second)
+	one.lock.Unlock()
+	p.clearExpiredDownloads()
+	p.lock.RLock()
+	held := len(p.pieces)
+	p.lock.RUnlock()
+	c.Equal(0, held, "a piece that has gone maxDownloadStall without data must be given up whatever its deadline says")
+
+	// A piece that is still being delivered is left alone, however long ago it was claimed
+	p.queuePieceDownload(1)
+	p.lock.RLock()
+	one = p.pieces[1]
+	p.lock.RUnlock()
+	one.lock.Lock()
+	one.timeout = time.Now().Add(downloadReadDeadline)
+	one.lastProgress = time.Now().Add(-maxDownloadStall + peerMgmtWait)
+	one.lock.Unlock()
+	p.clearExpiredDownloads()
+	p.lock.RLock()
+	held = len(p.pieces)
+	p.lock.RUnlock()
+	c.Equal(1, held, "a piece that is still being delivered must be kept")
+}
+
+// waitForMessagesToBeProcessed sends the peer a message flipping whether the remote says it is interested in what we
+// have and returns once that has been taken in. Messages are processed in order, so this is what says that everything
+// sent before it has been acted on as well, without a sleep whose length decides whether the test is testing anything.
+// The remote's interest is what gets flipped because taking it in has no other effect on the peer.
+func waitForMessagesToBeProcessed(t *testing.T, conn net.Conn, p *peer) {
+	t.Helper()
+	p.lock.RLock()
+	expected := !p.peerInterested
+	p.lock.RUnlock()
+	id := notInterestedID
+	if expected {
+		id = interestedID
+	}
+	if _, err := conn.Write(newTestMessage(id)); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(peerMgmtWait)
+	for {
+		p.lock.RLock()
+		actual := p.peerInterested
+		p.lock.RUnlock()
+		if actual == expected {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the peer never processed the messages sent to it")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// remainingMessages returns the messages the peer sends within a short window, so that a test can assert that a
+// particular one isn't among them.
+func remainingMessages(t *testing.T, conn net.Conn) [][]byte {
+	t.Helper()
+	var messages [][]byte
+	lengthBuffer := make([]byte, 4)
+	for {
+		if err := conn.SetReadDeadline(time.Now().Add(250 * time.Millisecond)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.ReadFull(conn, lengthBuffer); err != nil {
+			return messages
+		}
+		buffer := make([]byte, binary.BigEndian.Uint32(lengthBuffer))
+		if _, err := io.ReadFull(conn, buffer); err != nil {
+			return messages
+		}
+		messages = append(messages, buffer)
+	}
+}
+
 // waitForDeadlineBeyond fails the test if the piece's deadline isn't pushed out past the given time.
 func waitForDeadlineBeyond(t *testing.T, one *piece, beyond time.Time) {
 	t.Helper()
@@ -483,7 +733,9 @@ func TestResumeOnlyAsksForTheChunksThatAreMissing(t *testing.T) {
 	p.lock.Unlock()
 
 	p.resumeDownloads()
-	c.Equal(newTestPieceRequest(requestID, 2, chunkSize, chunkSize), <-p.writeQueue)
+	// Read with a deadline rather than a bare receive: asking for nothing at all is one of the ways resuming can go
+	// wrong, and that must fail this test rather than park it on the queue forever and hang the whole suite
+	c.Equal(newTestPieceRequest(requestID, 2, chunkSize, chunkSize), nextQueuedMessage(t, p))
 	select {
 	case buffer := <-p.writeQueue:
 		t.Fatalf("only the missing chunk should have been asked for, but %v was too", buffer)
@@ -767,7 +1019,7 @@ func TestChokingDiscardsQueuedPieceRequests(t *testing.T) {
 	conn, p := newTestPeer(t, client)
 	defer xio.CloseIgnoringErrors(conn)
 	p.setChoked(false)
-	go p.pieceRequestQueue()
+	startTestPieceRequestQueue(t, p)
 
 	// Fill the write queue, so that the responses have nowhere to go and the requests pile up behind them. That is
 	// both the state that has us choking a peer in the first place and the one in which its requests are still there
@@ -781,10 +1033,7 @@ func TestChokingDiscardsQueuedPieceRequests(t *testing.T) {
 		p.requestChan <- &pieceRequest{index: i % testPieceCount, length: chunkSize}
 	}
 	p.setChoked(true)
-
-	// Nothing else is being sent to the queue and its responses still have nowhere to go, so taking in the choke is
-	// the only thing left for it to do
-	time.Sleep(50 * time.Millisecond)
+	waitForChokeToBeHandled(t, p)
 
 	// Unchoking must not bring back the requests the peer was told to treat as discarded: the only response that may
 	// still arrive is the one already prepared when the write queue filled up
@@ -796,6 +1045,48 @@ func TestChokingDiscardsQueuedPieceRequests(t *testing.T) {
 	p.setChoked(true)
 	p.requestChan <- &pieceRequest{index: 0, length: chunkSize}
 	c.Equal(0, drainPieceMessages(t, p), "a request must not be served while we're choking the peer")
+}
+
+// startTestPieceRequestQueue starts the goroutine holding the peer's outstanding piece requests and stops it once the
+// test is over. It only stops when the channel feeding it is closed, which is normally done by the teardown of the
+// read loop, and nothing runs that here: leaving it open leaks both this goroutine and the one it spawns to fulfill
+// the requests, for the remainder of the run.
+func startTestPieceRequestQueue(t *testing.T, p *peer) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		p.pieceRequestQueue()
+	}()
+	t.Cleanup(func() {
+		close(p.requestChan)
+		select {
+		case <-done:
+		case <-time.After(peerMgmtWait):
+			t.Error("the goroutine holding the outstanding piece requests was left running")
+		}
+	})
+}
+
+// waitForChokeToBeHandled returns once the goroutine holding the peer's outstanding piece requests has finished acting
+// on the choke that was signaled to it. The signal channel holds a single entry, so a second signal can only be
+// accepted once the first has been taken, and can itself only be taken once the first has been acted on: waiting for
+// both to be consumed is therefore enough to know the requests have been discarded. Sleeping instead would let a
+// loaded scheduler run an unchoke first, leaving the queue intact and the test passing or failing at random.
+func waitForChokeToBeHandled(t *testing.T, p *peer) {
+	t.Helper()
+	select {
+	case p.chokedChan <- struct{}{}:
+	case <-time.After(peerMgmtWait):
+		t.Fatal("the choke was never taken up")
+	}
+	deadline := time.Now().Add(peerMgmtWait)
+	for len(p.chokedChan) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the choke was never acted on")
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 // drainPieceMessages returns the number of piece messages the peer has queued up for writing, once none have arrived
@@ -1114,6 +1405,75 @@ func TestExpiredDownloadsLeaveAnotherPeersClaimAlone(t *testing.T) {
 	downloading = client.tracker.downloading.IsSet(0)
 	client.tracker.lock.RUnlock()
 	c.False(downloading)
+}
+
+// TestAFreedPieceNudgesTheOtherPeers verifies that a peer giving up an expired claim tells the rest of them to look
+// for something to download. Nothing else does: an already connected, unchoked and idle peer is never revisited by
+// peer management or by an interest update, so in a small or static swarm the freed piece would otherwise sit
+// unclaimed until the peer that let it expire happened to unchoke us or some peer disconnected.
+func TestAFreedPieceNudgesTheOtherPeers(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+	otherConn, other := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(otherConn)
+
+	// The first peer is choking us and has let its claim expire, so the piece is given up but the connection is kept
+	c.Equal(0, client.tracker.selectForDownloading(p, everyTestPiece()))
+	p.lock.Lock()
+	p.pieces[0] = &piece{buffer: make([]byte, chunkSize), timeout: time.Now().Add(-time.Minute)}
+	p.lock.Unlock()
+
+	// The second peer has the whole torrent and isn't choking us, but has nothing to do
+	other.lock.Lock()
+	other.peerChoking = false
+	other.has = everyTestPiece()
+	other.lock.Unlock()
+
+	p.clearExpiredDownloads()
+
+	p.lock.RLock()
+	bailing := p.bail
+	p.lock.RUnlock()
+	c.False(bailing, "a peer that is choking us must not be dropped for failing to deliver")
+	other.lock.RLock()
+	claimed := slices.Sorted(maps.Keys(other.pieces))
+	other.lock.RUnlock()
+	c.Equal([]int{0}, claimed, "the freed piece must be taken up by a peer that can download it")
+	client.tracker.lock.RLock()
+	who := client.tracker.who[0]
+	client.tracker.lock.RUnlock()
+	c.Equal(other, who)
+}
+
+// TestInterestCoversPiecesAnotherPeerHasClaimed verifies that our interest in a peer is decided by the pieces we lack
+// rather than by the ones that are free to claim at that moment. Near the end of a download every piece we're missing
+// can be claimed at once, and telling our peers we want nothing then costs us exactly the connections we still need:
+// typical remotes choke a peer that says it wants nothing, our own rotation ranks an uninterested peer first to drop,
+// and getting one back takes an interested/unchoke round trip, or a reconnect, every time a claim frees up.
+func TestInterestCoversPiecesAnotherPeerHasClaimed(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+	otherConn, other := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(otherConn)
+
+	// We have all but the last piece of the torrent, and the other peer has claimed that one
+	markTestPiecesAvailable(client, 0, 1, 2)
+	p.lock.Lock()
+	p.has = everyTestPiece()
+	p.lock.Unlock()
+	c.Equal(testPieceCount-1, client.tracker.selectForDownloading(other, everyTestPiece()))
+
+	c.True(p.updateInterest().amInterested, "a peer holding the piece we still need is of interest, claimed or not")
+
+	// Once we have that piece too, there is nothing left to want from it
+	markTestPiecesAvailable(client, testPieceCount-1)
+	c.False(p.updateInterest().amInterested, "a peer with nothing we lack must not be of interest")
 }
 
 // everyTestPiece returns a bit set claiming every piece of the test torrent, as a peer that has the whole thing would.
@@ -1440,6 +1800,17 @@ func newTestClientForTorrent(d *dispatcher.Dispatcher, torrentFile *tfs.File) *C
 
 func newTestTorrentFile() *tfs.File {
 	return newTestTorrentFileWithPieces(testPieceCount)
+}
+
+// newTestTorrentFileWithHashes creates the test torrent with the piece hashes that match what testStorageBytes holds,
+// so that a piece assembled from it actually validates.
+func newTestTorrentFileWithHashes() *tfs.File {
+	f := newTestTorrentFile()
+	for i := range testPieceCount {
+		sum := sha1.Sum(testStorageBytes(i, 0, chunkSize)) //nolint:gosec // The spec requires sha1
+		copy(f.Info.Pieces[i*sha1Size:], sum[:])
+	}
+	return f
 }
 
 func newTestTorrentFileWithPieces(count int) *tfs.File {
