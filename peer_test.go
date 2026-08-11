@@ -309,7 +309,9 @@ func expectBitField(t *testing.T, conn net.Conn, bits ...byte) {
 func TestDuplicateChunksDoNotRenewTheDownloadDeadline(t *testing.T) {
 	c := check.New(t)
 	d := newTestDispatcher(t)
-	client := newTestClient(d)
+	// Pieces of more than one chunk, since a chunk has to be one of the blocks we asked for and the only such block a
+	// single chunk piece has completes the piece
+	client := newTestClientForTorrent(d, newTestTorrentFileWithChunksPerPiece(4, testPieceCount))
 	conn, p := newTestPeer(t, client)
 	defer xio.CloseIgnoringErrors(conn)
 	p.queuePieceDownload(0)
@@ -318,12 +320,12 @@ func TestDuplicateChunksDoNotRenewTheDownloadDeadline(t *testing.T) {
 	p.lock.RUnlock()
 	c.NotNil(one)
 
-	// The first half of the piece arrives, which is progress
-	c.NoError(p.receivedChunk(0, 0, testStorageBytes(0, 0, chunkSize/2)))
+	// The first chunk of the piece arrives, which is progress
+	c.NoError(p.receivedChunk(0, 0, testStorageBytes(0, 0, chunkSize)))
 	deadline, received := downloadDeadline(p, one)
 
-	// The same half arrives again, carrying nothing new
-	c.NoError(p.receivedChunk(0, 0, testStorageBytes(0, 0, chunkSize/2)))
+	// The same chunk arrives again, carrying nothing new
+	c.NoError(p.receivedChunk(0, 0, testStorageBytes(0, 0, chunkSize)))
 	repeated, repeatedReceived := downloadDeadline(p, one)
 	c.Equal(deadline, repeated, "a duplicate chunk must not renew the deadline for the piece")
 	c.Equal(received, repeatedReceived, "a duplicate chunk must not count as progress for the peer")
@@ -340,7 +342,7 @@ func TestDuplicateChunksDoNotRenewTheDownloadDeadline(t *testing.T) {
 	p.lock.Lock()
 	p.lastReceived = marker
 	p.lock.Unlock()
-	c.NoError(p.receivedChunk(0, chunkSize/2, testStorageBytes(0, chunkSize/2, chunkSize/4)))
+	c.NoError(p.receivedChunk(0, chunkSize, testStorageBytes(0, chunkSize, chunkSize)))
 	renewed, renewedReceived := downloadDeadline(p, one)
 	c.True(renewed.Before(marker), "a chunk with new data must renew the deadline for the piece")
 	c.True(renewedReceived.Before(marker), "a chunk with new data must count as progress for the peer")
@@ -445,7 +447,9 @@ func newReadOnlyTestStorage(t *testing.T, client *Client) *os.File {
 func TestChunkOutsideThePieceIsRejected(t *testing.T) {
 	c := check.New(t)
 	d := newTestDispatcher(t)
-	client := newTestClient(d)
+	// Pieces of more than one chunk, so that a chunk which fits within the piece can still be one we never asked for
+	client := newTestClientForTorrent(d, newTestTorrentFileWithChunksPerPiece(4, testPieceCount))
+	pieceLength := int(client.torrentFile.Info.PieceLength)
 	conn, p := newTestPeer(t, client)
 	defer xio.CloseIgnoringErrors(conn)
 	p.queuePieceDownload(0)
@@ -457,15 +461,335 @@ func TestChunkOutsideThePieceIsRejected(t *testing.T) {
 	}{
 		{name: "a negative offset", begin: -1, length: 16},
 		{name: "an offset that wrapped around", begin: math.MinInt32, length: 16},
-		{name: "an offset just past the end", begin: chunkSize, length: 1},
-		{name: "a chunk that runs past the end", begin: chunkSize - 8, length: 16},
-		{name: "a chunk larger than the piece", begin: 0, length: chunkSize + 1},
+		{name: "an offset just past the end", begin: pieceLength, length: 1},
+		{name: "a chunk that runs past the end", begin: pieceLength - 8, length: 16},
+		{name: "a chunk larger than the piece", begin: 0, length: pieceLength + 1},
 	} {
 		c.HasError(p.receivedChunk(0, one.begin, make([]byte, one.length)), one.name)
 	}
 
 	// The piece is still there, untouched, and a chunk that does fit is accepted
-	c.NoError(p.receivedChunk(0, chunkSize-16, testStorageBytes(0, chunkSize-16, 16)))
+	c.NoError(p.receivedChunk(0, pieceLength-chunkSize, testStorageBytes(0, pieceLength-chunkSize, chunkSize)))
+}
+
+// TestChunksWeNeverAskedForAreRefused verifies that a chunk which isn't one of the chunk aligned blocks we asked the
+// peer for is refused, even though it fits within the piece. Taking whatever range a peer cares to send is what lets
+// it hold a piece without ever delivering anything usable: any byte we haven't seen before counts as progress, so a
+// single new byte every few seconds renews both of the deadlines that decide whether the peer is still working on the
+// piece, and no other peer can take it while it is claimed. It is also what makes taking a chunk in cost more than the
+// chunk is worth, since each fragment that doesn't join up with its neighbors becomes another span of the piece to be
+// searched and shifted through on every one that follows.
+func TestChunksWeNeverAskedForAreRefused(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClientForTorrent(d, newTestTorrentFileWithChunksPerPiece(4, testPieceCount))
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+	p.queuePieceDownload(0)
+	p.lock.RLock()
+	one := p.pieces[0]
+	p.lock.RUnlock()
+	c.NotNil(one)
+	deadline, received := downloadDeadline(p, one)
+
+	for _, test := range []struct {
+		name   string
+		begin  int
+		length int
+	}{
+		{name: "a single byte", begin: 0, length: 1},
+		{name: "a single byte partway in", begin: chunkSize + 1, length: 1},
+		{name: "part of a chunk", begin: 0, length: chunkSize / 2},
+		{name: "a chunk at an unaligned offset", begin: 1, length: chunkSize},
+		{name: "a chunk straddling two of ours", begin: chunkSize / 2, length: chunkSize},
+		{name: "more than a chunk", begin: 0, length: chunkSize + 1},
+		{name: "two chunks at once", begin: 0, length: 2 * chunkSize},
+		{name: "no data at all", begin: 0, length: 0},
+	} {
+		c.HasError(p.receivedChunk(0, test.begin, testStorageBytes(0, test.begin, test.length)), test.name)
+	}
+
+	// None of it counted as progress, was recorded as part of the piece, or renewed anything
+	one.lock.RLock()
+	spans := len(one.spans.Spans)
+	one.lock.RUnlock()
+	c.Equal(0, spans, "nothing we didn't ask for may be recorded as part of the piece")
+	stillDeadline, stillReceived := downloadDeadline(p, one)
+	c.Equal(deadline, stillDeadline, "a chunk we never asked for must not renew the deadline for the piece")
+	c.Equal(received, stillReceived, "a chunk we never asked for must not count as progress for the peer")
+	c.True(d.GateKeeper().IsAddressBlocked(p.conn.RemoteAddr()),
+		"the peer must be blocked for sending what it was never asked for")
+
+	// A chunk we did ask for is still taken in
+	c.NoError(p.receivedChunk(0, chunkSize, testStorageBytes(0, chunkSize, chunkSize)))
+	one.lock.RLock()
+	spans = len(one.spans.Spans)
+	one.lock.RUnlock()
+	c.Equal(1, spans)
+}
+
+// TestTheShortFinalChunkOfAPieceIsAccepted verifies that the last chunk of a piece that isn't a whole number of chunks
+// long is both asked for and accepted at the length it actually has. Requiring a full chunk everywhere would leave the
+// tail of such a torrent impossible to complete.
+func TestTheShortFinalChunkOfAPieceIsAccepted(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	const tail = 100
+	torrentFile := newTestTorrentFileWithChunksPerPiece(4, testPieceCount)
+	torrentFile.Info.Length = torrentFile.Info.PieceLength*(testPieceCount-1) + chunkSize + tail
+	client := newTestClientForTorrent(d, torrentFile)
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+	startChunkRequestDelivery(t, p)
+
+	last := testPieceCount - 1
+	c.Equal(int64(chunkSize+tail), client.torrentFile.LengthOf(last))
+	p.queuePieceDownload(last)
+
+	// What we ask for is a full chunk followed by whatever is left of the piece
+	c.Equal(newTestPieceRequest(requestID, uint32(last), 0, chunkSize), nextQueuedMessage(t, p))
+	c.Equal(newTestPieceRequest(requestID, uint32(last), chunkSize, tail), nextQueuedMessage(t, p))
+
+	// And the short chunk is what is accepted at that offset. Only that one is delivered, so the piece doesn't
+	// complete and nothing but the length rule is being exercised.
+	c.HasError(p.receivedChunk(last, chunkSize, testStorageBytes(last, chunkSize, tail-1)),
+		"a chunk shorter than what is left of the piece was never asked for")
+	c.NoError(p.receivedChunk(last, chunkSize, testStorageBytes(last, chunkSize, tail)))
+}
+
+// TestQueuingAPieceDoesNotBlockOnABackedUpPeer verifies that claiming a piece from a peer doesn't wait for the
+// messages asking for its chunks to fit onto that peer's write queue. A piece is a whole queue's worth of requests and
+// the queue drains no faster than the peer and the rate limiter allow, which is tens of seconds for a slow peer with
+// piece messages already queued, while the callers that claim a piece are the peer management goroutine and the read
+// goroutines of other peers: waiting there stops choke rotation, expiry clearing and dialing dead for as long as the
+// slowest peer takes.
+func TestQueuingAPieceDoesNotBlockOnABackedUpPeer(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClientForTorrent(d, newTestTorrentFileWithChunksPerPiece(4, testPieceCount))
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+	startChunkRequestDelivery(t, p)
+
+	// Nothing more will fit on the write queue, which is what a peer whose messages are draining slowly looks like
+	for range cap(p.writeQueue) {
+		p.writeQueue <- newStateMessage(chokeID)
+	}
+
+	waitFor(t, "queuePieceDownload", func() { p.queuePieceDownload(0) })
+	p.lock.RLock()
+	_, claimed := p.pieces[0]
+	p.lock.RUnlock()
+	c.True(claimed, "the piece must be claimed even though nothing could be asked for yet")
+
+	// The requests are waiting on the delivery goroutine rather than lost, so they go out as the queue drains
+	for range cap(p.writeQueue) {
+		<-p.writeQueue
+	}
+	for i := range 4 {
+		c.Equal(newTestPieceRequest(requestID, 0, uint32(i*chunkSize), chunkSize), nextQueuedMessage(t, p), "chunk %d", i)
+	}
+}
+
+// TestChunkRequestsAreBuiltWhenTheyGoOut verifies that the messages asking for a piece's chunks are put together as
+// they are about to be sent rather than when the piece was claimed, so a chunk that arrives while the queue ahead of
+// them is draining isn't asked for all over again. Asking again spends the peer's upload bandwidth, and our download
+// bandwidth, on data we already hold.
+func TestChunkRequestsAreBuiltWhenTheyGoOut(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClientForTorrent(d, newTestTorrentFileWithChunksPerPiece(4, testPieceCount))
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+
+	// The piece is claimed and the first two chunks arrive before any of the requests have gone out, which is what not
+	// having started the delivery goroutine yet stands in for
+	p.queuePieceDownload(0)
+	c.NoError(p.receivedChunk(0, 0, testStorageBytes(0, 0, chunkSize)))
+	c.NoError(p.receivedChunk(0, chunkSize, testStorageBytes(0, chunkSize, chunkSize)))
+
+	startChunkRequestDelivery(t, p)
+	for i := 2; i < 4; i++ {
+		c.Equal(newTestPieceRequest(requestID, 0, uint32(i*chunkSize), chunkSize), nextQueuedMessage(t, p), "chunk %d", i)
+	}
+	select {
+	case buffer := <-p.writeQueue:
+		t.Fatalf("only the chunks that hadn't arrived should have been asked for, but %v was too", buffer)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// TestMessageDeadlinesScaleWithTheMessageLength verifies that how long a message is given to move, in either
+// direction, depends on how big it is. Everything but the bit field has a small, fixed size, but a bit field is one
+// byte for every eight pieces of the torrent, so a flat deadline for one of those amounts to demanding a transfer rate
+// that a slow but honest peer has no way to meet.
+func TestMessageDeadlinesScaleWithTheMessageLength(t *testing.T) {
+	c := check.New(t)
+
+	// Everything that fits within the minimum still gets the minimum
+	for _, length := range []uint32{0, 1, 5, 13, 9 + chunkSize, uint32(msgReadDeadline/time.Second) * minMessageRate} {
+		c.Equal(msgReadDeadline, messageReadDeadline(length), "length %d", length)
+	}
+	for _, length := range []int{0, 4, 5, 17, 13 + chunkSize, int(msgWriteDeadline/time.Second) * minMessageRate} {
+		c.Equal(msgWriteDeadline, messageWriteDeadline(length), "length %d", length)
+	}
+
+	// The bit field for the largest torrent that will be accepted is a quarter of a megabyte, which the flat deadline
+	// gave a peer five seconds to deliver: ~52KB/s or be dropped, and blocked from reconnecting on top of it
+	maxBitField := 1 + tfs.MaxPieceCount/8
+	c.Equal(time.Duration(maxBitField)*time.Second/minMessageRate, messageReadDeadline(uint32(maxBitField)))
+	c.Equal(time.Duration(4+maxBitField)*time.Second/minMessageRate, messageWriteDeadline(4+maxBitField))
+	for _, one := range []struct {
+		name     string
+		deadline time.Duration
+	}{
+		{name: "read", deadline: messageReadDeadline(uint32(maxBitField))},
+		{name: "write", deadline: messageWriteDeadline(4 + maxBitField)},
+	} {
+		c.True(one.deadline >= 30*time.Second,
+			"the largest bit field must be given enough time for a slow peer to %s it: %v", one.name, one.deadline)
+	}
+}
+
+// TestALargeBitFieldIsGivenTimeToArrive verifies that the deadline actually placed on the connection while a message
+// body is read is the one derived from its length, and that a peer sending a large bit field is taken in rather than
+// dropped. A timeout costs more than the connection: it is neither EOF nor a connection we closed, so the address is
+// blocked as well and the peer can't come back.
+func TestALargeBitFieldIsGivenTimeToArrive(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClientForTorrent(d, newTestTorrentFileWithPieces(bigBitFieldPieceCount))
+	local, recorder, p, done := startTestPeerRecordingDeadlines(t, client)
+
+	bits := make([]byte, bigBitFieldPieceCount/8)
+	bits[0] = 0x80 // The peer has the first piece
+	c.NoError(local.SetDeadline(time.Now().Add(peerMgmtWait)))
+	_, err := local.Write(newTestMessage(bitFieldID, bits...))
+	c.NoError(err)
+
+	deadline := time.Now().Add(peerMgmtWait)
+	for {
+		p.lock.RLock()
+		took := p.has.IsSet(0)
+		p.lock.RUnlock()
+		if took {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the bit field was never taken in")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// The upper bound is what tells the deadline for the body apart from the far longer idle one the read loop waits
+	// for the next message under, which would otherwise satisfy a test that only asked for more than the minimum. The
+	// deadline for the body is the second one armed, since the four byte length prefix is read under the idle one.
+	expected := messageReadDeadline(uint32(1 + len(bits)))
+	allowance := recorder.allowance(t, "read", 1)
+	c.True(allowance > msgReadDeadline && allowance <= expected,
+		"the body of a large bit field must be read under a deadline of %v, not %v", expected, allowance)
+	c.False(d.GateKeeper().IsAddressBlocked(p.conn.RemoteAddr()),
+		"a peer that delivered its bit field must not be blocked")
+
+	xio.CloseIgnoringErrors(local)
+	select {
+	case <-done:
+	case <-time.After(peerMgmtWait):
+		t.Fatal("the peer kept processing messages after the connection ended")
+	}
+}
+
+// TestALargeBitFieldIsGivenTimeToGoOut verifies that the deadline placed on the connection while a message is written
+// is derived from its length too. A peer that reads slowly is no more at fault than one that writes slowly, and the
+// bit field we send the moment a peer connects is as big as the one it sends us, so a flat deadline drops the peers
+// that need us most: the ones on the far end of a slow link, which is exactly when a seed matters.
+func TestALargeBitFieldIsGivenTimeToGoOut(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClientForTorrent(d, newTestTorrentFileWithPieces(bigBitFieldPieceCount))
+	// We have a piece, so the bit field announcing it is the first thing the peer is sent
+	client.tracker.lock.Lock()
+	client.tracker.have.Set(0)
+	client.tracker.lock.Unlock()
+	local, recorder, _, done := startTestPeerRecordingDeadlines(t, client)
+
+	bits := make([]byte, bigBitFieldPieceCount/8)
+	bits[0] = 0x80
+	expectBitField(t, local, bits...)
+
+	expected := messageWriteDeadline(len(newBitFieldMessage(bits)))
+	allowance := recorder.allowance(t, "write", 0)
+	c.True(allowance > msgWriteDeadline && allowance <= expected,
+		"a large bit field must be written under a deadline of %v, not %v", expected, allowance)
+
+	xio.CloseIgnoringErrors(local)
+	select {
+	case <-done:
+	case <-time.After(peerMgmtWait):
+		t.Fatal("the peer kept processing messages after the connection ended")
+	}
+}
+
+// bigBitFieldPieceCount is a piece count large enough that the bit field for it is worth more than the flat deadlines
+// at minMessageRate, which is what the tests that check those deadlines scale need.
+const bigBitFieldPieceCount = 400000
+
+// startTestPeerRecordingDeadlines starts a peer whose connection records the deadlines placed on it, and returns the
+// connection the remote would use to talk to it, the recorder, the peer, and a channel that is closed once the peer
+// stops processing messages.
+func startTestPeerRecordingDeadlines(t *testing.T, client *Client) (local net.Conn, recorder *deadlineRecordingConn,
+	p *peer, done chan struct{},
+) {
+	t.Helper()
+	local, remote := newTestConnPair(t)
+	recorder = &deadlineRecordingConn{Conn: remote}
+	p = newPeer(client, recorder, client.logger)
+	client.lock.Lock()
+	client.peers[recorder] = p
+	client.lock.Unlock()
+	done = make(chan struct{})
+	go func() {
+		defer close(done)
+		p.processIncomingMessages()
+	}()
+	return local, recorder, p, done
+}
+
+// deadlineRecordingConn records how long each deadline placed on a connection allowed, so that a test can tell how
+// long a peer was given for what it was in the middle of sending or being sent.
+type deadlineRecordingConn struct {
+	net.Conn
+	allowances map[string][]time.Duration
+	lock       sync.Mutex
+}
+
+func (c *deadlineRecordingConn) SetReadDeadline(when time.Time) error {
+	c.record("read", when)
+	return c.Conn.SetReadDeadline(when)
+}
+
+func (c *deadlineRecordingConn) SetWriteDeadline(when time.Time) error {
+	c.record("write", when)
+	return c.Conn.SetWriteDeadline(when)
+}
+
+func (c *deadlineRecordingConn) record(kind string, when time.Time) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	if c.allowances == nil {
+		c.allowances = make(map[string][]time.Duration)
+	}
+	c.allowances[kind] = append(c.allowances[kind], time.Until(when))
+}
+
+// allowance returns how long the nth deadline of the given kind allowed, failing the test if that many were never set.
+func (c *deadlineRecordingConn) allowance(t *testing.T, kind string, n int) time.Duration {
+	t.Helper()
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	if len(c.allowances[kind]) <= n {
+		t.Fatalf("the peer set %d %s deadlines, so there is no #%d", len(c.allowances[kind]), kind, n)
+	}
+	return c.allowances[kind][n]
 }
 
 // TestChokeDoesNotCostTheConnectionOrThePiece verifies that a peer choking us in the middle of a piece, which real
@@ -723,6 +1047,7 @@ func TestResumeOnlyAsksForTheChunksThatAreMissing(t *testing.T) {
 	client := newTestClient(d)
 	conn, p := newTestPeer(t, client)
 	defer xio.CloseIgnoringErrors(conn)
+	startChunkRequestDelivery(t, p)
 
 	// A piece three chunks long, of which the first and last have already arrived
 	one := &piece{buffer: make([]byte, 3*chunkSize), timeout: time.Now().Add(-time.Minute)}
@@ -1718,6 +2043,16 @@ func startTestPeer(t *testing.T, client *Client) (conn net.Conn, p *peer, done c
 	return conn, p, done
 }
 
+// startChunkRequestDelivery starts the goroutine that puts the messages asking for the chunks we still need onto the
+// peer's write queue, and stops it once the test is over. A peer whose read loop is running starts it for itself; one
+// a test built directly has to have it started, since without it the requests a piece is queued for never go out.
+func startChunkRequestDelivery(t *testing.T, p *peer) {
+	t.Helper()
+	done := make(chan bool)
+	go p.processChunkRequests(done)
+	t.Cleanup(func() { close(done) })
+}
+
 // newTestPeer adds a peer to the client and returns the connection the remote side of that peer would use to talk to
 // it, along with the peer itself.
 func newTestPeer(t *testing.T, client *Client) (conn net.Conn, p *peer) {
@@ -1820,4 +2155,15 @@ func newTestTorrentFileWithPieces(count int) *tfs.File {
 	f.Info.Pieces = make([]byte, sha1Size*count)
 	f.Info.Length = chunkSize * int64(count)
 	return &f
+}
+
+// newTestTorrentFileWithChunksPerPiece creates the test torrent with pieces made up of the given number of chunks, for
+// the tests that need a piece to be able to arrive a chunk at a time. The single chunk pieces the rest of them use
+// can't: a chunk has to be one of the blocks we asked for, and the only such block those pieces have is the whole
+// piece.
+func newTestTorrentFileWithChunksPerPiece(chunks, count int) *tfs.File {
+	f := newTestTorrentFileWithPieces(count)
+	f.Info.PieceLength = int64(chunks) * chunkSize
+	f.Info.Length = f.Info.PieceLength * int64(count)
+	return f
 }

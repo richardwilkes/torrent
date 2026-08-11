@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"maps"
 	"net"
+	"slices"
 	"sync"
 	"time"
 
@@ -31,8 +32,16 @@ import (
 const (
 	// idleReadDeadline is how long we'll wait for the next message from a peer. It must be longer than the period
 	// peers send keep-alive messages at, otherwise a peer with nothing to say will be disconnected.
-	idleReadDeadline        = keepAlivePeriod + 30*time.Second
-	msgReadDeadline         = 5 * time.Second
+	idleReadDeadline = keepAlivePeriod + 30*time.Second
+	msgReadDeadline  = 5 * time.Second
+	// minMessageRate is the slowest, in bytes per second, that a message is expected to move at. A message is given the
+	// longer of the flat deadline for its direction and what carrying it at this rate would take, rather than the flat
+	// deadline alone, because the bit field both ends exchange as soon as they connect is one byte for every eight
+	// pieces of the torrent — a quarter of a megabyte at tfs.MaxPieceCount — and a flat few seconds for that amounts to
+	// demanding a transfer rate that a slow but perfectly honest peer has no way to meet. Timing one out costs more
+	// than the connection, too: on the reading side a deadline is neither EOF nor a connection we closed, so
+	// blockAddressOnReadFailure bans the address as well and the peer can't come back.
+	minMessageRate          = 8 * 1024
 	msgWriteDeadline        = 5 * time.Second
 	keepAlivePeriod         = 2 * time.Minute
 	downloadReadDeadline    = 10 * time.Second
@@ -55,6 +64,21 @@ const (
 // errStorageClosed is returned when a peer tries to read or write the torrent's storage after the client has closed
 // it, which can happen for the peer goroutines that outlive the client's peer wait group.
 var errStorageClosed = errors.New("torrent storage has been closed")
+
+// messageReadDeadline returns how long the body of a message of the given length, which includes the one-byte message
+// ID, is allowed to take to arrive: the longer of the minimum every message is given and what carrying it at
+// minMessageRate would take.
+func messageReadDeadline(length uint32) time.Duration {
+	return max(msgReadDeadline, time.Duration(length)*time.Second/minMessageRate)
+}
+
+// messageWriteDeadline returns how long a message of the given length, which here includes its four-byte length
+// prefix, is allowed to take to go out. A peer that reads slowly is no more at fault than one that writes slowly, and
+// the message that makes the difference is the same one: the bit field we send a peer the moment it connects is as big
+// as the one it sends us.
+func messageWriteDeadline(length int) time.Duration {
+	return max(msgWriteDeadline, time.Duration(length)*time.Second/minMessageRate)
+}
 
 // useRate accounts for the given number of bytes moved on this connection, charging the limiter in pieces no larger
 // than dispatcher.MaxPieceMessageLength, which every permitted cap is large enough to accept. A limiter refuses any
@@ -104,7 +128,14 @@ type peer struct {
 	// capacity of one and is only ever sent to without blocking, since all that goroutine needs to know is that
 	// something is waiting for it and it re-reads all of the pending state each time it wakes.
 	stateChanged chan struct{}
-	pieces       map[int]*piece // protected by lock
+	// chunkRequestsChanged tells the goroutine that asks the peer for the chunks we need that there is something
+	// pending. It has a capacity of one and is only ever sent to without blocking, for the same reasons stateChanged
+	// is.
+	chunkRequestsChanged chan struct{}
+	// pendingChunkRequests holds the pieces we're downloading from this peer whose outstanding chunks have yet to be
+	// asked for. Protected by lock.
+	pendingChunkRequests map[int]bool
+	pieces               map[int]*piece // protected by lock
 	// haveQueue holds the pieces we've acquired that the peer has yet to be told about. Protected by lock.
 	haveQueue []int
 	peerState      // protected by lock
@@ -203,14 +234,16 @@ func newPeer(client *Client, conn net.Conn, logger *slog.Logger) *peer {
 		conn:   conn,
 		// A connection that has yet to send anything has been quiet since it was made, so that is where the wait for
 		// the first keep-alive starts.
-		lastWriteTime: now,
-		created:       now,
-		has:           fixedbits.New(client.torrentFile.PieceCount()),
-		requestChan:   make(chan *pieceRequest),
-		writeQueue:    make(chan []byte, 32),
-		chokedChan:    make(chan struct{}, 1),
-		stateChanged:  make(chan struct{}, 1),
-		pieces:        make(map[int]*piece),
+		lastWriteTime:        now,
+		created:              now,
+		has:                  fixedbits.New(client.torrentFile.PieceCount()),
+		requestChan:          make(chan *pieceRequest),
+		writeQueue:           make(chan []byte, 32),
+		chokedChan:           make(chan struct{}, 1),
+		stateChanged:         make(chan struct{}, 1),
+		chunkRequestsChanged: make(chan struct{}, 1),
+		pendingChunkRequests: make(map[int]bool),
+		pieces:               make(map[int]*piece),
 		// Both ends of a new connection start out choked and uninterested, so there is nothing to tell the peer about
 		// until one of those changes.
 		toldChoking: true,
@@ -377,6 +410,75 @@ func (p *peer) nextStateMessage() []byte {
 	}
 }
 
+// queueChunkRequests records that the chunks we still need of the given piece have yet to be asked for, leaving the
+// delivery of the messages that ask for them to processChunkRequests.
+func (p *peer) queueChunkRequests(index int) {
+	p.lock.Lock()
+	p.pendingChunkRequests[index] = true
+	p.lock.Unlock()
+	// The signal is never allowed to block, for the same reason signalStateChange's isn't: it says nothing more than
+	// that there is something to look at, and the delivery goroutine re-reads everything pending each time it wakes.
+	select {
+	case p.chunkRequestsChanged <- struct{}{}:
+	default:
+	}
+}
+
+// processChunkRequests asks the peer for the chunks it hasn't delivered yet of the pieces we're downloading from it. A
+// goroutine of its own owns those sends because a piece is a whole queue's worth of request messages and the write
+// queue blocks once it fills, which for a peer whose queue is backed up behind rate limited piece messages is tens of
+// seconds. The pieces are claimed by the peer management goroutine and by the read goroutines of other peers, so a
+// send made where the claim is decided would stall choke rotation, expiry clearing and dialing, or another peer's
+// message loop, on whichever peer happens to be the slowest.
+func (p *peer) processChunkRequests(done chan bool) {
+	for {
+		select {
+		case <-p.chunkRequestsChanged:
+			for _, buffer := range p.nextChunkRequests() {
+				select {
+				case p.writeQueue <- buffer:
+				case <-done:
+					return
+				}
+			}
+		case <-done:
+			return
+		}
+	}
+}
+
+// nextChunkRequests returns the messages asking for the chunks we still need of the pieces that have been queued for
+// requesting, and takes those pieces out of the queue. The messages are built when they are about to be sent rather
+// than when the piece was queued, so chunks that arrived while an earlier batch was draining aren't asked for a second
+// time, and a piece that was given back in the meantime isn't asked for at all.
+func (p *peer) nextChunkRequests() [][]byte {
+	p.lock.Lock()
+	indexes := make([]int, 0, len(p.pendingChunkRequests))
+	for index := range p.pendingChunkRequests {
+		indexes = append(indexes, index)
+	}
+	clear(p.pendingChunkRequests)
+	pieces := maps.Clone(p.pieces)
+	p.lock.Unlock()
+	var requests [][]byte
+	slices.Sort(indexes) // Map iteration order is arbitrary; the peer is asked for the pieces in a sensible one
+	for _, index := range indexes {
+		one, ok := pieces[index]
+		if !ok {
+			continue
+		}
+		one.lock.RLock()
+		for i := 0; i < len(one.buffer); i += chunkSize {
+			size := min(len(one.buffer)-i, chunkSize)
+			if !one.spans.Contains(&spanlist.Span{Start: i, Length: size}) {
+				requests = append(requests, newRequestMessage(index, i, size))
+			}
+		}
+		one.lock.RUnlock()
+	}
+	return requests
+}
+
 // newStateMessage creates one of the messages that consists of nothing more than its ID.
 func newStateMessage(id byte) []byte {
 	buffer := make([]byte, 5)
@@ -479,6 +581,7 @@ func (p *peer) processIncomingMessages() {
 	done := make(chan bool)
 	go p.processWriteQueue(done)
 	go p.processStateChanges(done)
+	go p.processChunkRequests(done)
 	go p.pieceRequestQueue()
 	lengthBuffer := make([]byte, 4)
 	maxLength := p.maxMessageLength()
@@ -505,7 +608,7 @@ func (p *peer) processIncomingMessages() {
 		}
 		if length > 0 { // Not a keep-alive message
 			buffer := make([]byte, length)
-			if err := tio.ReadWithDeadline(p.conn, buffer, msgReadDeadline); err != nil {
+			if err := tio.ReadWithDeadline(p.conn, buffer, messageReadDeadline(length)); err != nil {
 				if tio.ShouldLogIOError(err) {
 					errs.LogTo(p.logger, err)
 				}
@@ -637,19 +740,10 @@ func (p *peer) resumeDownloads() {
 	p.lock.Unlock()
 	deadline := now.Add(downloadReadDeadline)
 	for index, one := range pieces {
-		var requests [][]byte
 		one.lock.Lock()
 		one.timeout = deadline
-		for i := 0; i < len(one.buffer); i += chunkSize {
-			size := min(len(one.buffer)-i, chunkSize)
-			if !one.spans.Contains(&spanlist.Span{Start: i, Length: size}) {
-				requests = append(requests, newRequestMessage(index, i, size))
-			}
-		}
 		one.lock.Unlock()
-		for _, buffer := range requests {
-			p.writeQueue <- buffer
-		}
+		p.queueChunkRequests(index)
 	}
 }
 
@@ -702,9 +796,7 @@ func (p *peer) queuePieceDownload(index int) {
 		return
 	}
 	if !ok {
-		for i := 0; i < length; i += chunkSize {
-			p.writeQueue <- newRequestMessage(index, i, min(length-i, chunkSize))
-		}
+		p.queueChunkRequests(index)
 	}
 }
 
@@ -721,6 +813,18 @@ func (p *peer) receivedChunk(index, begin int, buffer []byte) error {
 	if begin < 0 || len(buffer) > len(one.buffer) || begin > len(one.buffer)-len(buffer) {
 		p.client.dispatcher.GateKeeper().BlockAddress(p.conn.RemoteAddr())
 		return errs.Newf("piece %d would overrun buffer", index)
+	}
+	// The chunk has to be one of the chunk aligned blocks we actually asked for, which is the only thing a peer is
+	// supposed to answer a request with. Taking whatever range a peer cares to send is what lets it defeat the bounds
+	// on how long it may hold a piece: every byte we haven't seen before counts as progress, so a peer that dribbles
+	// out a single new byte at a time renews both deadlines indefinitely while delivering nothing anyone can use, and
+	// no other peer can take the piece while it is claimed. It is also what makes taking a chunk in cost more than the
+	// chunk is worth: single bytes at every other offset build a span for each one, and both the search and the
+	// insertion that records a span are linear in the spans already there, so a peer can spend our CPU quadratically
+	// for as long as it keeps feeding us.
+	if begin%chunkSize != 0 || len(buffer) != min(chunkSize, len(one.buffer)-begin) {
+		p.client.dispatcher.GateKeeper().BlockAddress(p.conn.RemoteAddr())
+		return errs.Newf("piece %d chunk at %d with a length of %d was never requested", index, begin, len(buffer))
 	}
 	last := begin + len(buffer)
 	span := spanlist.Span{Start: begin, Length: len(buffer)}
@@ -953,7 +1057,7 @@ func (p *peer) processWriteQueue(done chan bool) {
 			}
 			if err == nil {
 				p.setLastWrite(time.Now())
-				err = tio.WriteWithDeadline(p.conn, buffer, msgWriteDeadline)
+				err = tio.WriteWithDeadline(p.conn, buffer, messageWriteDeadline(len(buffer)))
 			}
 		}
 		if err != nil || buffer == nil {
