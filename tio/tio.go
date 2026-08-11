@@ -19,26 +19,33 @@ import (
 	"github.com/richardwilkes/toolbox/v2/errs"
 )
 
-// ReadWithDeadline reads a buffer from a connection with a deadline.
+// ReadWithDeadline reads a buffer from a connection with a deadline. A deadline of zero or less means no deadline.
 func ReadWithDeadline(conn net.Conn, buffer []byte, deadline time.Duration) error {
-	if deadline > 0 {
-		if err := conn.SetReadDeadline(time.Now().Add(deadline)); err != nil {
-			return errs.Wrap(err)
-		}
+	if err := conn.SetReadDeadline(deadlineTime(deadline)); err != nil {
+		return errs.Wrap(err)
 	}
 	_, err := io.ReadFull(conn, buffer)
 	return errs.Wrap(err)
 }
 
-// WriteWithDeadline writes a buffer to a connection with a deadline.
+// WriteWithDeadline writes a buffer to a connection with a deadline. A deadline of zero or less means no deadline.
 func WriteWithDeadline(conn net.Conn, buffer []byte, deadline time.Duration) error {
-	if deadline > 0 {
-		if err := conn.SetWriteDeadline(time.Now().Add(deadline)); err != nil {
-			return errs.Wrap(err)
-		}
+	if err := conn.SetWriteDeadline(deadlineTime(deadline)); err != nil {
+		return errs.Wrap(err)
 	}
 	_, err := conn.Write(buffer)
 	return errs.Wrap(err)
+}
+
+// deadlineTime turns a caller's duration into the absolute time a connection deadline is set from. Zero or less means
+// no deadline, which is the zero time rather than no call at all: a deadline stays armed on the connection until it is
+// replaced, so leaving one in place would run the "no deadline" call against whatever an earlier one set — quite
+// possibly a deadline that has already passed, failing the call the moment it is made.
+func deadlineTime(deadline time.Duration) time.Time {
+	if deadline <= 0 {
+		return time.Time{}
+	}
+	return time.Now().Add(deadline)
 }
 
 // ShouldLogIOError returns true if the error should be logged.

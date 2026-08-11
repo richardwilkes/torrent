@@ -535,6 +535,118 @@ func TestAnnounceOvertakenByTheStopIsNotApplied(t *testing.T) {
 	c.Equal(0, client.Status().Seeders)
 }
 
+// TestParsePeersRejectsUnusablePorts verifies that the dict model's port is checked against the port range before it
+// becomes something we dial. It arrives as a bencoded integer, unlike the compact form's inherently 16-bit value, so a
+// hostile or buggy tracker can fill the peer list with ports no dial can ever reach, each of them attempted again on
+// every peer management pass until the next announce replaces the list.
+func TestParsePeersRejectsUnusablePorts(t *testing.T) {
+	c := check.New(t)
+	in := decodeTestTrackerResponse(t, []any{
+		testPeerDict("", "10.0.0.1", 6881),
+		testPeerDict("", "10.0.0.2", 1),
+		testPeerDict("", "10.0.0.3", math.MaxUint16),
+		testPeerDict("", "10.0.0.4", 0),
+		testPeerDict("", "10.0.0.5", -1),
+		testPeerDict("", "10.0.0.6", -6881),
+		testPeerDict("", "10.0.0.7", math.MaxUint16+1),
+		testPeerDict("", "10.0.0.8", math.MaxInt32),
+	})
+	peers, err := parsePeers(in.PeerAddresses, "<unknown>")
+	c.NoError(err)
+	c.Equal(3, len(peers))
+	c.Equal(6881, peers["10.0.0.1"])
+	c.Equal(1, peers["10.0.0.2"])
+	c.Equal(math.MaxUint16, peers["10.0.0.3"])
+	for _, addr := range []string{"10.0.0.4", "10.0.0.5", "10.0.0.6", "10.0.0.7", "10.0.0.8"} {
+		_, exists := peers[addr]
+		c.False(exists, "%s has a port outside the range a dial can use", addr)
+	}
+}
+
+// TestCompletedAnnounceIsNotMadeOnThePeerGoroutine verifies that finishing the download hands the "completed" announce
+// to the announce goroutine rather than making it where the last piece landed. That is a peer's message loop, which
+// the client's peer wait group tracks, so an announce made there stalls the peer for a full tracker round trip and, if
+// a stop arrives while it is in flight, holds the shutdown — the stopped announce, the close of the storage file and
+// the stopped notification all queue behind the wait for that peer — for as long as the HTTP client's timeout allows.
+func TestCompletedAnnounceIsNotMadeOnThePeerGoroutine(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	events := make(chan string, 4)
+	held := make(chan struct{})
+	defer close(held)
+	client := newTestTrackerClientWithHandler(t, d, func(w http.ResponseWriter, r *http.Request) {
+		event := r.URL.Query().Get("event")
+		events <- event
+		if event == completedMsg {
+			// The completion is left hanging, standing in for a tracker that is slow to answer
+			select {
+			case <-held:
+			case <-r.Context().Done():
+				return
+			}
+		}
+		fmt.Fprint(w, noPeersResponse)
+	})
+	c.NoError(client.tracker.announceStart())
+	c.Equal(startedMsg, <-events)
+
+	// Completing the download has to come back at once rather than sit on the tracker's answer
+	waitFor(t, "markBlockValid", func() {
+		for i := range client.torrentFile.PieceCount() {
+			client.tracker.markBlockValid(i)
+		}
+	})
+	c.True(client.tracker.isDownloadComplete())
+
+	// The announce is still made, just not from there
+	select {
+	case event := <-events:
+		c.Equal(completedMsg, event)
+	case <-time.After(peerMgmtWait):
+		t.Fatal("the completed announce was never made")
+	}
+
+	// And being on that goroutine puts it under the same cancellation as every other announce, so the stop cuts the
+	// round trip it is parked on short instead of leaving the shutdown to wait out the HTTP timeout
+	client.tracker.stopPeriodicAnnounce()
+	client.tracker.lock.RLock()
+	done := client.tracker.periodicAnnounceDone
+	client.tracker.lock.RUnlock()
+	select {
+	case <-done:
+	default:
+		t.Fatal("the completed announce in flight was not cut short by the stop")
+	}
+}
+
+// TestCompletedIsNotAnnouncedForADownloadThatNeverHappened verifies that a client coming up with a complete file on
+// disk doesn't report a completion. Verifying that file marks every piece valid, which is what would ask for the
+// announce, but it happens before the start announce and the event describes a torrent downloaded during this session.
+func TestCompletedIsNotAnnouncedForADownloadThatNeverHappened(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	events := make(chan string, 4)
+	client := newTestTrackerClientWithHandler(t, d, func(w http.ResponseWriter, r *http.Request) {
+		events <- r.URL.Query().Get("event")
+		fmt.Fprint(w, noPeersResponse)
+	})
+
+	// Which is what verifying an already complete file on disk does, before anything has been announced at all
+	for i := range client.torrentFile.PieceCount() {
+		client.tracker.markBlockValid(i)
+	}
+	c.True(client.tracker.isDownloadComplete())
+
+	c.NoError(client.tracker.announceStart())
+	c.Equal(startedMsg, <-events)
+	defer client.tracker.stopPeriodicAnnounce()
+	select {
+	case event := <-events:
+		t.Fatalf("a %q event was announced for a download that never happened", event)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 // testTrackerResponse is what the stub tracker answers with. Either field may be changed between announces; a status
 // of zero means the ordinary 200.
 type testTrackerResponse struct {
@@ -543,24 +655,31 @@ type testTrackerResponse struct {
 }
 
 // newTestTrackerClient returns a client whose announces go to a stub tracker, along with the response that stub will
-// return. The peer ID is filled in with query-safe bytes, which is what NewClient does and what the announce URL
-// relies on.
+// return.
 func newTestTrackerClient(t *testing.T, d *dispatcher.Dispatcher) (client *Client, response *testTrackerResponse) {
 	t.Helper()
 	response = &testTrackerResponse{}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	return newTestTrackerClientWithHandler(t, d, func(w http.ResponseWriter, _ *http.Request) {
 		if response.status != 0 {
 			w.WriteHeader(response.status)
 		}
 		fmt.Fprint(w, response.body)
-	}))
+	}), response
+}
+
+// newTestTrackerClientWithHandler returns a client whose announces go to a stub tracker answering them with the given
+// handler, for the tests that need to look at the request or hold the answer back. The peer ID is filled in with
+// query-safe bytes, which is what NewClient does and what the announce URL relies on.
+func newTestTrackerClientWithHandler(t *testing.T, d *dispatcher.Dispatcher, handler http.HandlerFunc) *Client {
+	t.Helper()
+	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
-	client = newTestClient(d)
+	client := newTestClient(d)
 	client.torrentFile.Announce = srv.URL
 	for i := range client.id {
 		client.id[i] = urlQuerySafeBytes[i%len(urlQuerySafeBytes)]
 	}
-	return client, response
+	return client
 }
 
 // unreachableTrackerURL is an announce URL that no request can ever be made to, standing in for a tracker that never

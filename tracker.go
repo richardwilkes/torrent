@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -33,8 +34,9 @@ import (
 )
 
 const (
-	startedMsg = "started"
-	stoppedMsg = "stopped"
+	startedMsg   = "started"
+	stoppedMsg   = "stopped"
+	completedMsg = "completed"
 
 	// minAnnounceInterval and maxAnnounceInterval bound how long we wait between announces. The tracker's requested
 	// interval is only a request, and it is unverified data: too small a value has us hammering the tracker, while one
@@ -72,6 +74,10 @@ type tracker struct {
 	// stopped announce, the close of the storage file and the stopped notification queuing behind a full round trip.
 	announceCtx    context.Context
 	cancelAnnounce context.CancelFunc
+	// completeAnnounceRequested carries the "completed" announce from the peer goroutine that finished the download to
+	// the periodic announce goroutine, which is the only place an announce is made from once we've started. Buffered by
+	// one and never blocking on a send, since a request already pending says everything a second one would.
+	completeAnnounceRequested chan struct{}
 	trackerLockData
 	// The transfer totals are reported in every announce and are updated by each peer's read and write goroutines, so
 	// they are kept as atomics rather than under the tracker lock, which those hot paths would otherwise contend on
@@ -125,9 +131,10 @@ func newTracker(client *Client) *tracker {
 	totalPieces := client.torrentFile.PieceCount()
 	ctx, cancel := context.WithCancel(context.Background())
 	return &tracker{
-		client:         client,
-		announceCtx:    ctx,
-		cancelAnnounce: cancel,
+		client:                    client,
+		announceCtx:               ctx,
+		cancelAnnounce:            cancel,
+		completeAnnounceRequested: make(chan struct{}, 1),
 		trackerLockData: trackerLockData{
 			totalBytes:     totalBytes,
 			remainingBytes: totalBytes,
@@ -166,9 +173,25 @@ func (t *tracker) markBlockValid(index int) {
 	t.lock.Unlock()
 	t.client.informPeersWeHavePiece(index)
 	if announce {
-		if err := t.announceComplete(); err != nil {
-			errs.LogTo(t.client.logger, err)
-		}
+		t.requestCompleteAnnounce()
+	}
+}
+
+// requestCompleteAnnounce hands the "completed" announce to the periodic announce goroutine rather than making it
+// here. This runs on a peer's message loop, which the client's peer wait group tracks, so making the announce here
+// stalls that peer for a full tracker round trip and, when a stop lands while it is in flight, holds up the shutdown
+// — the stopped announce, the close of the storage file and the stopped notification all queue behind the wait for
+// that peer — for as long as the HTTP client's timeout allows, well past the bound the shutdown otherwise keeps every
+// announce within. A download that finished before we ever announced a start, which is what verifying an already
+// complete file on disk does, has no completion to report and no goroutine to report it: the event describes a
+// torrent downloaded during this session.
+func (t *tracker) requestCompleteAnnounce() {
+	if !t.hasStarted() {
+		return
+	}
+	select {
+	case t.completeAnnounceRequested <- struct{}{}:
+	default:
 	}
 }
 
@@ -261,11 +284,14 @@ func (t *tracker) announceStart() error {
 	return nil
 }
 
+// announceComplete reports the finished download. It is made with the context the stop cancels, like every other
+// announce the periodic goroutine makes, so that one caught in the middle of a round trip unwinds at once instead of
+// holding the shutdown that is waiting for that goroutine.
 func (t *tracker) announceComplete() error {
 	if !t.hasStarted() {
 		return nil
 	}
-	return t.announce(context.Background(), "completed")
+	return t.announce(t.announceCtx, completedMsg)
 }
 
 func (t *tracker) announceStopped() error {
@@ -337,6 +363,10 @@ func (t *tracker) announceInterval() time.Duration {
 	return minAnnounceInterval
 }
 
+// periodicAnnounce makes the announces that follow the start: the ones the tracker's interval asks for, and the
+// "completed" one a peer asks for when the last piece lands. Both are made here so that every announce after the start
+// is on this one goroutine, which is the one the shutdown cancels and waits for. Servicing a completion restarts the
+// interval as well, since the tracker has just been brought up to date by an announce of its own.
 func (t *tracker) periodicAnnounce() {
 	for {
 		timer := time.After(t.announceInterval())
@@ -346,6 +376,10 @@ func (t *tracker) periodicAnnounce() {
 			// unwinds at once rather than holding up the shutdown that is waiting for this goroutine. Nothing is
 			// logged for that: being cut short is what was asked for, not a failure to report.
 			if err := t.announce(t.announceCtx, ""); !t.announceStopping() && tio.ShouldLogIOError(err) {
+				errs.LogTo(t.client.logger, err)
+			}
+		case <-t.completeAnnounceRequested:
+			if err := t.announceComplete(); !t.announceStopping() && tio.ShouldLogIOError(err) {
 				errs.LogTo(t.client.logger, err)
 			}
 		case <-t.announceCtx.Done():
@@ -374,7 +408,7 @@ func parseCompactPeers(value, externalAddr string) map[string]int {
 // parsePeers extracts the peer addresses from a tracker's "peers" value. Although we always ask for the compact form,
 // a tracker is free to ignore that and answer with the dict model instead, so both are accepted: a bencoded string is
 // the compact form and a bencoded list is the dict model. A missing or empty value simply yields no peers. Our own
-// address, which the caller passes in, is omitted, as are entries with no port.
+// address, which the caller passes in, is omitted, as are entries whose port isn't one that can be dialed.
 func parsePeers(raw bencode.RawMessage, externalAddr string) (map[string]int, error) {
 	if len(raw) == 0 {
 		return make(map[string]int), nil
@@ -395,7 +429,11 @@ func parsePeers(raw bencode.RawMessage, externalAddr string) (map[string]int, er
 		slog.Debug("announce map", "count", len(list))
 		peerAddresses := make(map[string]int, len(list))
 		for _, one := range list {
-			if one.IP != externalAddr && one.Port != 0 {
+			// The dict model carries the port as a bencoded integer, so unlike the compact form — whose ports are
+			// inherently 16 bit — a hostile or buggy tracker can hand us a negative one or one past the end of the port
+			// range. Kept, they become dial attempts that cannot possibly succeed, retried on every peer management
+			// pass until the next announce replaces the list.
+			if one.IP != externalAddr && one.Port > 0 && one.Port <= math.MaxUint16 {
 				peerAddresses[one.IP] = one.Port
 			}
 		}
