@@ -10,6 +10,7 @@
 package torrent
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"net/http"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"github.com/richardwilkes/toolbox/v2/check"
+	"github.com/richardwilkes/toolbox/v2/xio"
 	"github.com/richardwilkes/torrent/dispatcher"
 	"github.com/zeebo/bencode"
 )
@@ -120,9 +122,19 @@ func TestParsePeersMalformed(t *testing.T) {
 	c.HasError(err)
 }
 
-// noPeersResponse is a tracker response carrying an interval and an empty peer list, which is everything an announce
-// needs and nothing more.
-const noPeersResponse = "d8:intervali1800e5:peers0:e"
+const (
+	// noPeersResponse is a tracker response carrying an interval and an empty peer list, which is everything an
+	// announce needs and nothing more.
+	noPeersResponse = "d8:intervali1800e5:peers0:e"
+
+	// unbackedStringResponse declares a 2GB string with nothing at all behind it, which is what a tracker hands us when
+	// it wants us to allocate 2GB.
+	unbackedStringResponse = "d5:peers2147483646:"
+
+	// failureResponse is a tracker refusing the announce, the one thing in a response that is an error in its own
+	// right rather than something missing from it.
+	failureResponse = "d14:failure reason9:not founde"
+)
 
 // overflowSeconds is the smallest interval, in seconds, whose conversion to a time.Duration overflows. The arithmetic
 // is done in int64 and only then narrowed, since letting math.MaxInt64 become an int is a constant that overflows the
@@ -185,7 +197,7 @@ func TestCheckBencode(t *testing.T) {
 		name string
 		data string
 	}{
-		{name: "string length with no data behind it", data: "d5:peers2147483646:"},
+		{name: "string length with no data behind it", data: unbackedStringResponse},
 		{name: "string one byte longer than the data", data: "d5:peers4:abe"},
 		{name: "string length that isn't a number", data: "d5:peers99999999999999999999:abe"},
 		{name: "unterminated string length", data: "d5:peers12"},
@@ -214,10 +226,10 @@ func TestTrackerResponseIsBounded(t *testing.T) {
 	var tr tracker
 
 	// A response declaring a 2GB string, with nothing behind it, must not be allocated for
-	body = "d5:peers2147483646:"
+	body = unbackedStringResponse
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
-	_, err := tr.get(srv.URL)
+	_, err := fetchAnnounceResponse(&tr, srv.URL)
 	runtime.ReadMemStats(&after)
 	c.HasError(err)
 	const allowed = 64 * 1024 * 1024
@@ -226,12 +238,12 @@ func TestTrackerResponseIsBounded(t *testing.T) {
 
 	// A response larger than the cap is refused rather than read into memory
 	body = "d5:peers" + strconv.Itoa(2*maxTrackerResponseSize) + ":" + strings.Repeat("x", 2*maxTrackerResponseSize) + "e"
-	_, err = tr.get(srv.URL)
+	_, err = fetchAnnounceResponse(&tr, srv.URL)
 	c.HasError(err)
 
 	// A normal response still decodes
 	body = "d8:intervali1800e8:completei2e10:incompletei1e5:peers6:" + string([]byte{10, 0, 0, 1, 0x1A, 0xE1}) + "e"
-	in, err := tr.get(srv.URL)
+	in, err := fetchAnnounceResponse(&tr, srv.URL)
 	c.NoError(err)
 	c.Equal(1800, in.Interval)
 	c.Equal(2, in.Seeders)
@@ -255,36 +267,99 @@ func TestAnnounceReportsTransferTotals(t *testing.T) {
 	c.Contains(client.tracker.announceURL(""), "&uploaded=4096&downloaded=16400")
 }
 
-// TestAnnounceToleratesTheShutdownResponse verifies that a tracker answering the stopped announce minimally doesn't
-// produce a spurious error, and that we stop considering ourselves started either way. The response to that announce
-// is never used — the stop was delivered by the request itself.
+// TestAnnounceToleratesTheShutdownResponse verifies that whatever a tracker answers the stopped announce with is
+// accepted without complaint, and that we stop considering ourselves started either way. Nothing in that response is
+// ever read — the stop was delivered by the request itself — and trackers commonly reply to it with an empty body,
+// plain text or a status other than 200 for exactly that reason, so anything less than a fully formed announce
+// response must not turn the shutdown into a reported failure.
 func TestAnnounceToleratesTheShutdownResponse(t *testing.T) {
 	for _, one := range []struct {
-		name string
-		body string
+		name   string
+		body   string
+		status int
 	}{
 		{name: "empty dict", body: "de"},
 		{name: "no interval", body: "d8:completei2ee"},
 		{name: "zero interval", body: "d8:intervali0ee"},
-		{name: "failure reason", body: "d14:failure reason9:not founde"},
+		{name: "failure reason", body: failureResponse},
+		{name: "nothing at all", body: ""},
+		{name: "plain text", body: "ok"},
+		{name: "truncated bencode", body: "d8:intervali1800"},
+		{name: "a string with nothing behind it", body: unbackedStringResponse},
+		{name: "not found", body: "404 page not found", status: http.StatusNotFound},
+		{name: "server error", body: "", status: http.StatusInternalServerError},
+		{name: "no content", body: "", status: http.StatusNoContent},
 	} {
 		t.Run(one.name, func(t *testing.T) {
 			c := check.New(t)
 			d := newTestDispatcher(t)
-			client, body := newTestTrackerClient(t, d)
-			*body = one.body
+			client, response := newTestTrackerClient(t, d)
+			response.body = one.body
+			response.status = one.status
 			client.tracker.lock.Lock()
 			client.tracker.started = true
 			client.tracker.lock.Unlock()
 
-			c.NoError(client.tracker.announce(stoppedMsg))
+			c.NoError(client.tracker.announce(context.Background(), stoppedMsg))
 			c.False(client.tracker.hasStarted(), "the stop was delivered, so we are no longer started")
+		})
+	}
 
-			// The same response is still not enough to start with, since the periodic announce needs an interval
-			c.HasError(client.tracker.announce(startedMsg))
+	// A stop that never reached the tracker is a different matter: the request is what carries the event, so a failure
+	// to make it at all is still reported.
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client, _ := newTestTrackerClient(t, d)
+	client.torrentFile.Announce = unreachableTrackerURL
+	client.tracker.lock.Lock()
+	client.tracker.started = true
+	client.tracker.lock.Unlock()
+	c.HasError(client.tracker.announce(context.Background(), stoppedMsg))
+}
+
+// TestAFailedStartStillOwesAStoppedEvent verifies that a start announce the tracker answered counts as started even
+// when the response turns out to be unusable. The tracker has us in its swarm from the moment it answers, so recording
+// that only once the response has been made sense of leaves us registered with a tracker that is never told we left,
+// handing our dead address to peers until its own timeout runs out.
+func TestAFailedStartStillOwesAStoppedEvent(t *testing.T) {
+	for _, one := range []struct {
+		name   string
+		body   string
+		status int
+	}{
+		{name: "no interval", body: "d5:peers0:e"},
+		{name: "zero interval", body: "d8:intervali0e5:peers0:e"},
+		{name: "an unreadable peer list", body: "d8:intervali1800e5:peersi5ee"},
+		{name: "a failure reason", body: failureResponse},
+		{name: "not bencode at all", body: "nope"},
+		{name: "a status other than 200", body: noPeersResponse, status: http.StatusInternalServerError},
+	} {
+		t.Run(one.name, func(t *testing.T) {
+			c := check.New(t)
+			d := newTestDispatcher(t)
+			client, response := newTestTrackerClient(t, d)
+			response.body = one.body
+			response.status = one.status
+
+			c.HasError(client.tracker.announce(context.Background(), startedMsg))
+			c.True(client.tracker.hasStarted(), "the tracker answered, so it has us in its swarm")
+
+			// Which means the stopped event is actually sent rather than quietly skipped
+			response.body = noPeersResponse
+			response.status = 0
+			c.NoError(client.tracker.announceStopped())
 			c.False(client.tracker.hasStarted())
 		})
 	}
+
+	// A start that never reached the tracker leaves nothing to take back
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client, _ := newTestTrackerClient(t, d)
+	client.torrentFile.Announce = unreachableTrackerURL
+	c.HasError(client.tracker.announce(context.Background(), startedMsg))
+	c.False(client.tracker.hasStarted(), "a tracker that was never reached has no record of us")
+	c.NoError(client.tracker.announceStopped())
 }
 
 // TestAnnounceKeepsTheIntervalWhenOneIsNotReturned verifies that an update or completion announce answered without an
@@ -292,20 +367,20 @@ func TestAnnounceToleratesTheShutdownResponse(t *testing.T) {
 func TestAnnounceKeepsTheIntervalWhenOneIsNotReturned(t *testing.T) {
 	c := check.New(t)
 	d := newTestDispatcher(t)
-	client, body := newTestTrackerClient(t, d)
-	*body = noPeersResponse
+	client, response := newTestTrackerClient(t, d)
+	response.body = noPeersResponse
 
-	c.NoError(client.tracker.announce(startedMsg))
+	c.NoError(client.tracker.announce(context.Background(), startedMsg))
 	c.True(client.tracker.hasStarted())
 	c.Equal(30*time.Minute, client.tracker.announceInterval())
 
-	*body = "d5:peers0:e"
-	c.NoError(client.tracker.announce("completed"))
+	response.body = "d5:peers0:e"
+	c.NoError(client.tracker.announce(context.Background(), "completed"))
 	c.Equal(30*time.Minute, client.tracker.announceInterval())
 
 	// A failure reason is still an error for anything but the shutdown announce
-	*body = "d14:failure reason9:not founde"
-	c.HasError(client.tracker.announce(""))
+	response.body = failureResponse
+	c.HasError(client.tracker.announce(context.Background(), ""))
 }
 
 // TestAnnounceKeepsTheTrackerID verifies that a tracker id we were issued is sent back on every announce that
@@ -315,71 +390,169 @@ func TestAnnounceKeepsTheIntervalWhenOneIsNotReturned(t *testing.T) {
 func TestAnnounceKeepsTheTrackerID(t *testing.T) {
 	c := check.New(t)
 	d := newTestDispatcher(t)
-	client, body := newTestTrackerClient(t, d)
+	client, response := newTestTrackerClient(t, d)
 
-	*body = "d8:intervali1800e5:peers0:10:tracker id5:abcdee"
-	c.NoError(client.tracker.announce(startedMsg))
+	response.body = "d8:intervali1800e5:peers0:10:tracker id5:abcdee"
+	c.NoError(client.tracker.announce(context.Background(), startedMsg))
 	c.Contains(client.tracker.announceURL(""), "&trackerid=abcde")
 
 	// A response that simply leaves the key out isn't taking the id away
-	*body = noPeersResponse
-	c.NoError(client.tracker.announce(""))
+	response.body = noPeersResponse
+	c.NoError(client.tracker.announce(context.Background(), ""))
 	c.Contains(client.tracker.announceURL(""), "&trackerid=abcde")
 
 	// A new id does replace it, and is escaped for the query it goes into
-	*body = "d8:intervali1800e5:peers0:10:tracker id5:a b&ce"
-	c.NoError(client.tracker.announce(""))
+	response.body = "d8:intervali1800e5:peers0:10:tracker id5:a b&ce"
+	c.NoError(client.tracker.announce(context.Background(), ""))
 	c.Contains(client.tracker.announceURL(""), "&trackerid=a+b%26c")
 
 	// A tracker that never issues one leaves the parameter out entirely
-	client, body = newTestTrackerClient(t, d)
-	*body = noPeersResponse
-	c.NoError(client.tracker.announce(startedMsg))
+	client, response = newTestTrackerClient(t, d)
+	response.body = noPeersResponse
+	c.NoError(client.tracker.announce(context.Background(), startedMsg))
 	c.NotContains(client.tracker.announceURL(""), "trackerid")
 }
 
-// TestStopAnnounceDoesNotWaitForThePeriodicAnnounce verifies that stopping doesn't have to wait for an announce that
-// is already under way. The periodic announce goroutine spends up to the 30 second HTTP timeout inside a single
-// request, and the stop being handed to it directly would hold up the stopped announce, the close of the storage file
-// and the stopped notification for all of that time, well beyond the timeout the caller gave Stop.
-func TestStopAnnounceDoesNotWaitForThePeriodicAnnounce(t *testing.T) {
+// TestStopWaitsForThePeriodicAnnounce verifies that the stopped announce isn't made while a periodic one is still
+// under way. The two go out on connections of their own, so a tracker that finished with the update after the stopped
+// event would have us back in its swarm for a full announce interval after we shut down.
+func TestStopWaitsForThePeriodicAnnounce(t *testing.T) {
 	c := check.New(t)
 	d := newTestDispatcher(t)
-	client, body := newTestTrackerClient(t, d)
-	*body = noPeersResponse
-	c.NoError(client.tracker.announce(startedMsg))
+	client, response := newTestTrackerClient(t, d)
+	response.body = noPeersResponse
+	c.NoError(client.tracker.announce(context.Background(), startedMsg))
 
-	// Nothing is listening for the stop, which is exactly the state the periodic announce is in for as long as one of
-	// its own requests is outstanding
+	// A stand-in for the periodic announce goroutine, which the stop waits on exactly as it would the real one
+	done := make(chan struct{})
+	client.tracker.lock.Lock()
+	client.tracker.periodicAnnounceDone = done
+	client.tracker.lock.Unlock()
+
 	stopped := make(chan error, 1)
 	go func() { stopped <- client.tracker.announceStopped() }()
+	select {
+	case <-stopped:
+		t.Fatal("the stopped announce went out while a periodic announce was still under way")
+	case <-time.After(100 * time.Millisecond):
+	}
+	c.True(client.tracker.hasStarted(), "the stopped announce must not have been made yet")
+
+	// Once that announce is done with, so is the wait
+	close(done)
 	select {
 	case err := <-stopped:
 		c.NoError(err)
 	case <-time.After(peerMgmtWait):
-		t.Fatal("the stopped announce waited on the periodic announce")
+		t.Fatal("the stopped announce never went out")
 	}
 	c.False(client.tracker.hasStarted())
-
-	// The stop is still there to be found by a periodic announce that only looks afterwards, rather than having been
-	// consumed by whoever happened to be listening first
-	returned := make(chan struct{})
-	go func() { defer close(returned); client.tracker.periodicAnnounce() }()
-	select {
-	case <-returned:
-	case <-time.After(peerMgmtWait):
-		t.Fatal("the periodic announce never saw the stop")
-	}
 }
 
-// newTestTrackerClient returns a client whose announces go to a stub tracker, along with a pointer to the response
-// body that stub will return. The peer ID is filled in with query-safe bytes, which is what NewClient does and what
-// the announce URL relies on.
-func newTestTrackerClient(t *testing.T, d *dispatcher.Dispatcher) (client *Client, body *string) {
+// TestStopAbortsTheAnnounceInFlight verifies that the announce the periodic goroutine is in the middle of is cut short
+// rather than left to run out the HTTP timeout. The stopped announce, the close of the storage file and the stopped
+// notification all queue behind the wait for that goroutine, so without the cancellation the shutdown would sit on a
+// round trip with up to 30 seconds left in it — far beyond the timeout the caller gave Stop.
+func TestStopAbortsTheAnnounceInFlight(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+
+	// A tracker that never answers, leaving the announce parked on the response for as long as it is allowed
+	held := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-held:
+		}
+	}))
+	defer srv.Close()
+	defer close(held)
+	client, _ := newTestTrackerClient(t, d)
+	client.torrentFile.Announce = srv.URL
+
+	// The periodic announce goroutine makes its announces with the context the stop cancels
+	returned := make(chan error, 1)
+	go func() { returned <- client.tracker.announce(client.tracker.announceCtx, "") }()
+	select {
+	case <-returned:
+		t.Fatal("the announce came back before the tracker answered it")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	client.tracker.stopPeriodicAnnounce()
+	select {
+	case err := <-returned:
+		c.HasError(err, "the announce was cut short, which is not a success")
+	case <-time.After(peerMgmtWait):
+		t.Fatal("the announce in flight was left to run out the HTTP timeout")
+	}
+	c.True(client.tracker.announceStopping())
+}
+
+// TestPeriodicAnnounceStopsWhenTold verifies that the goroutine returns on the stop and closes the channel the stop
+// waits on, rather than the two waiting on each other.
+func TestPeriodicAnnounceStopsWhenTold(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client, response := newTestTrackerClient(t, d)
+	response.body = noPeersResponse
+
+	client.tracker.startPeriodicAnnounce()
+	client.tracker.lock.RLock()
+	done := client.tracker.periodicAnnounceDone
+	client.tracker.lock.RUnlock()
+	c.NotNil(done)
+
+	waitFor(t, "stopPeriodicAnnounce", client.tracker.stopPeriodicAnnounce)
+	select {
+	case <-done:
+	default:
+		t.Fatal("the stop returned before the periodic announce had finished")
+	}
+
+	// A second stop is harmless, which matters because the client stops the announces on every path out
+	waitFor(t, "stopPeriodicAnnounce", client.tracker.stopPeriodicAnnounce)
+}
+
+// TestAnnounceOvertakenByTheStopIsNotApplied verifies that what a periodic announce comes back with after the shutdown
+// has begun is discarded. It describes a swarm we're on our way out of, so letting the peer list, the interval and the
+// counts we report land after the stopped event leaves all of them belonging to a client that no longer exists.
+func TestAnnounceOvertakenByTheStopIsNotApplied(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client, response := newTestTrackerClient(t, d)
+	response.body = noPeersResponse
+	c.NoError(client.tracker.announce(context.Background(), startedMsg))
+	c.Equal(0, len(client.tracker.peerAddressesMap()))
+
+	// The announce is made with a context of its own, standing in for a request that was already on the wire when the
+	// stop was signaled and only came back afterwards
+	client.tracker.stopPeriodicAnnounce()
+	response.body = "d8:intervali3600e8:completei9e5:peers6:" + string([]byte{10, 0, 0, 1, 0x1A, 0xE1}) + "e"
+	c.NoError(client.tracker.announce(context.Background(), ""))
+	c.Equal(0, len(client.tracker.peerAddressesMap()), "the peer list of a swarm we have left must not be taken up")
+	c.Equal(30*time.Minute, client.tracker.announceInterval())
+	c.Equal(0, client.Status().Seeders)
+}
+
+// testTrackerResponse is what the stub tracker answers with. Either field may be changed between announces; a status
+// of zero means the ordinary 200.
+type testTrackerResponse struct {
+	body   string
+	status int
+}
+
+// newTestTrackerClient returns a client whose announces go to a stub tracker, along with the response that stub will
+// return. The peer ID is filled in with query-safe bytes, which is what NewClient does and what the announce URL
+// relies on.
+func newTestTrackerClient(t *testing.T, d *dispatcher.Dispatcher) (client *Client, response *testTrackerResponse) {
 	t.Helper()
-	body = new(string)
+	response = &testTrackerResponse{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprint(w, *body)
+		if response.status != 0 {
+			w.WriteHeader(response.status)
+		}
+		fmt.Fprint(w, response.body)
 	}))
 	t.Cleanup(srv.Close)
 	client = newTestClient(d)
@@ -387,7 +560,23 @@ func newTestTrackerClient(t *testing.T, d *dispatcher.Dispatcher) (client *Clien
 	for i := range client.id {
 		client.id[i] = urlQuerySafeBytes[i%len(urlQuerySafeBytes)]
 	}
-	return client, body
+	return client, response
+}
+
+// unreachableTrackerURL is an announce URL that no request can ever be made to, standing in for a tracker that never
+// hears from us at all. It is malformed rather than merely unroutable, so that it fails at once instead of waiting out
+// a connection attempt.
+const unreachableTrackerURL = "http://%zz/announce"
+
+// fetchAnnounceResponse makes an announce request and reads what comes back the way an announce does, so that the two
+// halves the announce keeps apart can be exercised together.
+func fetchAnnounceResponse(tr *tracker, urlStr string) (*trackerWire, error) {
+	resp, err := tr.request(context.Background(), urlStr)
+	if err != nil {
+		return nil, err
+	}
+	defer xio.DiscardAndCloseIgnoringErrors(resp.Body)
+	return readAnnounceResponse(resp)
 }
 
 // testPeerDict builds one entry of a tracker's dict-model peer list. The keys are spelled out the way a tracker would

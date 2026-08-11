@@ -50,6 +50,11 @@ const (
 	// maxBencodeDepth is the deepest nesting of lists and dictionaries accepted in a tracker response. The decoder
 	// recurses for each level, so an unbounded depth is a way to run us out of stack with very little data.
 	maxBencodeDepth = 16
+
+	// stopAnnounceWait is how long the shutdown will wait for the periodic announce goroutine to finish. The request
+	// that goroutine may be in the middle of is aborted before the wait begins, so this is only reached if the
+	// transport doesn't unwind from that promptly; the shutdown then goes ahead rather than being held up further.
+	stopAnnounceWait = 5 * time.Second
 )
 
 var (
@@ -60,36 +65,41 @@ var (
 
 type tracker struct {
 	client *Client
-	// stopAnnounceChan is closed to tell the periodic announce goroutine to stop. It is closed rather than sent to
-	// because that goroutine may be in the middle of an HTTP announce, which is bounded only by the client's 30 second
-	// timeout: a send would hold up the caller — and with it the stopped announce, the close of the storage file and
-	// the stopped notification — until the request it is waiting on finished.
-	stopAnnounceChan chan struct{}
+	// announceCtx is canceled to tell the periodic announce goroutine to stop. A context rather than a channel because
+	// that goroutine may be in the middle of an HTTP announce, which is bounded only by the client's 30 second
+	// timeout: cancellation reaches the request it is parked on, so the shutdown can wait for the goroutine — which it
+	// must, or the update it is making would be in flight alongside the stopped event that follows — without the
+	// stopped announce, the close of the storage file and the stopped notification queuing behind a full round trip.
+	announceCtx    context.Context
+	cancelAnnounce context.CancelFunc
 	trackerLockData
 	// The transfer totals are reported in every announce and are updated by each peer's read and write goroutines, so
 	// they are kept as atomics rather than under the tracker lock, which those hot paths would otherwise contend on
 	// for every message.
-	uploadedBytes    atomic.Int64
-	downloadedBytes  atomic.Int64
-	stopAnnounceOnce sync.Once
-	lock             sync.RWMutex
+	uploadedBytes   atomic.Int64
+	downloadedBytes atomic.Int64
+	lock            sync.RWMutex
 }
 
 type trackerLockData struct {
-	have           *fixedbits.Bits
-	downloading    *fixedbits.Bits
-	who            map[int]*peer
-	peerAddresses  map[string]int
-	seedExpires    time.Time
-	trackerID      string
-	currentState   State
-	totalBytes     int64
-	remainingBytes int64
-	interval       int
-	leechers       int
-	seeders        int
-	progress       float64
-	started        bool
+	have          *fixedbits.Bits
+	downloading   *fixedbits.Bits
+	who           map[int]*peer
+	peerAddresses map[string]int
+	// periodicAnnounceDone is closed by the periodic announce goroutine as it returns, which is what the shutdown
+	// waits on. It stays nil while no such goroutine exists, so a tracker whose start announce failed has nothing to
+	// wait for.
+	periodicAnnounceDone chan struct{}
+	seedExpires          time.Time
+	trackerID            string
+	currentState         State
+	totalBytes           int64
+	remainingBytes       int64
+	interval             int
+	leechers             int
+	seeders              int
+	progress             float64
+	started              bool
 }
 
 type trackerWire struct { //nolint:govet // We can't change the order of these fields
@@ -113,9 +123,11 @@ type peerWire struct { //nolint:govet // We can't change the order of these fiel
 func newTracker(client *Client) *tracker {
 	totalBytes := client.torrentFile.Size()
 	totalPieces := client.torrentFile.PieceCount()
+	ctx, cancel := context.WithCancel(context.Background())
 	return &tracker{
-		client:           client,
-		stopAnnounceChan: make(chan struct{}),
+		client:         client,
+		announceCtx:    ctx,
+		cancelAnnounce: cancel,
 		trackerLockData: trackerLockData{
 			totalBytes:     totalBytes,
 			remainingBytes: totalBytes,
@@ -237,7 +249,7 @@ func (t *tracker) announceStart() error {
 	if t.hasStarted() {
 		return nil
 	}
-	if err := t.announce(startedMsg); err != nil {
+	if err := t.announce(context.Background(), startedMsg); err != nil {
 		return err
 	}
 	if t.isDownloadComplete() {
@@ -245,7 +257,7 @@ func (t *tracker) announceStart() error {
 	} else {
 		t.setStateAndProgress(Downloading, -1)
 	}
-	go t.periodicAnnounce()
+	t.startPeriodicAnnounce()
 	return nil
 }
 
@@ -253,22 +265,60 @@ func (t *tracker) announceComplete() error {
 	if !t.hasStarted() {
 		return nil
 	}
-	return t.announce("completed")
+	return t.announce(context.Background(), "completed")
 }
 
 func (t *tracker) announceStopped() error {
+	// The periodic announce is stopped whether or not we ever managed to start, so that nothing is left running, and
+	// nothing left waiting to be canceled, for a client that is on its way out.
+	t.stopPeriodicAnnounce()
 	if !t.hasStarted() {
 		return nil
 	}
-	t.stopPeriodicAnnounce()
-	return t.announce(stoppedMsg)
+	// Deliberately not the announce context, which the stop above has just canceled.
+	return t.announce(context.Background(), stoppedMsg)
+}
+
+// startPeriodicAnnounce starts the goroutine that announces at the interval the tracker asked for. The channel the
+// stop waits on is recorded before the goroutine exists, so that a stop arriving immediately afterwards can't find
+// nothing to wait for.
+func (t *tracker) startPeriodicAnnounce() {
+	done := make(chan struct{})
+	t.lock.Lock()
+	t.periodicAnnounceDone = done
+	t.lock.Unlock()
+	go func() {
+		defer close(done)
+		t.periodicAnnounce()
+	}()
 }
 
 // stopPeriodicAnnounce tells the periodic announce goroutine to stop, whether it is waiting for its next turn or in
-// the middle of one, and without waiting for it either way. A goroutine that never ran, because the start announce
-// failed, simply has nothing to hear it.
+// the middle of one, and waits for it to finish. Without the wait, the update it is making would still be in flight,
+// on a connection of its own, while the stopped announce went out: a tracker that finished with the update after the
+// stopped event would have us back in its swarm for a full announce interval after we shut down, and the response to
+// it would land on tracker state that no longer describes anything. The wait is short because the announce is
+// canceled rather than left to run out the HTTP timeout, and bounded regardless, since the stopped announce, the close
+// of the storage file and the stopped notification all queue behind it. A goroutine that never ran, because the start
+// announce failed, simply has nothing to wait for.
 func (t *tracker) stopPeriodicAnnounce() {
-	t.stopAnnounceOnce.Do(func() { close(t.stopAnnounceChan) })
+	t.cancelAnnounce()
+	t.lock.RLock()
+	done := t.periodicAnnounceDone
+	t.lock.RUnlock()
+	if done == nil {
+		return
+	}
+	select {
+	case <-done:
+	case <-time.After(stopAnnounceWait):
+		t.client.logger.Warn("timed out waiting for the periodic announce to stop", "timeout", stopAnnounceWait)
+	}
+}
+
+// announceStopping returns true once the shutdown has told the periodic announce to stop.
+func (t *tracker) announceStopping() bool {
+	return t.announceCtx.Err() != nil
 }
 
 // announceInterval returns how long to wait before the next announce. The tracker's requested interval is bounded at
@@ -292,10 +342,13 @@ func (t *tracker) periodicAnnounce() {
 		timer := time.After(t.announceInterval())
 		select {
 		case <-timer:
-			if err := t.announce(""); tio.ShouldLogIOError(err) {
+			// The announce is made with the context the stop cancels, so that one caught in the middle of a round trip
+			// unwinds at once rather than holding up the shutdown that is waiting for this goroutine. Nothing is
+			// logged for that: being cut short is what was asked for, not a failure to report.
+			if err := t.announce(t.announceCtx, ""); !t.announceStopping() && tio.ShouldLogIOError(err) {
 				errs.LogTo(t.client.logger, err)
 			}
-		case <-t.stopAnnounceChan:
+		case <-t.announceCtx.Done():
 			return
 		}
 	}
@@ -352,21 +405,40 @@ func parsePeers(raw bencode.RawMessage, externalAddr string) (map[string]int, er
 	}
 }
 
-func (t *tracker) announce(event string) error {
-	slog.Debug("announce", "url", t.announceURL(event))
-	in, err := t.get(t.announceURL(event))
+func (t *tracker) announce(ctx context.Context, event string) error {
+	urlStr := t.announceURL(event)
+	slog.Debug("announce", "url", urlStr)
+	resp, err := t.request(ctx, urlStr)
 	if err != nil {
 		return err
 	}
-	if event == stoppedMsg {
+	defer xio.DiscardAndCloseIgnoringErrors(resp.Body)
+	switch event {
+	case startedMsg:
+		// The tracker has us in its swarm from the moment it answers this request, whatever the response then turns
+		// out to say. Recording that only once the response has been made sense of leaves a start that failed on a
+		// missing interval or an unreadable peer list registered with a tracker that will never be told we left, so it
+		// goes on handing our dead address to peers until its own timeout runs out. A stopped event for a tracker that
+		// had no record of us — one that answered with a failure reason, say — costs nothing; one we owed and never
+		// sent costs the swarm.
+		t.lock.Lock()
+		t.started = true
+		t.lock.Unlock()
+	case stoppedMsg:
 		// Nothing in the response to a shutdown announce is ever used: the stop was delivered by the request itself,
-		// which has already succeeded. Holding it to the same standard as the rest only produces a spurious error and
-		// leaves us believing we are still started.
+		// which the tracker has now answered. Trackers commonly reply to it with an empty body, plain text, or a status
+		// other than 200, precisely because no one reads it, so holding the response to the same standard as every
+		// other announce only produces a spurious error on the way out and leaves us believing we are still started.
+		// A request that never reached the tracker is a different matter and is still reported by t.request above.
 		t.lock.Lock()
 		t.started = false
 		t.lock.Unlock()
 		t.client.logger.Info("announce", "event", stoppedMsg)
 		return nil
+	}
+	in, err := readAnnounceResponse(resp)
+	if err != nil {
+		return err
 	}
 	if in.Failure != "" {
 		return errs.New(in.Failure)
@@ -383,6 +455,13 @@ func (t *tracker) announce(event string) error {
 	peerAddresses, err := parsePeers(in.PeerAddresses, externalAddr)
 	if err != nil {
 		return err
+	}
+	// An announce the shutdown overtook has nothing left to say. What it came back with describes a swarm we are on
+	// our way out of, and letting the peer list, the interval and the counts we report land after the stopped event
+	// would leave all of them belonging to a client that no longer exists. The start announce is exempt: it is what
+	// decides whether a stopped event is owed at all, and it completes before any stop can be signaled.
+	if event != startedMsg && t.announceStopping() {
+		return nil
 	}
 	t.lock.Lock()
 	if in.Interval > 0 {
@@ -438,9 +517,11 @@ func (t *tracker) announceURL(event string) string {
 	return buffer.String()
 }
 
-func (t *tracker) get(urlStr string) (*trackerWire, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
+// request makes the announce request and hands back the tracker's answer to it without judging what that answer says:
+// only the delivery of the request is decided here, since that is all the shutdown announce needs to know. The caller
+// owns the response body. The whole exchange, the reading of that body included, is bounded by the HTTP client's own
+// timeout, while the context is what lets an announce the shutdown has overtaken be cut short well ahead of it.
+func (t *tracker) request(ctx context.Context, urlStr string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, http.NoBody)
 	if err != nil {
 		return nil, errs.Wrap(err)
@@ -452,7 +533,11 @@ func (t *tracker) get(urlStr string) (*trackerWire, error) {
 	if err != nil {
 		return nil, errs.Wrap(err)
 	}
-	defer xio.DiscardAndCloseIgnoringErrors(resp.Body)
+	return resp, nil
+}
+
+// readAnnounceResponse reads and decodes the tracker's answer to an announce.
+func readAnnounceResponse(resp *http.Response) (*trackerWire, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, errs.New("unexpected status: " + resp.Status)
 	}
