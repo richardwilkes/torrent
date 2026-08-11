@@ -18,8 +18,12 @@ type Span struct {
 }
 
 // overlaps returns true if the two spans have at least one position in common. Spans that merely abut each other do
-// not overlap.
+// not overlap, and a span with no length overlaps nothing at all, wherever it sits, since it holds no position that
+// something else could also hold.
 func (s *Span) overlaps(other *Span) bool {
+	if s.Length <= 0 || other.Length <= 0 {
+		return false
+	}
 	return s.Start < other.Start+other.Length && other.Start < s.Start+s.Length
 }
 
@@ -58,8 +62,14 @@ func (sl *SpanList) Contains(span *Span) bool {
 // Insert a span into the list. Returns true if the span overlapped an
 // existing span within the list. Note that the new span may reach past the
 // first span it touches, so every span it is merged with has to be considered,
-// not just the first one.
+// not just the first one. A span with no length covers no position, so there is
+// nothing of it to record and nothing it could have overlapped. Such a span
+// arrives straight from the network, since a peer is free to send a piece
+// message that carries no data.
 func (sl *SpanList) Insert(span *Span) bool {
+	if span.Length <= 0 {
+		return false
+	}
 	for i, one := range sl.Spans {
 		// Before
 		if span.Start+span.Length < one.Start {

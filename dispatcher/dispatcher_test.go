@@ -15,6 +15,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"reflect"
 	"runtime"
 	"strconv"
 	"sync"
@@ -26,6 +27,7 @@ import (
 	"github.com/richardwilkes/toolbox/v2/check"
 	"github.com/richardwilkes/toolbox/v2/errs"
 	"github.com/richardwilkes/toolbox/v2/xio"
+	"github.com/richardwilkes/toolbox/v2/xnet"
 )
 
 // goroutineWait is how long a test will wait for goroutines started by a failed constructor to go away. Anything
@@ -252,6 +254,39 @@ func stubExternalIP(ip net.IP) func(*Dispatcher) error {
 		d.lookupExternalIP = func(_ context.Context, _ time.Duration) net.IP { return ip }
 		return nil
 	}
+}
+
+// newTestDispatcher creates a dispatcher for a test and stops it once the test is over. The external IP lookup is
+// always stubbed out, since the real one is started by the listen goroutine as soon as the dispatcher exists: leaving
+// it in place makes the test depend on outside sites being reachable and leaves a probe goroutine running for as long
+// as those requests take to give up, which is the better part of a minute where the network is restricted.
+func newTestDispatcher(t *testing.T, options ...func(*Dispatcher) error) *Dispatcher {
+	t.Helper()
+	d, err := NewDispatcher(append([]func(*Dispatcher) error{stubExternalIP(nil)}, options...)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(d.Stop)
+	return d
+}
+
+// TestTestDispatchersDoNotLookUpTheRealExternalIP verifies that a dispatcher built for a test can't consult the
+// outside sites the real lookup uses, no matter what options the test itself supplies.
+func TestTestDispatchersDoNotLookUpTheRealExternalIP(t *testing.T) {
+	c := check.New(t)
+	realLookup := reflect.ValueOf(xnet.ExternalIPAddress).Pointer()
+	d := newTestDispatcher(t)
+	c.NotEqual(realLookup, reflect.ValueOf(d.lookupExternalIP).Pointer(), "the real external IP lookup must be replaced")
+	c.Nil(d.ExternalIP())
+
+	// An option of the test's own must not put the real lookup back
+	d = newTestDispatcher(t, func(_ *Dispatcher) error { return nil })
+	c.NotEqual(realLookup, reflect.ValueOf(d.lookupExternalIP).Pointer(), "the real external IP lookup must be replaced")
+
+	// The comparison has to be able to recognize the real lookup, which is what an unstubbed dispatcher is left
+	// holding, or the checks above would pass no matter what
+	unstubbed := &Dispatcher{lookupExternalIP: xnet.ExternalIPAddress}
+	c.Equal(realLookup, reflect.ValueOf(unstubbed.lookupExternalIP).Pointer())
 }
 
 // TestExternalIPDoesNotSerializeCallers verifies that a caller arriving while a lookup is in progress isn't blocked

@@ -24,10 +24,7 @@ const rateSettleTime = 2500 * time.Millisecond
 // TestGlobalRateCapsTooSmallForAPieceMessageAreRejected verifies that a global cap which would stall every client
 // using the dispatcher isn't accepted in the first place.
 func TestGlobalRateCapsTooSmallForAPieceMessageAreRejected(t *testing.T) {
-	c := check.New(t)
-	d, err := NewDispatcher()
-	c.NoError(err)
-	defer d.Stop()
+	d := newTestDispatcher(t)
 	for _, one := range []struct {
 		option func(int) func(*Dispatcher) error
 		name   string
@@ -51,9 +48,7 @@ func TestGlobalRateCapsTooSmallForAPieceMessageAreRejected(t *testing.T) {
 // below it can never carry that same request, which is what makes the minimum necessary.
 func TestMinimumGlobalRateCapPermitsAPieceMessage(t *testing.T) {
 	c := check.New(t)
-	d, err := NewDispatcher()
-	c.NoError(err)
-	defer d.Stop()
+	d := newTestDispatcher(t)
 	c.NoError(GlobalUploadCap(MinimumRateCap)(d))
 	client := d.OutRate.New(math.MaxInt32)
 	defer client.Close()

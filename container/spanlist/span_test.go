@@ -131,6 +131,32 @@ func TestSpanInsertOverlapBeyondTheFirstSpan(t *testing.T) {
 	c.Equal([]spanlist.Span{{Start: 0, Length: 20}}, list.Spans)
 }
 
+// TestSpanInsertWithoutLength verifies that a span covering nothing is neither recorded nor reported as overlapping
+// anything, wherever it lands. Such a span comes straight off the wire, since a peer is free to send a piece message
+// that carries no data, and an entry covering nothing would leave the list claiming a position it doesn't hold.
+func TestSpanInsertWithoutLength(t *testing.T) {
+	c := check.New(t)
+
+	// Into an empty list
+	var list spanlist.SpanList
+	c.False(list.Insert(&spanlist.Span{Start: 10}))
+	c.Equal(0, len(list.Spans), "a span with no length must not be recorded")
+
+	c.False(list.Insert(&spanlist.Span{Start: 10, Length: 10}))
+	c.False(list.Insert(&spanlist.Span{Start: 40, Length: 10}))
+	want := []spanlist.Span{{Start: 10, Length: 10}, {Start: 40, Length: 10}}
+
+	// Ahead of, inside, at either edge of, between and beyond the existing spans
+	for _, start := range []int{0, 5, 10, 15, 19, 20, 25, 40, 49, 50, 60} {
+		c.False(list.Insert(&spanlist.Span{Start: start}), "no length at %d must not overlap anything", start)
+		c.Equal(want, list.Spans, "no length at %d must leave the list alone", start)
+	}
+
+	// A negative length covers nothing either
+	c.False(list.Insert(&spanlist.Span{Start: 15, Length: -5}))
+	c.Equal(want, list.Spans)
+}
+
 func TestSpanInsertIntoGap(t *testing.T) {
 	c := check.New(t)
 
