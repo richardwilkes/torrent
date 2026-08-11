@@ -15,10 +15,12 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -216,18 +218,37 @@ func TestMonitorCompleteThenStop(t *testing.T) {
 // part way through, leaving truncated files behind that look complete.
 func TestStopAtExit(t *testing.T) {
 	c := check.New(t)
-	registered := registerStopAtExit(t, func(timeout time.Duration) { c.Equal(stopTimeout, timeout) },
-		make(chan struct{}), notifyWait)
+	// The stop is reported on a channel rather than asserted from inside the callback, so that the test can require it
+	// to have happened: an assertion made only where the callback runs holds just as well when the callback never
+	// does, which is the regression this is here to catch
+	stopped := make(chan time.Duration, 1)
+	finished := make(chan struct{})
+	registered := registerStopAtExit(t, func(timeout time.Duration) { stopped <- timeout }, make(chan struct{}),
+		finished, notifyWait, notifyWait)
 
 	returned := make(chan struct{})
 	go func() {
+		defer close(returned)
 		registered()
-		close(returned)
 	}()
+	select {
+	case timeout := <-stopped:
+		c.Equal(stopTimeout, timeout)
+	case <-time.After(notifyWait):
+		t.Fatal("the torrent was not stopped when the program exited")
+	}
 	select {
 	case <-returned:
 		t.Fatal("the exit did not wait for the monitor to finish with the torrent's files")
 	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Released rather than left to run out its wait, so that the goroutine running it doesn't outlive the test
+	close(finished)
+	select {
+	case <-returned:
+	case <-time.After(notifyWait):
+		t.Fatal("the exit did not resume once the monitor had finished with the torrent's files")
 	}
 }
 
@@ -237,7 +258,8 @@ func TestStopAtExitResumesOnceTheMonitorIsDone(t *testing.T) {
 	c := check.New(t)
 	stopped := make(chan time.Duration, 1)
 	finished := make(chan struct{})
-	registered := registerStopAtExit(t, func(timeout time.Duration) { stopped <- timeout }, finished, time.Hour)
+	registered := registerStopAtExit(t, func(timeout time.Duration) { stopped <- timeout }, make(chan struct{}),
+		finished, time.Hour, time.Hour)
 
 	returned := make(chan struct{})
 	go func() {
@@ -258,10 +280,39 @@ func TestStopAtExitResumesOnceTheMonitorIsDone(t *testing.T) {
 	}
 }
 
-// TestStopAtExitGivesUpWaitingForTheMonitor verifies that the wait for the monitor is bounded. Extraction that has
-// genuinely wedged must not leave someone who pressed Ctrl-C with a program that never exits.
+// TestStopAtExitInterruptsWorkThatOutlastsTheWait verifies that an extraction still running when the wait runs out is
+// told to stop rather than being left to be killed where it stands. The os.Exit that follows unwinds nothing, so a
+// copy cut off mid-write leaves a truncated file that looks complete — and, since every target is created exclusively,
+// one that fails every later run and every -unpack retry with "file exists".
+func TestStopAtExitInterruptsWorkThatOutlastsTheWait(t *testing.T) {
+	interrupt := make(chan struct{})
+	finished := make(chan struct{})
+	registered := registerStopAtExit(t, func(_ time.Duration) {}, interrupt, finished, time.Millisecond, notifyWait)
+
+	// Stands in for the extraction, which only reports that it is finished once the interrupt has reached it and it
+	// has taken back what it wrote
+	go func() {
+		<-interrupt
+		close(finished)
+	}()
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		registered()
+	}()
+	select {
+	case <-returned:
+	case <-time.After(notifyWait):
+		t.Fatal("the extraction was never interrupted, so the exit waited on work that had no way to stop")
+	}
+}
+
+// TestStopAtExitGivesUpWaitingForTheMonitor verifies that the wait for the monitor is bounded even when the interrupt
+// doesn't reach it. Extraction that has genuinely wedged must not leave someone who pressed Ctrl-C with a program that
+// never exits.
 func TestStopAtExitGivesUpWaitingForTheMonitor(t *testing.T) {
-	registered := registerStopAtExit(t, func(_ time.Duration) {}, make(chan struct{}), time.Millisecond)
+	registered := registerStopAtExit(t, func(_ time.Duration) {}, make(chan struct{}), make(chan struct{}),
+		time.Millisecond, time.Millisecond)
 
 	returned := make(chan struct{})
 	go func() {
@@ -276,18 +327,90 @@ func TestStopAtExitGivesUpWaitingForTheMonitor(t *testing.T) {
 }
 
 // registerStopAtExit registers the exit handling with a stand-in registrar and returns what was registered with it.
-func registerStopAtExit(t *testing.T, stop func(time.Duration), finished <-chan struct{}, wait time.Duration) func() {
+func registerStopAtExit(t *testing.T, stop func(time.Duration), interrupt chan<- struct{}, finished <-chan struct{},
+	wait, interruptWait time.Duration,
+) func() {
 	t.Helper()
 	var registered func()
 	stopAtExit(func(f func()) int {
 		registered = f
 		return 1
-	}, stop, finished, wait)
+	}, stop, interrupt, finished, wait, interruptWait)
 	if registered == nil {
 		// Fatal, since calling what wasn't registered would panic and take the whole test binary down with it
 		t.Fatal("nothing was registered to run when the program exits")
 	}
 	return registered
+}
+
+// TestStopDispatcherAtExit verifies that the dispatcher is shut down when the program exits. Nothing stopped it
+// before, so the listener stayed bound and its accept loop went on taking inbound connections and spawning a handshake
+// goroutine for each of them for the whole of the extraction window, and every failure on the way to the monitor
+// exited with it still open.
+func TestStopDispatcherAtExit(t *testing.T) {
+	c := check.New(t)
+	// A fixed external IP, since the real lookup consults outside sites as soon as the dispatcher exists
+	d, err := dispatcher.NewDispatcher(dispatcher.FixedExternalIP(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Stop() // Stopping twice is a no-op, so this covers the test failing before what was registered is run
+
+	var registered func()
+	stopDispatcherAtExit(func(f func()) int {
+		registered = f
+		return 1
+	}, d)
+	if registered == nil {
+		// Fatal, since calling what wasn't registered would panic and take the whole test binary down with it
+		t.Fatal("nothing was registered to run when the program exits")
+	}
+
+	// While the dispatcher is up, the port it listens on answers
+	addr := net.JoinHostPort("127.0.0.1", strconv.FormatUint(uint64(d.InternalPort()), 10))
+	conn, err := net.DialTimeout("tcp", addr, notifyWait)
+	c.NoError(err, "the dispatcher must be listening before the exit runs what was registered")
+	if conn != nil {
+		c.NoError(conn.Close())
+	}
+
+	registered()
+	conn, err = net.DialTimeout("tcp", addr, notifyWait)
+	if conn != nil {
+		c.NoError(conn.Close())
+	}
+	c.HasError(err, "the listener must be closed once the program exits")
+}
+
+// TestValidateUserAgent verifies that a user agent which couldn't be sent as an HTTP header is refused where the flag
+// is read. Left to the announce, the rejection comes from inside net/http on every attempt, and by then the storage
+// file has been created and preallocated at the torrent's full length, so a stray newline in the flag earns a
+// full-size .tordata and an opaque error rather than a word about the flag that caused it.
+func TestValidateUserAgent(t *testing.T) {
+	for _, one := range []struct {
+		name  string
+		agent string
+		valid bool
+	}{
+		{name: "none at all", agent: "", valid: true},
+		{name: "an ordinary agent", agent: "torrent/1.5.1 (+https://example.com)", valid: true},
+		{name: "a horizontal tab, which a header value may hold", agent: "torrent\t1.5.1", valid: true},
+		{name: "bytes above ASCII, which a header value may also hold", agent: "torrent/\xc3\xa9", valid: true},
+		{name: "a newline", agent: "torrent\nX-Injected: 1"},
+		{name: "a carriage return", agent: "torrent\rX-Injected: 1"},
+		{name: "a NUL", agent: "torrent\x00"},
+		{name: "a DEL", agent: "torrent\x7f"},
+	} {
+		t.Run(one.name, func(t *testing.T) {
+			c := check.New(t)
+			err := validateUserAgent(one.agent)
+			if one.valid {
+				c.NoError(err)
+				return
+			}
+			c.HasError(err, "a user agent that can't be sent as a header must be refused at startup")
+		})
+	}
 }
 
 // TestStopAtExitRunsOnInterrupt verifies the whole chain a Ctrl-C travels: the signal handlers the registrar installs,
@@ -325,7 +448,12 @@ func TestStopAtExitRunsOnInterrupt(t *testing.T) {
 	}()
 	defer func() {
 		_ = cmd.Process.Kill() //nolint:errcheck // Nothing can be done if the child is already gone
-		_ = cmd.Wait()         //nolint:errcheck // The exit status is checked below when it is reached normally
+		// Draining until the scanner closes the channel is what says it has finished with the pipe. os/exec documents
+		// calling Wait before every read from the pipe has completed as incorrect, since Wait closes the pipe out from
+		// under whoever is still reading it.
+		for range lines { //nolint:revive // Draining is the whole point
+		}
+		_ = cmd.Wait() //nolint:errcheck // The exit status is checked below when it is reached normally
 	}()
 
 	// Wait until the child has registered its stop, since a signal sent before that would kill it outright
@@ -380,7 +508,7 @@ func TestStopAtExitHelper(t *testing.T) {
 			fmt.Println(stoppedLine)
 		}
 		close(stopped)
-	}, finished, notifyWait)
+	}, make(chan struct{}), finished, notifyWait, notifyWait)
 	fmt.Println(readyLine)
 	time.Sleep(2 * notifyWait) // The interrupt the parent is about to send is what ends this
 }
@@ -502,7 +630,8 @@ func TestExtractFileRefusesToWriteOverTheStorageFile(t *testing.T) {
 	const content = torrentName + ".bin"
 
 	tf := newTorrentFile(t, content, map[string]any{lengthKey: int64(len(sampleContent))})
-	c.HasError(extractFile(tf, content, tf.StoragePath(), nil),
+	var e extraction
+	c.HasError(e.extractFile(tf, content, tf.StoragePath(), nil),
 		"extracting a torrent over its own storage file must be refused")
 
 	data, err := os.ReadFile(tf.StoragePath())
@@ -565,6 +694,77 @@ func TestAFailedExtractionLeavesNothingBehind(t *testing.T) {
 	data, err := os.ReadFile(target)
 	c.NoError(err)
 	c.Equal(sampleContent, string(data))
+}
+
+// TestAFailedExtractionRemovesTheFilesItAlreadyWrote verifies that an extraction which stops part way takes back the
+// files it had already completed, not just the one it was in the middle of. The walk stops at the first failure, so a
+// ten-file torrent that hits a full disk on its seventh would otherwise leave the first six behind — and since every
+// target is created exclusively, the retry the monitor deliberately keeps the storage around for then fails on the
+// first of those six with "file exists", as does every run after it.
+func TestAFailedExtractionRemovesTheFilesItAlreadyWrote(t *testing.T) {
+	c := check.New(t)
+	t.Chdir(t.TempDir())
+
+	// The middle file of the three, in the lexical order the walk takes, is blocked by a file already sitting at its
+	// target, which is what a partial extraction of a previous run leaves behind
+	const existing = "do not overwrite me"
+	c.NoError(os.MkdirAll(torrentName, 0o750))
+	c.NoError(os.WriteFile(filepath.Join(torrentName, "c.txt"), []byte(existing), 0o600))
+	tf := newTorrentFile(t, torrentName, map[string]any{
+		filesKey: []any{
+			map[string]any{lengthKey: int64(8), pathKey: []any{"a.txt"}},
+			map[string]any{lengthKey: int64(4), pathKey: []any{"c.txt"}},
+			map[string]any{lengthKey: int64(8), pathKey: []any{"sub", fileB}},
+		},
+	})
+
+	c.HasError(extractFiles(tf, nil), "an extraction that can't write one of its files must be reported")
+	_, err := os.Stat(filepath.Join(torrentName, "a.txt"))
+	c.True(os.IsNotExist(err), "the file extracted before the failure must not be left behind: %v", err)
+	data, err := os.ReadFile(filepath.Join(torrentName, "c.txt"))
+	c.NoError(err)
+	c.Equal(existing, string(data), "the file that was already there must be left exactly as it was")
+
+	// And with the blocking file out of the way, the retry the cleanup leaves room for extracts the whole torrent
+	c.NoError(os.Remove(filepath.Join(torrentName, "c.txt")))
+	c.NoError(extractFiles(tf, nil))
+	data, err = os.ReadFile(filepath.Join(torrentName, "a.txt"))
+	c.NoError(err)
+	c.Equal(sampleContent[:8], string(data))
+	data, err = os.ReadFile(filepath.Join(torrentName, "c.txt"))
+	c.NoError(err)
+	c.Equal(sampleContent[8:12], string(data))
+	data, err = os.ReadFile(filepath.Join(torrentName, "sub", fileB))
+	c.NoError(err)
+	c.Equal(sampleContent[12:], string(data))
+}
+
+// TestAnUndoneExtractionRemovesOnlyWhatItCreated verifies that taking an extraction back off disk removes the
+// directories it made, deepest first, and leaves the ones that were already there — along with anything in them —
+// exactly as they were. Everything below the wrapping directory of a multi-file torrent is ours to remove; the
+// directory the extraction was run in, and whatever else lives there, is not.
+func TestAnUndoneExtractionRemovesOnlyWhatItCreated(t *testing.T) {
+	c := check.New(t)
+	t.Chdir(t.TempDir())
+	const theirs = "keep me"
+	existingDir := filepath.Join("existing", "kept")
+	c.NoError(os.MkdirAll(existingDir, 0o750))
+	c.NoError(os.WriteFile(filepath.Join(existingDir, "theirs.txt"), []byte(theirs), 0o600))
+
+	var e extraction
+	c.NoError(e.mkdirAll(existingDir))
+	ourDir := filepath.Join("existing", "made", "deeper")
+	c.NoError(e.mkdirAll(ourDir))
+	ours := filepath.Join(ourDir, "ours.txt")
+	c.NoError(os.WriteFile(ours, []byte(sampleContent), 0o600))
+	e.files = append(e.files, ours)
+
+	e.undo()
+	_, err := os.Stat(filepath.Join("existing", "made"))
+	c.True(os.IsNotExist(err), "the directories the extraction created must be removed with it: %v", err)
+	data, err := os.ReadFile(filepath.Join(existingDir, "theirs.txt"))
+	c.NoError(err)
+	c.Equal(theirs, string(data), "a directory that was already there is not the extraction's to remove")
 }
 
 // failingReader hands back the first few bytes of its content and then fails, standing in for a storage file that

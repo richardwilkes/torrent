@@ -536,6 +536,36 @@ func TestTheDispatcherEndOfAPipeIgnoresReadDeadlines(t *testing.T) {
 	}
 }
 
+// TestDeregisterOnlyRemovesItsOwnRegistration verifies that a handler which has since been replaced doesn't take the
+// replacement with it when it is deregistered. Stop returns as soon as its timeout expires, whether or not the shutdown
+// it asked for has finished, so a torrent started again after a timed-out stop has its new handler registered while the
+// old client's run goroutine is still on its way out — and an unconditional removal there would leave the running
+// client receiving no inbound connections at all, silently, for the rest of its life.
+func TestDeregisterOnlyRemovesItsOwnRegistration(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	infoHash := tfs.InfoHash{1, 2, 3}
+	// A function typed handler, which is not a comparable type at all, so this also covers the registrations being told
+	// apart by an identity of their own rather than by comparing the handlers themselves
+	noop := handlerFunc(func(_ net.Conn, _ *slog.Logger, _ ProtocolExtensions, _ tfs.InfoHash, _ bool, _ func()) {})
+
+	old := d.Register(infoHash, noop)
+	current := d.Register(infoHash, noop)
+	d.Deregister(old)
+	stored, ok := d.handlers.Load(infoHash)
+	c.True(ok, "the replacement registration must survive the removal of the one it replaced")
+	reg, isRegistration := stored.(*Registration)
+	c.True(isRegistration)
+	c.True(reg == current, "the registration left behind must be the replacement")
+
+	// The current registration still removes itself, and removing one that is already gone changes nothing
+	d.Deregister(current)
+	_, ok = d.handlers.Load(infoHash)
+	c.False(ok)
+	c.NotPanics(func() { d.Deregister(current) })
+	c.NotPanics(func() { d.Deregister(nil) })
+}
+
 // handlerFunc adapts a function to the ConnectionHandler interface.
 type handlerFunc func(conn net.Conn, log *slog.Logger, extensions ProtocolExtensions, infoHash tfs.InfoHash,
 	sendHandshake bool, handshakeDone func())

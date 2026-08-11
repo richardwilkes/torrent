@@ -1016,7 +1016,10 @@ func (p *peer) receivedChunk(index, begin int, buffer []byte) error {
 			if err != nil && (!errors.Is(err, io.EOF) || n != len(one.buffer)) {
 				p.client.tracker.clearDownload(index, p)
 				writeErr := errs.NewWithCause("unable to write piece", err)
-				errs.LogTo(p.logger, writeErr, "index", index)
+				// As on the read side, storage the shutdown has already closed isn't a failure to write
+				if !storageClosed(err) {
+					errs.LogTo(p.logger, writeErr, "index", index)
+				}
 				// Nothing a peer can do fixes storage we can't write to, so the piece is not simply downloaded again:
 				// doing that would have us pull whole pieces off the network, forever, for as long as the disk stayed
 				// full or the file unwritable, making no progress and saying nothing about it beyond another log line
@@ -1192,7 +1195,12 @@ func (p *peer) processPieceRequests(in chan *pieceRequest) {
 		}
 		if err != nil {
 			readErr := errs.NewWithCause("unable to read piece", err)
-			errs.LogTo(p.logger, readErr, "index", req.index, "begin", req.begin, "length", req.length)
+			// Storage the shutdown has already closed isn't a failure to read, so it isn't reported as one. This
+			// goroutine isn't tracked by the peer wait group, so it can be here with a descriptor it fetched a moment
+			// before the shutdown closed it, which reads back as os.ErrClosed.
+			if !storageClosed(err) {
+				errs.LogTo(p.logger, readErr, "index", req.index, "begin", req.begin, "length", req.length)
+			}
 			xio.CloseIgnoringErrors(p.conn)
 			process = false
 			// Nothing a peer can do fixes storage we can't read, so this can't be left as one connection's problem:

@@ -14,6 +14,7 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -231,6 +232,7 @@ func TestStalledPeerIsBanned(t *testing.T) {
 	client.adjustPeers()
 	c.True(d.GateKeeper().IsAddressBlocked(p.conn.RemoteAddr()))
 	checkConnOpen(t, conn, false)
+	c.Equal(0, len(client.currentPeers()), "the dropped peer must leave the map, so the slot it held is free again")
 }
 
 // TestPeerOrderingsAreConsistent verifies that each of the orderings used to rank peers is a real ordering: no peer
@@ -378,6 +380,43 @@ func TestLeastUsefulPeerIsRotatedOut(t *testing.T) {
 	client.adjustPeers()
 	checkConnOpen(t, downloadingConn, true)
 	checkConnOpen(t, idleConn, false)
+	select {
+	case conn := <-accepted:
+		xio.CloseIgnoringErrors(conn)
+	case <-time.After(peerMgmtWait):
+		t.Fatal("the alternate the peer was given up for was never dialed")
+	}
+}
+
+// TestARotatedOutPeerFreesItsSlot verifies that the peer given up to make room for an alternate leaves the map rather
+// than only being closed. The slot it gave up isn't free until it does: the replacement's admission still sees every
+// slot taken, so it either drops a second peer or is refused outright, and the rotation loses a peer instead of
+// swapping one.
+func TestARotatedOutPeerFreesItsSlot(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+
+	// Every slot is taken, one peer is downloading for us and the other is doing nothing, and the tracker has an
+	// alternate we could dial
+	client.peersWanted = 2
+	downloadingConn, downloading := newTestPeerFromHost(t, client, testPeerHost1, testPeerPort)
+	defer xio.CloseIgnoringErrors(downloadingConn)
+	idleConn, idle := newTestPeerFromHost(t, client, testPeerHost2, testPeerPort)
+	defer xio.CloseIgnoringErrors(idleConn)
+	host, port, accepted := listenForTestDials(t)
+	setTrackerPeerAddresses(client, peerAddr{ip: host, port: port})
+	downloading.lock.Lock()
+	downloading.peerChoking = false
+	downloading.lock.Unlock()
+	downloading.queuePieceDownload(0)
+	c.True(downloading.updateInterest().downloading)
+	c.False(idle.updateInterest().amInterested)
+
+	client.adjustPeers()
+	peers := client.currentPeers()
+	c.Equal(1, len(peers), "the rotated out peer must leave the map, so the slot it gave up is actually free")
+	c.True(peers[0] == downloading, "the peer that was downloading for us must be the one that was kept")
 	select {
 	case conn := <-accepted:
 		xio.CloseIgnoringErrors(conn)
@@ -795,6 +834,27 @@ func TestUnusedTestPortIsRefused(t *testing.T) {
 	c.HasError(err, "something was listening on the port")
 }
 
+// TestAFailedDialDoesNotBlockInboundConnections verifies that a peer we couldn't reach is only kept out of our
+// outgoing connection attempts, rather than banned in both directions. The common case in a real swarm — a firewalled
+// or NAT'd peer that can't accept connections but can make them — would otherwise be shut out by our own failed dial,
+// and the connection it goes on to make to us dropped by the dispatcher for the whole of the block.
+func TestAFailedDialDoesNotBlockInboundConnections(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+
+	host, port := unusedTestPort(t)
+	client.connectToPeer(host, port)
+	c.False(d.GateKeeper().IsAddressStringBlocked(host),
+		"a peer we couldn't dial must still be able to connect to us")
+	c.True(d.GateKeeper().IsDialBlocked(host), "an address we couldn't reach must not be dialed again")
+
+	// Which is what keeps the next peer adjustment from spending an attempt on it all over again
+	setTrackerPeerAddresses(client, peerAddr{ip: host, port: port})
+	c.Equal(0, len(client.dialCandidates(make(map[string]bool))),
+		"an address we just failed to reach must not be offered as a candidate")
+}
+
 // testAddrHostAndPort splits an address into the host and port a dial takes.
 func testAddrHostAndPort(t *testing.T, addr net.Addr) (host string, port int) {
 	t.Helper()
@@ -809,7 +869,10 @@ func testAddrHostAndPort(t *testing.T, addr net.Addr) (host string, port int) {
 }
 
 // checkConnOpen fails the test if the state of the connection doesn't match what is expected. A connection that has
-// been closed by the other side reports EOF, while one that is still open times out with nothing to read.
+// been closed by the other side reports EOF, while one that is still open either times out with nothing to read or
+// hands us whatever the other side has sent. The read that succeeds is as much proof of an open connection as the one
+// that times out, and treating it as a close would fail the check with the nonsense of a nil error for a connection
+// reported closed.
 func checkConnOpen(t *testing.T, conn net.Conn, expected bool) {
 	t.Helper()
 	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
@@ -817,13 +880,92 @@ func checkConnOpen(t *testing.T, conn net.Conn, expected bool) {
 	}
 	_, err := conn.Read(make([]byte, 1))
 	var netErr net.Error
-	open := errors.As(err, &netErr) && netErr.Timeout()
+	open := err == nil || (errors.As(err, &netErr) && netErr.Timeout())
 	if open != expected {
 		if expected {
 			t.Fatalf("connection was closed: %v", err)
 		}
 		t.Fatal("connection was not closed")
 	}
+}
+
+// TestCheckConnOpenTreatsPendingDataAsOpen verifies the helper the connection state checks rest on: a connection with
+// something waiting to be read is as open as one that times out with nothing on it. Treating the successful read as a
+// close fails the check with the nonsense of a nil error for a connection said to have been closed.
+func TestCheckConnOpenTreatsPendingDataAsOpen(t *testing.T) {
+	conn, remote := newTestConnPair(t)
+	if _, err := remote.Write([]byte{0}); err != nil {
+		t.Fatal(err)
+	}
+	checkConnOpen(t, conn, true)
+}
+
+// TestTheRunLoopWaitsForASignalRatherThanPolling verifies that the run goroutine parks until something it ends the
+// torrent for actually happens, rather than waking ten times a second for the life of the torrent to look for itself.
+func TestTheRunLoopWaitsForASignalRatherThanPolling(t *testing.T) {
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		client.waitForRunEvent()
+	}()
+	select {
+	case <-returned:
+		t.Fatal("the run loop woke with nothing to react to")
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	client.wakeRun()
+	select {
+	case <-returned:
+	case <-time.After(peerMgmtWait):
+		t.Fatal("the run loop was never woken")
+	}
+}
+
+// TestEverythingTheRunLoopEndsForWakesIt verifies that each of the conditions run() ends the torrent for signals it,
+// since nothing polls for them any more. A condition that didn't would leave the torrent running until something else
+// happened to wake it, which for a torrent with no seeding deadline is never.
+func TestEverythingTheRunLoopEndsForWakesIt(t *testing.T) {
+	for _, one := range []struct {
+		trigger func(client *Client)
+		name    string
+	}{
+		{name: "stop requested", trigger: func(client *Client) { client.Stop(0) }},
+		{
+			name:    "storage failure",
+			trigger: func(client *Client) { client.failWithStorageError(errs.New("no space left on device")) },
+		},
+		{name: "download complete", trigger: func(client *Client) { client.tracker.markBlockValid(0) }},
+	} {
+		t.Run(one.name, func(t *testing.T) {
+			d := newTestDispatcher(t)
+			// A single piece torrent, so that the one piece completes the download, and a seeding period long enough
+			// that the deadline it starts can't be what ends the wait
+			client := newTestClientForTorrent(d, newTestTorrentFileWithPieces(1))
+			client.seedDuration = time.Hour
+			one.trigger(client)
+			waitFor(t, "waitForRunEvent", client.waitForRunEvent)
+		})
+	}
+}
+
+// TestTheRunLoopWakesWhenTheSeedingDeadlineArrives verifies that the one condition with no setter behind it — the end
+// of the seeding period, which arrives on a schedule of its own — still ends the wait when it is due.
+func TestTheRunLoopWakesWhenTheSeedingDeadlineArrives(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+
+	client.tracker.lock.Lock()
+	client.tracker.remainingBytes = 0
+	client.tracker.seedExpires = time.Now().Add(100 * time.Millisecond)
+	client.tracker.lock.Unlock()
+
+	waitFor(t, "waitForRunEvent", client.waitForRunEvent)
+	c.True(client.tracker.isSeedingComplete(), "the wait must not end before the seeding deadline it was waiting on")
 }
 
 // TestRateLimitersAreClosed verifies that our limiters are released from the dispatcher's limiter tree, which would
@@ -867,6 +1009,12 @@ func TestAStorageFailureLeavesTheTorrentErrored(t *testing.T) {
 	// doesn't track can still be draining work at that point, and the shutdown that closed it is what they're behind.
 	client.failWithStorageError(errs.NewWithCause("unable to write piece", errStorageClosed))
 	c.NoError(client.fatalError())
+
+	// Both forms of it, since which one comes back depends on when the goroutine reached for the file: one that asks
+	// for it after the shutdown took it away gets errStorageClosed, while one holding a descriptor it fetched a moment
+	// earlier gets os.ErrClosed from the read or write it makes with it. Neither is anything going wrong.
+	client.failWithStorageError(errs.NewWithCause("unable to read piece", os.ErrClosed))
+	c.NoError(client.fatalError(), "a clean stop must not be recorded as a storage failure")
 
 	// The first failure is the one kept, since it is the one that explains what went wrong
 	first := errors.New("no space left on device")
@@ -1146,12 +1294,8 @@ func TestPeerManagementLogsThroughTheClientLogger(t *testing.T) {
 	c.Contains(sink.contents(), `msg="managing peers"`)
 
 	// A port nothing is listening on, so the dial fails at once rather than making the test wait out peerDialTimeout
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	c.NoError(err)
-	addr, ok := listener.Addr().(*net.TCPAddr)
-	c.True(ok)
-	c.NoError(listener.Close())
-	client.connectToPeer(addr.IP.String(), addr.Port)
+	host, port := unusedTestPort(t)
+	client.connectToPeer(host, port)
 	c.Contains(sink.contents(), `msg="dialing peer"`)
 
 	c.NotContains(defaultSink.contents(), "managing peers",

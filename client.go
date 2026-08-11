@@ -76,7 +76,11 @@ type Client struct {
 	// replaced each time peer management is started and so has to be read under the lock that guards the replacement,
 	// this is assigned once at construction and never again: the channel itself does the synchronizing, so neither the
 	// close nor the receive holds the client's lock.
-	stoppedChan         chan bool
+	stoppedChan chan bool
+	// runWake carries the nudge that tells run() to look at the conditions it ends the torrent for. It holds a single
+	// signal, since every one of them means the same thing — re-check — and the checks are made after the wait rather
+	// than by whoever woke it.
+	runWake             chan struct{}
 	concurrentDownloads int
 	peersWanted         int
 	seedDuration        time.Duration
@@ -123,6 +127,7 @@ func NewClient(d *dispatcher.Dispatcher, torrentFile *tfs.File, options ...func(
 		peers:               make(map[net.Conn]*peer),
 		dialing:             make(map[string]bool),
 		stoppedChan:         make(chan bool, 1),
+		runWake:             make(chan struct{}, 1),
 	}
 	if _, err := rand.Read(c.id[:]); err != nil {
 		c.closeRateLimiters()
@@ -176,6 +181,7 @@ func (c *Client) Stop(timeout time.Duration) {
 	}
 	c.stopRequested = true
 	c.lock.Unlock()
+	c.wakeRun()
 	// Cut short whatever announce is in flight. Every stage of the startup that can take a while looks for the stop
 	// request itself, but an announce can't: it is parked in the HTTP client, which answers to nothing but its own 30
 	// second timeout, and the start announce holds run() while it is. Everything the shutdown owes — the stopped
@@ -256,7 +262,7 @@ func (c *Client) shouldStop() bool {
 // doesn't track can still be draining work while the client shuts down, and the shutdown that closed it is what they
 // are running behind.
 func (c *Client) failWithStorageError(err error) {
-	if errors.Is(err, errStorageClosed) {
+	if storageClosed(err) {
 		return
 	}
 	c.lock.Lock()
@@ -264,6 +270,16 @@ func (c *Client) failWithStorageError(err error) {
 		c.fatalErr = err
 	}
 	c.lock.Unlock()
+	c.wakeRun()
+}
+
+// storageClosed reports whether the error says the torrent's storage has been closed rather than that it couldn't be
+// used. Both forms turn up: a goroutine that asks for the file after the shutdown has taken it away is handed
+// errStorageClosed, while one that fetched the descriptor a moment before that gets os.ErrClosed back from the read or
+// write it makes with it. Neither is a failure — the shutdown that closed the file is what those goroutines are
+// running behind — so neither is worth a fatal error or a log line that reads like something went wrong.
+func storageClosed(err error) bool {
+	return errors.Is(err, errStorageClosed) || errors.Is(err, os.ErrClosed)
 }
 
 // fatalError returns the error the torrent has to stop for, or nil if there isn't one.
@@ -293,8 +309,12 @@ func (c *Client) run() {
 		c.finish(err)
 		return
 	}
-	c.dispatcher.Register(c.torrentFile.InfoHash, c)
-	defer c.dispatcher.Deregister(c.torrentFile.InfoHash)
+	// The registration is deregistered by way of the handle it returned rather than by info hash, so that a client
+	// which is still shutting down when the same torrent is started again — which Stop's contract allows, since it
+	// returns once its timeout expires whether or not the shutdown has finished — takes only its own registration with
+	// it and leaves the new client's in place.
+	reg := c.dispatcher.Register(c.torrentFile.InfoHash, c)
+	defer c.dispatcher.Deregister(reg)
 	if err := c.tracker.announceStart(); err != nil {
 		c.finish(err)
 		return
@@ -315,7 +335,34 @@ func (c *Client) run() {
 			c.finish(errStopRequested)
 			return
 		}
-		time.Sleep(100 * time.Millisecond)
+		c.waitForRunEvent()
+	}
+}
+
+// waitForRunEvent parks the run goroutine until one of the conditions it ends the torrent for may have changed. Each
+// of them is signaled by whoever brings it about — the stop request, the fatal error and the completion of the
+// download that starts the seeding clock — so nothing here polls for them. The seeding deadline is the one that
+// arrives on a schedule of its own rather than through a setter, and it only exists once the download is complete.
+func (c *Client) waitForRunEvent() {
+	if expires, ok := c.tracker.seedingDeadline(); ok {
+		timer := time.NewTimer(time.Until(expires))
+		defer timer.Stop()
+		select {
+		case <-c.runWake:
+		case <-timer.C:
+		}
+		return
+	}
+	<-c.runWake
+}
+
+// wakeRun nudges the run goroutine into re-checking the conditions it ends the torrent for. The send is made without
+// waiting for room, so a caller is never held up by it and a nudge that lands while one is already pending is simply
+// the same wake-up: the conditions are read after the wait, not carried on the channel.
+func (c *Client) wakeRun() {
+	select {
+	case c.runWake <- struct{}{}:
+	default:
 	}
 }
 
@@ -483,6 +530,11 @@ func (c *Client) admitPeer(conn net.Conn, p *peer) bool {
 // connectToPeer dials the peer and, if the handshake exchange succeeds, hands the connection off to be serviced. The
 // host is claimed by the caller through startDial before this is started, so that nothing else can dial it in the
 // window before this goroutine runs, and stays claimed for as long as we're working with the connection.
+//
+// An attempt that doesn't get through suppresses further dials to the address rather than blocking it. Blocking is for
+// what a peer does wrong, and it applies in both directions: a peer that is firewalled or behind a NAT can't accept a
+// connection but is perfectly able to make one, which is the common case in a real swarm, so banning it for a dial of
+// ours that failed would drop the connection it goes on to make to us as well.
 func (c *Client) connectToPeer(addr string, port int) {
 	defer c.finishDial(addr)
 	c.logger.Debug("dialing peer", "address", addr, "port", port)
@@ -491,7 +543,7 @@ func (c *Client) connectToPeer(addr string, port int) {
 		if tio.ShouldLogIOError(err) {
 			errs.LogTo(c.logger, err)
 		}
-		c.dispatcher.GateKeeper().BlockAddressString(addr)
+		c.dispatcher.GateKeeper().SuppressDialsTo(addr)
 		return
 	}
 	defer xio.CloseIgnoringErrors(conn)
@@ -501,7 +553,7 @@ func (c *Client) connectToPeer(addr string, port int) {
 		if tio.ShouldLogIOError(err) {
 			errs.LogTo(logger, err)
 		}
-		c.dispatcher.GateKeeper().BlockAddressString(addr)
+		c.dispatcher.GateKeeper().SuppressDialsTo(addr)
 		return
 	}
 	var extensions dispatcher.ProtocolExtensions
@@ -510,7 +562,10 @@ func (c *Client) connectToPeer(addr string, port int) {
 		if tio.ShouldLogIOError(err) {
 			errs.LogTo(logger, err)
 		}
-		c.dispatcher.GateKeeper().BlockAddressString(addr)
+		// A remote that hangs up part way through the exchange is routine churn rather than misbehavior, so this is
+		// suppressed rather than blocked too. What the remote says, as opposed to whether it says it, is checked by
+		// HandleConnection below, which does block an address that answers for a torrent we didn't ask about.
+		c.dispatcher.GateKeeper().SuppressDialsTo(addr)
 		return
 	}
 	// No handshake completion notification is passed along, since a connection we dialed was never accepted by the
@@ -761,7 +816,7 @@ func (c *Client) adjustPeers() {
 		if data.state.downloading && !data.state.peerChoking {
 			if data.state.downloadStalled(now) {
 				c.dispatcher.GateKeeper().BlockAddress(data.peer.conn.RemoteAddr())
-				xio.CloseIgnoringErrors(data.peer.conn)
+				c.dropPeer(data.peer)
 				continue
 			}
 			downloadCount++
@@ -797,7 +852,7 @@ func (c *Client) adjustPeers() {
 			// is delivering data.
 			sort.Slice(pd, func(i, j int) bool { return pd[i].worseForRotation(pd[j], now) })
 			if !pd[0].state.downloading || pd[0].state.peerChoking {
-				xio.CloseIgnoringErrors(pd[0].peer.conn)
+				c.dropPeer(pd[0].peer)
 				pd = pd[1:]
 				count = 1
 			}
@@ -806,7 +861,7 @@ func (c *Client) adjustPeers() {
 		for i := 0; i < count; i++ {
 			added := false
 			for _, one := range candidates {
-				if !existing[one.ip] && !c.dispatcher.GateKeeper().IsAddressStringBlocked(one.ip) &&
+				if !existing[one.ip] && !c.dispatcher.GateKeeper().IsDialBlocked(one.ip) &&
 					c.startDial(one.ip) {
 					go c.connectToPeer(one.ip, one.port)
 					existing[one.ip] = true
@@ -831,7 +886,7 @@ func (c *Client) dialCandidates(existing map[string]bool) []peerAddr {
 	known := c.tracker.knownPeers()
 	candidates := make([]peerAddr, 0, len(known))
 	for _, one := range known {
-		blocked := c.dispatcher.GateKeeper().IsAddressStringBlocked(one.ip)
+		blocked := c.dispatcher.GateKeeper().IsDialBlocked(one.ip)
 		c.logger.Debug("managing peers", "address", one.ip, "port", one.port, "exists", existing[one.ip],
 			"blocked", blocked)
 		if !existing[one.ip] && !blocked {
@@ -857,17 +912,24 @@ func (c *Client) dropPeerIfPossible() bool {
 	default:
 		sort.Slice(pd, func(i, j int) bool { return pd[i].worseForDropping(pd[j]) })
 	}
-	// The victim leaves the map here rather than only when its own goroutine unwinds, which is what makes the room it
-	// gave up actually available: closing a connection doesn't remove it, and a caller that admitted a peer on the
-	// strength of this drop would otherwise still see the count it started with. It also keeps the next drop from
-	// settling on the same peer all over again — closing an already closed connection succeeds, so nothing about that
-	// says the room had already been taken. The peer's own teardown still runs; deleting an entry twice costs nothing.
-	victim := pd[0].peer
-	c.lock.Lock()
-	delete(c.peers, victim.conn)
-	c.lock.Unlock()
-	xio.CloseIgnoringErrors(victim.conn)
+	c.dropPeer(pd[0].peer)
 	return true
+}
+
+// dropPeer gives up on the peer, taking it out of the map before closing its connection.
+//
+// The peer leaves the map here rather than only when its own goroutine unwinds, which is what makes the room it gave up
+// actually available: closing a connection doesn't remove it, and a caller that admitted a peer on the strength of this
+// drop, or that dialed an alternate to take its place, would otherwise still see the count it started with — so the
+// admission is refused, or a second peer is dropped for it, and the swap loses a peer instead of making one. It also
+// keeps the next drop from settling on the same peer all over again: closing an already closed connection succeeds, so
+// nothing about that says the room had already been taken. The peer's own teardown still runs and deletes the entry
+// again on its way out, which costs nothing.
+func (c *Client) dropPeer(p *peer) {
+	c.lock.Lock()
+	delete(c.peers, p.conn)
+	c.lock.Unlock()
+	xio.CloseIgnoringErrors(p.conn)
 }
 
 func (c *Client) currentPeers() []*peer {

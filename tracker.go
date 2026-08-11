@@ -189,6 +189,9 @@ func (t *tracker) markBlockValid(index int) {
 	t.lock.Unlock()
 	t.client.informPeersWeHavePiece(index)
 	if announce {
+		// The piece that finishes the download is what starts the seeding clock, and the run goroutine is waiting on a
+		// deadline that didn't exist until now, so it is told to look again.
+		t.client.wakeRun()
 		t.requestCompleteAnnounce()
 	}
 }
@@ -249,6 +252,14 @@ func (t *tracker) isSeedingComplete() bool {
 	t.lock.RLock()
 	defer t.lock.RUnlock()
 	return t.remainingBytes <= 0 && time.Now().After(t.seedExpires)
+}
+
+// seedingDeadline returns when seeding is due to be over and whether there is such a deadline yet. There isn't one
+// until the download is complete, since that is what starts the clock.
+func (t *tracker) seedingDeadline() (deadline time.Time, ok bool) {
+	t.lock.RLock()
+	defer t.lock.RUnlock()
+	return t.seedExpires, t.remainingBytes <= 0
 }
 
 func (t *tracker) setProgress(progress float64) {

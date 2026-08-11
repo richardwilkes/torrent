@@ -20,6 +20,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -53,6 +54,11 @@ const extractTimeout = 5 * time.Minute
 // since storage that has genuinely wedged must not leave someone who pressed Ctrl-C with a program that never exits.
 const unpackInterruptTimeout = 30 * time.Second
 
+// extractInterruptTimeout is how long the shutdown registered at exit will wait for an extraction it interrupted to
+// let go of what it was in the middle of. It is the same wait, for the same reasons, that an interrupted unpack is
+// given: the extraction is the same work, reached through the monitor rather than through -unpack.
+const extractInterruptTimeout = unpackInterruptTimeout
+
 // errInterrupted is what the unpack reports for work the program's exit cut short. It travels the same path a storage
 // file that couldn't be read does, which is what has the partial file at the target removed rather than left behind.
 var errInterrupted = errors.New("interrupted")
@@ -79,6 +85,9 @@ func main() {
 	xflag.AddVersionFlags()
 	xflag.SetUsage(nil, "", "<torrent file>")
 	xflag.Parse()
+	if err := validateUserAgent(*userAgent); err != nil {
+		xos.ExitWithMsg(err.Error())
+	}
 	torrent.SetTrackerUserAgent(*userAgent)
 
 	torrentPath, err := torrentFilePath(flag.Args())
@@ -109,6 +118,7 @@ func main() {
 	var d *dispatcher.Dispatcher
 	d, err = dispatcher.NewDispatcher(opts...)
 	xos.ExitIfErr(err)
+	stopDispatcherAtExit(xos.RunAtExit, d)
 
 	completeNotifier := make(chan *torrent.Client, 1)
 	stoppedNotifier := make(chan *torrent.Client, 1)
@@ -119,15 +129,18 @@ func main() {
 		torrent.SeedDuration(*seedDuration))
 	xos.ExitIfErr(err)
 	monitorDone := make(chan struct{})
-	stopAtExit(xos.RunAtExit, c.Stop, monitorDone, extractTimeout)
+	extractInterrupt := make(chan struct{})
+	stopAtExit(xos.RunAtExit, c.Stop, extractInterrupt, monitorDone, extractTimeout, extractInterruptTimeout)
 
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
 	m := &monitor{
 		status: c.Status,
-		// No interrupt is watched here: the exit handling registered above waits for this extraction to finish rather
-		// than cutting it short, which is what keeps a torrent that completed from being left half unpacked.
-		extract:  func() error { return extractFiles(c.TorrentFile(), nil) },
+		// The exit handling registered above waits for this extraction to finish rather than cutting it short, which
+		// is what keeps a torrent that completed from being left half unpacked. Only when that wait runs out does it
+		// signal this interrupt, so that the extraction gives up in a way that takes back what it had written instead
+		// of being killed where it stands by the os.Exit that follows.
+		extract:  func() error { return extractFiles(c.TorrentFile(), extractInterrupt) },
 		remove:   func() error { return os.Remove(f.StoragePath()) },
 		complete: completeNotifier,
 		stopped:  stoppedNotifier,
@@ -158,19 +171,53 @@ func main() {
 // behind that look complete, and one arriving just after would make it a coin toss whether the storage file those
 // files came from was removed at all.
 //
-// The registrar, the stop, the notification and the wait are all supplied by the caller so that what gets registered
-// can be tested on its own.
-func stopAtExit(register func(func()) int, stop func(time.Duration), finished <-chan struct{}, wait time.Duration) {
+// Work that is still going when that wait runs out is interrupted rather than left to be killed where it stands. The
+// os.Exit that follows unwinds nothing, so an extraction cut off mid-copy leaves a truncated file behind that looks
+// complete, and since every target is created exclusively, that file then fails every later run and every -unpack
+// retry with "file exists" — which is the very retry the monitor keeps the storage around for. Closing 'interrupt' has
+// the extraction stop between reads and take back what it wrote, and 'interruptWait' is what gives it the moment that
+// takes.
+//
+// The registrar, the stop, the channels and the waits are all supplied by the caller so that what gets registered can
+// be tested on its own.
+func stopAtExit(register func(func()) int, stop func(time.Duration), interrupt chan<- struct{},
+	finished <-chan struct{}, wait, interruptWait time.Duration,
+) {
 	register(func() {
 		stop(stopTimeout)
-		timer := time.NewTimer(wait)
-		defer timer.Stop()
-		select {
-		case <-finished:
-		case <-timer.C:
-			slog.Warn("gave up waiting for the torrent's files to be dealt with", "timeout", wait)
+		if waitUntilFinished(finished, wait) {
+			return
+		}
+		slog.Warn("interrupting the work still being done with the torrent's files", "timeout", wait)
+		close(interrupt)
+		if !waitUntilFinished(finished, interruptWait) {
+			slog.Warn("gave up waiting for the torrent's files to be dealt with", "timeout", interruptWait)
 		}
 	})
+}
+
+// waitUntilFinished waits up to 'wait' for 'finished' to be closed, returning whether it was.
+func waitUntilFinished(finished <-chan struct{}, wait time.Duration) bool {
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-finished:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+// stopDispatcherAtExit arranges for the dispatcher to be shut down when the program exits. It is registered rather
+// than called once the monitor has returned so that it covers the failures on the way there as well: every one of them
+// exits, and an exit that leaves the listener bound goes on accepting inbound connections and spawning a handshake
+// goroutine for each of them right up until the process is gone, with the gatekeeper's pruning goroutine still running
+// alongside. Exit functions run in the reverse of the order they were registered, so registering this before the
+// torrent's own exit handling is what has the torrent stopped and its files dealt with first.
+//
+// The registrar is supplied by the caller so that what gets registered can be tested on its own.
+func stopDispatcherAtExit(register func(func()) int, d *dispatcher.Dispatcher) {
+	register(d.Stop)
 }
 
 // unpackWithExitHandling unpacks the torrent from a goroutine of its own, with the handling a signal arriving mid-unpack
@@ -204,14 +251,24 @@ func unpackWithExitHandling(tf *tfs.File) error {
 func interruptAtExit(register func(func()) int, interrupt chan<- struct{}, finished <-chan struct{}, wait time.Duration) {
 	register(func() {
 		close(interrupt)
-		timer := time.NewTimer(wait)
-		defer timer.Stop()
-		select {
-		case <-finished:
-		case <-timer.C:
+		if !waitUntilFinished(finished, wait) {
 			slog.Warn("gave up waiting for the interrupted unpack to clean up after itself", "timeout", wait)
 		}
 	})
+}
+
+// validateUserAgent refuses a user agent that can't be sent as an HTTP header value, which is what net/http accepts in
+// one: a horizontal tab, or any byte from a space up that isn't DEL. Left to be discovered by the announce, the
+// rejection comes from inside net/http on every attempt and only after the storage file has been created and
+// preallocated at the torrent's full length, so what a stray newline in the flag earns is a full-size .tordata and an
+// opaque error rather than a word about the flag that caused it.
+func validateUserAgent(agent string) error {
+	for i := range len(agent) {
+		if b := agent[i]; (b < ' ' && b != '\t') || b == 0x7f {
+			return fmt.Errorf("user agent may not contain the character 0x%02x at position %d", b, i)
+		}
+	}
+	return nil
 }
 
 // torrentFilePath returns the path of the torrent file to work with. Exactly one is required: only one torrent is
@@ -366,7 +423,8 @@ func verifyStorageIsComplete(tf *tfs.File, interrupt <-chan struct{}) error {
 }
 
 // extractFiles copies the whole of the torrent's content out of its storage and into the local filesystem, stopping if
-// the interrupt it was handed is signaled along the way.
+// the interrupt it was handed is signaled along the way. One that stops, for that reason or any other, takes back
+// everything it had already written.
 func extractFiles(tf *tfs.File, interrupt <-chan struct{}) error {
 	dir := "."
 	// By convention, a multi-file torrent's content goes into a directory named for the torrent while a single-file
@@ -376,9 +434,10 @@ func extractFiles(tf *tfs.File, interrupt <-chan struct{}) error {
 	if len(tf.Info.Files) != 0 {
 		dir = filepath.Join(dir, sanitizePath(tf.Info.Name))
 	}
+	var e extraction
 	// The torrent's info only carries the base name of each entry, so walk the tree to recover the paths that Open
 	// expects and that determine where each file lands on disk.
-	return fs.WalkDir(tf, ".", func(p string, d fs.DirEntry, err error) error {
+	if err := fs.WalkDir(tf, ".", func(p string, d fs.DirEntry, err error) error {
 		if err != nil || p == "." {
 			return err
 		}
@@ -388,20 +447,61 @@ func extractFiles(tf *tfs.File, interrupt <-chan struct{}) error {
 		target := filepath.Join(dir, sanitizePath(p))
 		if d.IsDir() {
 			slog.Info("extract", "dir", target)
-			return os.MkdirAll(target, 0o750)
+			return e.mkdirAll(target)
 		}
 		slog.Info("extract", "file", target)
-		return extractFile(tf, p, target, interrupt)
-	})
+		return e.extractFile(tf, p, target, interrupt)
+	}); err != nil {
+		e.undo()
+		return err
+	}
+	return nil
 }
 
-// extractFile copies a single file out of the torrent's storage and into the local filesystem at target. The target is
-// created exclusively, so that nothing already sitting there is destroyed to make room for it: a single-file torrent's
-// content lands directly in the current directory, where unrelated files of the caller's live, and a torrent names its
-// own content, so an extraction is otherwise free to overwrite whatever it likes. That also covers the
-// case-insensitive filesystems macOS and Windows use, on which two entries differing only in letter case — which the
-// library's duplicate-path validation accepts as distinct — would silently clobber each other.
-func extractFile(tf *tfs.File, p, target string, interrupt <-chan struct{}) error {
+// extraction records what an extraction has put on disk so that one which doesn't run to the end can take it all back
+// off again. fs.WalkDir stops at the first error its callback returns, so a ten-file torrent that hits a full disk on
+// its seventh file would otherwise leave the first six behind — and since every target is created exclusively, the
+// retry the monitor deliberately keeps the storage around for then fails on the first of those six with "file exists",
+// as does every run after it, until whoever asked for the extraction works out what to delete by hand. copyToNewFile
+// already covers the file that was being written when it went wrong; this covers the ones that had gone right.
+type extraction struct {
+	files []string
+	dirs  []string
+}
+
+// mkdirAll creates the directory and any missing parent of it, recording each one it had to create. Directories that
+// were already there are deliberately left out of that record: they aren't ours, so they are not ours to remove.
+func (e *extraction) mkdirAll(dir string) error {
+	var missing []string
+	for p := filepath.Clean(dir); ; {
+		if _, err := os.Stat(p); err == nil {
+			break
+		}
+		missing = append(missing, p)
+		parent := filepath.Dir(p)
+		if parent == p {
+			break
+		}
+		p = parent
+	}
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return err
+	}
+	// Reversed, so that they are recorded in the order they were created and undo, which works backwards through the
+	// record, removes the deepest of them first
+	slices.Reverse(missing)
+	e.dirs = append(e.dirs, missing...)
+	return nil
+}
+
+// extractFile copies a single file out of the torrent's storage and into the local filesystem at target, recording it
+// once it is safely there. The target is created exclusively, so that nothing already sitting there is destroyed to
+// make room for it: a single-file torrent's content lands directly in the current directory, where unrelated files of
+// the caller's live, and a torrent names its own content, so an extraction is otherwise free to overwrite whatever it
+// likes. That also covers the case-insensitive filesystems macOS and Windows use, on which two entries differing only
+// in letter case — which the library's duplicate-path validation accepts as distinct — would silently clobber each
+// other.
+func (e *extraction) extractFile(tf *tfs.File, p, target string, interrupt <-chan struct{}) error {
 	// The storage file is never a valid target. Creating the file exclusively already refuses it, but the collision is
 	// worth naming: what it would destroy is the download itself rather than some unrelated file, and it takes nothing
 	// more than a single-file torrent naming its content after the storage file to arrange it, at which point the copy
@@ -415,11 +515,31 @@ func extractFile(tf *tfs.File, p, target string, interrupt <-chan struct{}) erro
 	}
 	defer xio.CloseIgnoringErrors(r)
 	if d, _ := filepath.Split(target); d != "" {
-		if err = os.MkdirAll(d, 0o750); err != nil {
+		if err = e.mkdirAll(d); err != nil {
 			return err
 		}
 	}
-	return copyToNewFile(target, &interruptibleReader{r: r, interrupt: interrupt})
+	if err = copyToNewFile(target, &interruptibleReader{r: r, interrupt: interrupt}); err != nil {
+		return err
+	}
+	e.files = append(e.files, target)
+	return nil
+}
+
+// undo removes what the extraction put on disk, most recent first, so that what is left behind is what was there
+// before it started. Nothing is reported: the failure that led here is the one worth telling the caller about, so a
+// removal that fails itself is logged instead.
+func (e *extraction) undo() {
+	for i := len(e.files) - 1; i >= 0; i-- {
+		removePartialExtraction(e.files[i])
+	}
+	// Directories only after the files they hold, and the deepest of them first, since a directory that isn't empty
+	// can't be removed at all
+	for i := len(e.dirs) - 1; i >= 0; i-- {
+		if err := os.Remove(e.dirs[i]); err != nil {
+			errs.Log(err)
+		}
+	}
 }
 
 // interruptibleReader stops a copy that is under way once the interrupt it watches has been signaled. A file of a large

@@ -276,14 +276,34 @@ func (d *Dispatcher) Stop() {
 	d.closeRateLimiters()
 }
 
-// Register a connection handler with this dispatcher.
-func (d *Dispatcher) Register(infoHash tfs.InfoHash, handler ConnectionHandler) {
-	d.handlers.Store(infoHash, handler)
+// Registration identifies what a call to Register put in place, so that the same call to Deregister can take it away
+// again and nothing else. It carries the handler rather than the handler being stored directly because a registration
+// has to have an identity of its own: handlers need not be comparable — a function type is a perfectly ordinary way to
+// write one — so they can't be told apart from each other, and a pointer always can.
+type Registration struct {
+	handler  ConnectionHandler
+	infoHash tfs.InfoHash
 }
 
-// Deregister a connection handler from this dispatcher.
-func (d *Dispatcher) Deregister(infoHash tfs.InfoHash) {
-	d.handlers.Delete(infoHash)
+// Register a connection handler with this dispatcher, replacing whatever was registered for the info hash before it.
+// The registration returned is what Deregister takes to remove it again.
+func (d *Dispatcher) Register(infoHash tfs.InfoHash, handler ConnectionHandler) *Registration {
+	reg := &Registration{handler: handler, infoHash: infoHash}
+	d.handlers.Store(infoHash, reg)
+	return reg
+}
+
+// Deregister a connection handler from this dispatcher, but only if the registration is still the current one for its
+// info hash. A registration that has since been replaced belongs to whoever replaced it: a torrent that is stopped and
+// started again registers its new handler before the old one's shutdown has necessarily finished — Stop returns as
+// soon as its timeout expires, whether or not the shutdown is over — so an unconditional removal here would take the
+// running client's registration away with it and leave that client receiving no inbound connections at all, silently,
+// for the rest of its life. A nil registration, which is what a failed startup has, removes nothing.
+func (d *Dispatcher) Deregister(reg *Registration) {
+	if reg == nil {
+		return
+	}
+	d.handlers.CompareAndDelete(reg.infoHash, reg)
 }
 
 // ExternalIP returns our external IP address, or nil if it could not be determined. The lookup is performed at most
@@ -415,9 +435,9 @@ func (d *Dispatcher) handshake(conn net.Conn, logger *slog.Logger) (ConnectionHa
 		}
 		return nil, extensions, infoHash
 	}
-	if handler, ok := d.handlers.Load(infoHash); ok {
-		if connHandler, ok2 := handler.(ConnectionHandler); ok2 {
-			return connHandler, extensions, infoHash
+	if stored, ok := d.handlers.Load(infoHash); ok {
+		if reg, ok2 := stored.(*Registration); ok2 {
+			return reg.handler, extensions, infoHash
 		}
 	}
 	return nil, extensions, infoHash

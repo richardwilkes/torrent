@@ -1078,6 +1078,59 @@ func TestStorageClosedByTheShutdownIsNotAFailure(t *testing.T) {
 	c.NoError(client.fatalError(), "storage the shutdown has already closed is not a failure")
 }
 
+// TestStorageClosedUnderneathUsIsNotAFailure verifies the other half of the same shutdown, which is the one a peer is
+// actually left holding: this goroutine isn't tracked by the peer wait group, so it can be here with a descriptor it
+// fetched a moment before the shutdown closed it, and its reads come back with os.ErrClosed rather than with the
+// sentinel a goroutine that asked for the file afterwards is handed. It is the same clean stop, so it must neither
+// stop the torrent with an error nor log a line that reads like the storage went bad.
+func TestStorageClosedUnderneathUsIsNotAFailure(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	defer client.closeRateLimiters()
+	sink := &logSink{}
+	client.logger = slog.New(slog.NewTextHandler(sink, nil))
+	client.file = newClosedTestStorage(t)
+	markTestPiecesAvailable(client, 0)
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+	// The peer isn't choked, so what it asks for is actually served
+	p.setChoked(false)
+
+	requests := make(chan *pieceRequest)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		p.processPieceRequests(requests)
+	}()
+	requests <- &pieceRequest{index: 0, begin: 0, length: chunkSize}
+	close(requests)
+	select {
+	case <-done:
+	case <-time.After(peerMgmtWait):
+		t.Fatal("the request was never processed")
+	}
+
+	c.NoError(client.fatalError(), "storage the shutdown has already closed is not a failure")
+	c.NotContains(sink.contents(), "unable to read piece",
+		"a clean stop must not log a storage failure that didn't happen")
+}
+
+// newClosedTestStorage creates the storage file for the test torrent and closes it, leaving the handle a goroutine that
+// fetched the descriptor just before the shutdown took it away holds: still usable as far as it knows, but answering
+// every read with os.ErrClosed.
+func newClosedTestStorage(t *testing.T) *os.File {
+	t.Helper()
+	f, err := os.Create(filepath.Join(t.TempDir(), "test"+tfs.DownloadExt))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
 // newWriteOnlyTestStorage creates the storage file for the test torrent and hands back a handle that can only be
 // written to, so that reading a piece from it fails the way an unreadable file would.
 func newWriteOnlyTestStorage(t *testing.T, client *Client) *os.File {
@@ -2797,6 +2850,7 @@ func newTestClientForTorrent(d *dispatcher.Dispatcher, torrentFile *tfs.File) *C
 		peers:               make(map[net.Conn]*peer),
 		dialing:             make(map[string]bool),
 		stoppedChan:         make(chan bool, 1),
+		runWake:             make(chan struct{}, 1),
 		concurrentDownloads: 4,
 		peersWanted:         32,
 	}

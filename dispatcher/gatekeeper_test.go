@@ -47,6 +47,48 @@ func TestPruneRemovesExpiredBlocks(t *testing.T) {
 	c.True(gk.IsAddressStringBlocked("10.0.0.2"))
 }
 
+// TestSuppressedDialsDoNotBlockTheAddress verifies that an address we couldn't reach is only kept out of the peers we
+// dial, rather than being refused when it connects to us. A peer that is firewalled or behind a NAT can't accept a
+// connection but is perfectly able to make one, which is the common case in a real swarm, so a failed dial that blocked
+// it would cost us a peer that never did anything wrong — in both directions.
+func TestSuppressedDialsDoNotBlockTheAddress(t *testing.T) {
+	c := check.New(t)
+	gk := NewGateKeeper(nil)
+	defer gk.Close()
+
+	const addr = "10.0.0.1"
+	c.False(gk.IsDialBlocked(addr))
+	gk.SuppressDialsTo(addr)
+	c.True(gk.IsDialBlocked(addr))
+	c.False(gk.IsAddressStringBlocked(addr), "a peer we couldn't dial must still be free to connect to us")
+
+	// A block, by contrast, applies in both directions
+	const blocked = "10.0.0.2"
+	gk.BlockAddressString(blocked)
+	c.True(gk.IsAddressStringBlocked(blocked))
+	c.True(gk.IsDialBlocked(blocked), "an address we won't accept a connection from is not one to dial either")
+
+	// A suppression whose time has run out no longer keeps us from dialing, even before it has been pruned away
+	gk.undialable.Store(addr, time.Now().Add(-time.Minute))
+	c.False(gk.IsDialBlocked(addr))
+}
+
+// TestPruneRemovesExpiredDialSuppressions verifies that the dial suppressions are reclaimed by the same pruning the
+// blocks are, rather than accumulating for the life of the process.
+func TestPruneRemovesExpiredDialSuppressions(t *testing.T) {
+	c := check.New(t)
+	gk := NewGateKeeper(nil)
+	defer gk.Close()
+
+	gk.undialable.Store("10.0.0.1", time.Now().Add(-time.Minute))
+	gk.SuppressDialsTo("10.0.0.2")
+	gk.pruneExpired()
+
+	_, stillThere := gk.undialable.Load("10.0.0.1")
+	c.False(stillThere, "the expired dial suppression should have been pruned")
+	c.True(gk.IsDialBlocked("10.0.0.2"))
+}
+
 // TestPruneDoesNotUnblockRecentlyReblockedPeer verifies that the removal of an expired block is skipped when the
 // address was blocked again after the expired entry was observed. Removing it unconditionally would silently unblock a
 // peer that had just been blocked, which is precisely the peer we least want to let back in.
