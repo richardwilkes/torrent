@@ -12,6 +12,7 @@ package dispatcher
 import (
 	"log/slog"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -32,6 +33,39 @@ func TestLogToReplacesTheDefaultLogger(t *testing.T) {
 
 	logger := slog.New(slog.DiscardHandler)
 	c.Equal(logger, newTestDispatcher(t, LogTo(logger)).Logger())
+}
+
+// TestLogToSubstitutesForANilLogger verifies that a nil logger falls back to the process default rather than being
+// stored. The dispatcher's own goroutines reach for the logger without checking it — the listen goroutine logs the
+// line saying it started, every accept failure, and the line saying it stopped — so a stored nil is a nil pointer
+// panic on a goroutine no caller can recover from, taking the whole process down rather than reporting anything.
+func TestLogToSubstitutesForANilLogger(t *testing.T) {
+	c := check.New(t)
+	sink := captureDefaultLogger(t)
+	d := newTestDispatcher(t, LogTo(nil))
+	c.Equal(slog.Default(), d.Logger(), "a nil logger must not be handed back out")
+
+	// The whole of the listen goroutine's logging is exercised: it logs that it started as soon as it has a port, and
+	// that it stopped once the listener is closed, both of which would panic on a nil logger
+	waitForLoggedText(t, sink, `msg=listening`)
+	d.Stop()
+	waitForLoggedText(t, sink, `msg="stopped listening"`)
+}
+
+// waitForLoggedText fails the test if the text doesn't reach the sink promptly. The dispatcher logs from its own
+// goroutines, so what it has written by the time the call that provoked it returns isn't fixed.
+func waitForLoggedText(t *testing.T, sink *logSink, want string) {
+	t.Helper()
+	deadline := time.Now().Add(goroutineWait)
+	for {
+		if strings.Contains(sink.contents(), want) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%q was never logged; what was logged was: %s", want, sink.contents())
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 // TestGlobalRateCapsTooSmallForAPieceMessageAreRejected verifies that a global cap which would stall every client

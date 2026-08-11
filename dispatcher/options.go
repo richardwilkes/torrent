@@ -52,12 +52,21 @@ func FixedExternalIP(ip net.IP) func(*Dispatcher) error {
 	}
 }
 
-// LogTo sets the logger the dispatcher should use. Default is slog.Default(), so a caller that wants the dispatcher's
-// logging — accept failures, and the lines saying we started and stopped listening — kept off of the process's default
-// logger has to say where it should go instead, which may be a logger built on slog.DiscardHandler.
+// LogTo sets the logger the dispatcher should use, or slog.Default() if it is nil. Default is slog.Default(), so a
+// caller that wants the dispatcher's logging — accept failures, and the lines saying we started and stopped listening
+// — kept off of the process's default logger has to say where it should go instead, which may be a logger built on
+// slog.DiscardHandler.
+//
+// A nil logger is substituted for rather than stored, the same way NewGateKeeper substitutes for one, because the
+// dispatcher's own goroutines reach for the logger without checking it: the listen goroutine logs the line saying it
+// started, every accept failure, and the line saying it stopped, so a stored nil turns into a nil pointer panic on a
+// goroutine no caller of ours can recover from, taking the whole process down.
 func LogTo(logger *slog.Logger) func(*Dispatcher) error {
 	return func(d *Dispatcher) error {
 		d.logger = logger
+		if d.logger == nil {
+			d.logger = slog.Default()
+		}
 		return nil
 	}
 }

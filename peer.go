@@ -59,6 +59,16 @@ const (
 	// maxPendingPieceRequests is the number of unfulfilled piece requests we'll hold onto for a peer before deciding
 	// it is flooding us.
 	maxPendingPieceRequests = 512
+	// maxOutstandingChunkRequests is the number of chunk requests we'll keep in front of a single peer at a time. A
+	// piece is asked for a chunk at a time and a piece at tfs.MaxPieceLength is 2048 of them, so asking for a whole
+	// piece in one burst puts far more requests in front of a peer than clients are willing to hold: this library's
+	// own upload side treats more than maxPendingPieceRequests as flooding and bans the address for it, which leaves
+	// two instances of it unable to transfer a torrent with a piece length above 8MB at all, and third party clients
+	// with request queue caps of their own — commonly 250 to 2000 — drop the excess or hang up, leaving the piece to
+	// stall until the peer is given up on and banned. This sits far enough below every one of those caps to leave room
+	// for the batch a peer is re-asked for after a choke overlapping one still in flight, while still keeping 2MB in
+	// flight per peer, which is well beyond what the delay between asking and being answered can hold.
+	maxOutstandingChunkRequests = 128
 	// requestMessageLength is the size of a message asking a peer for a chunk, length prefix included.
 	requestMessageLength = 17
 )
@@ -225,6 +235,14 @@ type piece struct {
 	// progress renews it, so it is what bounds how long a peer that never delivers can keep the piece to itself.
 	lastProgress time.Time
 	buffer       []byte
+	// askedTo is how far into the piece the requests built so far reach. Only what lies beyond it is asked for when
+	// more of the piece can be put in front of the peer, so a chunk isn't asked for a second time while we're still
+	// waiting for it. A peer that chokes us discards everything it was asked for, so resumeDownloads winds this back
+	// to the beginning and the whole of what is still missing is asked for again.
+	askedTo int
+	// inFlight is the number of this piece's chunks that have been asked for and haven't arrived. Summed across the
+	// pieces a peer holds, it is what says how much of maxOutstandingChunkRequests is still free.
+	inFlight int
 	// requested is set once the messages asking for the chunks we still need of this piece have begun going out on the
 	// wire, which is where the deadline for the piece starts. Until then the peer hasn't been asked for anything and
 	// can't be held to a deadline: the requests wait their turn on the shared write queue, which for a peer we're also
@@ -458,8 +476,13 @@ func (p *peer) queueChunkRequests(index int) {
 	p.lock.Lock()
 	p.pendingChunkRequests[index] = true
 	p.lock.Unlock()
-	// The signal is never allowed to block, for the same reason signalStateChange's isn't: it says nothing more than
-	// that there is something to look at, and the delivery goroutine re-reads everything pending each time it wakes.
+	p.signalChunkRequests()
+}
+
+// signalChunkRequests tells the goroutine that asks the peer for chunks that there may be something for it to send.
+// The signal is never allowed to block, for the same reason signalStateChange's isn't: it says nothing more than that
+// there is something to look at, and the delivery goroutine re-reads everything pending each time it wakes.
+func (p *peer) signalChunkRequests() {
 	select {
 	case p.chunkRequestsChanged <- struct{}{}:
 	default:
@@ -489,34 +512,64 @@ func (p *peer) processChunkRequests(done chan bool) {
 	}
 }
 
-// nextChunkRequests returns the messages asking for the chunks we still need of the pieces that have been queued for
-// requesting, and takes those pieces out of the queue. The messages are built when they are about to be sent rather
-// than when the piece was queued, so chunks that arrived while an earlier batch was draining aren't asked for a second
-// time, and a piece that was given back in the meantime isn't asked for at all.
+// nextChunkRequests returns the messages asking for as much as may be asked for right now of the chunks we still need
+// of the pieces that have been queued for requesting, and takes the pieces that have nothing left to ask for out of
+// the queue. The messages are built when they are about to be sent rather than when the piece was queued, so chunks
+// that arrived while an earlier batch was draining aren't asked for a second time, and a piece that was given back in
+// the meantime isn't asked for at all.
+//
+// No more than maxOutstandingChunkRequests are ever left in front of a peer at once, so a piece whose chunks run past
+// that is asked for a batch at a time as the answers come back rather than all in one burst. A piece that stays in the
+// queue with chunks left to ask for is picked up again by the signal receivedChunk makes when a chunk arrives, which
+// is what frees the room for the next batch.
 func (p *peer) nextChunkRequests() [][]byte {
-	p.lock.Lock()
+	p.lock.RLock()
 	indexes := make([]int, 0, len(p.pendingChunkRequests))
 	for index := range p.pendingChunkRequests {
 		indexes = append(indexes, index)
 	}
-	clear(p.pendingChunkRequests)
 	pieces := maps.Clone(p.pieces)
-	p.lock.Unlock()
-	var requests [][]byte
+	p.lock.RUnlock()
 	slices.Sort(indexes) // Map iteration order is arbitrary; the peer is asked for the pieces in a sensible one
+	// What may be asked for is what the cap leaves once everything already asked for is accounted for. The count is
+	// derived from the pieces themselves rather than tracked alongside them so that it cannot drift: a piece that
+	// completed, or that was given back because it stalled, takes whatever it had outstanding with it.
+	budget := maxOutstandingChunkRequests
+	for _, one := range pieces {
+		one.lock.RLock()
+		budget -= one.inFlight
+		one.lock.RUnlock()
+	}
+	var requests [][]byte
+	settled := make([]int, 0, len(indexes))
 	for _, index := range indexes {
 		one, ok := pieces[index]
 		if !ok {
+			// The piece finished, or was given back, while it sat in the queue, so there is nothing left to ask for
+			settled = append(settled, index)
 			continue
 		}
-		one.lock.RLock()
-		for i := 0; i < len(one.buffer); i += chunkSize {
-			size := min(len(one.buffer)-i, chunkSize)
-			if !one.spans.Contains(&spanlist.Span{Start: i, Length: size}) {
-				requests = append(requests, newRequestMessage(index, i, size))
+		one.lock.Lock()
+		for budget > 0 && one.askedTo < len(one.buffer) {
+			size := min(len(one.buffer)-one.askedTo, chunkSize)
+			if !one.spans.Contains(&spanlist.Span{Start: one.askedTo, Length: size}) {
+				requests = append(requests, newRequestMessage(index, one.askedTo, size))
+				one.inFlight++
+				budget--
 			}
+			one.askedTo += size
 		}
-		one.lock.RUnlock()
+		if one.askedTo >= len(one.buffer) {
+			settled = append(settled, index)
+		}
+		one.lock.Unlock()
+	}
+	if len(settled) != 0 {
+		p.lock.Lock()
+		for _, index := range settled {
+			delete(p.pendingChunkRequests, index)
+		}
+		p.lock.Unlock()
 	}
 	return requests
 }
@@ -797,6 +850,10 @@ func (p *peer) resumeDownloads() {
 		// The requests we're about to build have yet to go out, so the deadline is inert again until they do, the same
 		// as it was when the piece was first claimed.
 		one.requested = false
+		// A peer that was choking us was told to discard everything it had been asked for, so nothing is in flight any
+		// longer and what is still missing has to be asked for again from the beginning of the piece.
+		one.askedTo = 0
+		one.inFlight = 0
 		one.lock.Unlock()
 		p.queueChunkRequests(index)
 	}
@@ -907,6 +964,12 @@ func (p *peer) receivedChunk(index, begin int, buffer []byte) error {
 	if progressed {
 		one.extendDeadline(now.Add(downloadReadDeadline))
 		one.lastProgress = now
+		// The request this answers is no longer in front of the peer, so it stops counting against the cap on how many
+		// of them we keep there. A duplicate is not counted off: the request it answers was already accounted for by
+		// the copy that arrived first, or was discarded along with the rest when the peer choked us.
+		if one.inFlight > 0 {
+			one.inFlight--
+		}
 	}
 	copy(one.buffer[begin:last], buffer)
 	one.spans.Insert(&span)
@@ -953,6 +1016,10 @@ func (p *peer) receivedChunk(index, begin int, buffer []byte) error {
 		one.lock.Unlock()
 		if bailIfNotFinish {
 			p.bailOut()
+		} else {
+			// The chunk that just arrived freed room under the cap on how many requests we keep in front of a peer, so
+			// this is what carries the rest of a piece too large to ask for in one go out to it, a batch at a time.
+			p.signalChunkRequests()
 		}
 	}
 	return nil

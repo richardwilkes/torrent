@@ -922,6 +922,96 @@ func TestChunkRequestsAreBuiltWhenTheyGoOut(t *testing.T) {
 	}
 }
 
+// TestChunkRequestsAreCappedToWhatAPeerWillHold verifies that a piece far larger than the request pipeline is asked
+// for a batch at a time as the answers come back, rather than every chunk of it going out in one burst. A piece at
+// tfs.MaxPieceLength is 2048 chunk requests, which is more than clients are willing to hold: this library's own upload
+// side bans a peer for fewer than that, and third party clients with request queue caps drop the excess or hang up.
+func TestChunkRequestsAreCappedToWhatAPeerWillHold(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	const beyondTheCap = 4
+	client := newTestClientForTorrent(d,
+		newTestTorrentFileWithChunksPerPiece(maxOutstandingChunkRequests+beyondTheCap, testPieceCount))
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+	startChunkRequestDelivery(t, p)
+
+	p.queuePieceDownload(0)
+	for i := range maxOutstandingChunkRequests {
+		c.Equal(newTestPieceRequest(requestID, 0, uint32(i*chunkSize), chunkSize), nextQueuedMessage(t, p), "chunk %d", i)
+	}
+	select {
+	case buffer := <-p.writeQueue:
+		t.Fatalf("no more than %d requests may be put in front of a peer at once, but %v was asked for as well",
+			maxOutstandingChunkRequests, buffer)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Each chunk that arrives is one fewer in front of the peer, which is what carries the rest of the piece out to it
+	for i := range beyondTheCap {
+		c.NoError(p.receivedChunk(0, i*chunkSize, testStorageBytes(0, i*chunkSize, chunkSize)))
+		c.Equal(newTestPieceRequest(requestID, 0, uint32((maxOutstandingChunkRequests+i)*chunkSize), chunkSize),
+			nextQueuedMessage(t, p), "refill %d", i)
+	}
+
+	// And with the whole of the piece asked for, an arrival adds nothing more
+	c.NoError(p.receivedChunk(0, beyondTheCap*chunkSize, testStorageBytes(0, beyondTheCap*chunkSize, chunkSize)))
+	select {
+	case buffer := <-p.writeQueue:
+		t.Fatalf("every chunk of the piece had been asked for, but %v was asked for as well", buffer)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// TestChunkRequestsStayWithinWhatWeWouldBanAPeerFor verifies that the burst of requests we put in front of a peer is
+// one this library's own upload side is willing to hold. Two instances of it would otherwise be unable to transfer a
+// torrent whose piece length is above 8MB at all: every attempt has the seeder decide the downloader is flooding it
+// and block its address for five minutes.
+func TestChunkRequestsStayWithinWhatWeWouldBanAPeerFor(t *testing.T) {
+	c := check.New(t)
+	q := newPendingRequests()
+	for i := range maxOutstandingChunkRequests {
+		c.True(q.add(&pieceRequest{index: 0, begin: i * chunkSize, length: chunkSize}),
+			"request %d of a full pipeline was refused, so a peer asking the way we do would be banned for it", i)
+	}
+	c.Equal(maxOutstandingChunkRequests, q.count())
+}
+
+// TestChunkRequestsResumeFromTheStartAfterAChoke verifies that the pipeline is wound back when a peer chokes us. A
+// choked peer discards everything it was asked for, so what was in flight is never answered: leaving it counted
+// against the cap would shrink the pipeline every time a peer choked us, and leaving the piece asked for as far as it
+// had reached would mean the discarded chunks were never asked for again.
+func TestChunkRequestsResumeFromTheStartAfterAChoke(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	const chunks = 3
+	client := newTestClientForTorrent(d, newTestTorrentFileWithChunksPerPiece(chunks, testPieceCount))
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+	startChunkRequestDelivery(t, p)
+
+	p.queuePieceDownload(0)
+	for i := range chunks {
+		c.Equal(newTestPieceRequest(requestID, 0, uint32(i*chunkSize), chunkSize), nextQueuedMessage(t, p), "chunk %d", i)
+	}
+	p.lock.RLock()
+	one := p.pieces[0]
+	p.lock.RUnlock()
+	one.lock.RLock()
+	c.Equal(chunks, one.inFlight, "every chunk of the piece is waiting to be answered")
+	one.lock.RUnlock()
+
+	p.resumeDownloads()
+	one.lock.RLock()
+	inFlightAfterResume := one.inFlight
+	one.lock.RUnlock()
+	c.Equal(0, inFlightAfterResume, "what a choking peer discarded may not go on counting against the pipeline")
+	for i := range chunks {
+		c.Equal(newTestPieceRequest(requestID, 0, uint32(i*chunkSize), chunkSize), nextQueuedMessage(t, p),
+			"chunk %d after the resume", i)
+	}
+}
+
 // TestMessageDeadlinesScaleWithTheMessageLength verifies that how long a message is given to move, in either
 // direction, depends on how big it is. Everything but the bit field has a small, fixed size, but a bit field is one
 // byte for every eight pieces of the torrent, so a flat deadline for one of those amounts to demanding a transfer rate
@@ -1364,10 +1454,13 @@ func TestResumeOnlyAsksForTheChunksThatAreMissing(t *testing.T) {
 	// Read with a deadline rather than a bare receive: asking for nothing at all is one of the ways resuming can go
 	// wrong, and that must fail this test rather than park it on the queue forever and hang the whole suite
 	c.Equal(newTestPieceRequest(requestID, 2, chunkSize, chunkSize), nextQueuedMessage(t, p))
+	// The wait is what makes the check mean anything: processChunkRequests puts the requests on the queue one at a
+	// time from a goroutine of its own, so a resume that also re-asked for the chunks around the missing one may not
+	// have delivered the next of them at the instant the first was taken off, and a bare look would let it through
 	select {
 	case buffer := <-p.writeQueue:
 		t.Fatalf("only the missing chunk should have been asked for, but %v was too", buffer)
-	default:
+	case <-time.After(100 * time.Millisecond):
 	}
 	one.lock.RLock()
 	timeout := one.timeout
