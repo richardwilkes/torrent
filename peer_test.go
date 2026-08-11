@@ -2065,6 +2065,30 @@ func newTestPeer(t *testing.T, client *Client) (conn net.Conn, p *peer) {
 	return conn, p
 }
 
+// newTestPeerFromHost adds a peer to the client the way newTestPeer does, but has it report the given address as the
+// remote end of its connection. Every connection a test makes is on the loopback interface, which leaves all of the
+// peers built from them looking like the same host to peer management, so a test that needs its peers to be on hosts
+// of their own uses this instead.
+func newTestPeerFromHost(t *testing.T, client *Client, host string, port int) (conn net.Conn, p *peer) {
+	t.Helper()
+	conn, remote := newTestConnPair(t)
+	fixed := &fixedRemoteAddrConn{Conn: remote, remoteAddr: &net.TCPAddr{IP: net.ParseIP(host), Port: port}}
+	p = newPeer(client, fixed, client.logger)
+	client.lock.Lock()
+	client.peers[fixed] = p
+	client.lock.Unlock()
+	return conn, p
+}
+
+// fixedRemoteAddrConn reports the remote address it was given rather than the loopback address the connection it wraps
+// was actually made to.
+type fixedRemoteAddrConn struct {
+	net.Conn
+	remoteAddr net.Addr
+}
+
+func (c *fixedRemoteAddrConn) RemoteAddr() net.Addr { return c.remoteAddr }
+
 // newTestConnPair returns the two ends of a loopback connection.
 func newTestConnPair(t *testing.T) (local, remote net.Conn) {
 	t.Helper()

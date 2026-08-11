@@ -35,6 +35,15 @@ const peerMgmtWait = 5 * time.Second
 // documentation, so nothing can be listening on it and no dial to it is ever actually made.
 const testDialHost = "203.0.113.2"
 
+// testPeerHost1, testPeerHost2 and testPeerPort stand in for the remote ends of peers that have to look like they come
+// from hosts of their own. They come from the range reserved for documentation, and since a peer we already have is
+// never dialed, no connection to them is ever attempted.
+const (
+	testPeerHost1 = "203.0.113.10"
+	testPeerHost2 = "203.0.113.11"
+	testPeerPort  = 6881
+)
+
 // TestPeerManagementStopsWhenStoppedBeforeStarting verifies that a stop that arrives before peer management has
 // started is still honored, rather than leaving the peer management goroutine running forever.
 func TestPeerManagementStopsWhenStoppedBeforeStarting(t *testing.T) {
@@ -338,12 +347,15 @@ func TestLeastUsefulPeerIsRotatedOut(t *testing.T) {
 	d := newTestDispatcher(t)
 	client := newTestClient(d)
 
-	// We already have as many peers as we want, so one has to be given up before an alternate can be added
+	// We already have as many peers as we want, so one has to be given up before the alternate the tracker gave us can
+	// be added
 	client.peersWanted = 2
-	downloadingConn, downloading := newTestPeer(t, client)
+	downloadingConn, downloading := newTestPeerFromHost(t, client, testPeerHost1, testPeerPort)
 	defer xio.CloseIgnoringErrors(downloadingConn)
-	idleConn, idle := newTestPeer(t, client)
+	idleConn, idle := newTestPeerFromHost(t, client, testPeerHost2, testPeerPort)
 	defer xio.CloseIgnoringErrors(idleConn)
+	host, port, accepted := listenForTestDials(t)
+	setTrackerPeerAddresses(client, map[string]int{host: port})
 	downloading.lock.Lock()
 	downloading.peerChoking = false
 	downloading.lock.Unlock()
@@ -354,6 +366,114 @@ func TestLeastUsefulPeerIsRotatedOut(t *testing.T) {
 	client.adjustPeers()
 	checkConnOpen(t, downloadingConn, true)
 	checkConnOpen(t, idleConn, false)
+	select {
+	case conn := <-accepted:
+		xio.CloseIgnoringErrors(conn)
+	case <-time.After(peerMgmtWait):
+		t.Fatal("the alternate the peer was given up for was never dialed")
+	}
+}
+
+// TestPeerIsNotRotatedOutWithoutAnAlternate verifies that no peer is given up when there is nothing to put in its
+// place. The tracker's list holds nothing we can use in a small or fully connected swarm, and a peer closed for an
+// alternate that doesn't exist is simply lost: the host we closed becomes dialable again on the next pass, since a
+// connection we closed ourselves isn't blocked, and ranks worst again as the newest connection with the least read
+// from it, so the drop repeats on every adjustment.
+func TestPeerIsNotRotatedOutWithoutAnAlternate(t *testing.T) {
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+
+	// Every peer slot is taken and the tracker hasn't given us any peers at all
+	client.peersWanted = 2
+	conn1, _ := newTestPeerFromHost(t, client, testPeerHost1, testPeerPort)
+	defer xio.CloseIgnoringErrors(conn1)
+	conn2, _ := newTestPeerFromHost(t, client, testPeerHost2, testPeerPort)
+	defer xio.CloseIgnoringErrors(conn2)
+
+	client.adjustPeers()
+	checkConnOpen(t, conn1, true)
+	checkConnOpen(t, conn2, true)
+
+	// The only peer the tracker knows about is one we're already connected to, which is no alternate either
+	setTrackerPeerAddresses(client, map[string]int{testPeerHost1: testPeerPort})
+	client.adjustPeers()
+	checkConnOpen(t, conn1, true)
+	checkConnOpen(t, conn2, true)
+}
+
+// TestPeersAreNotRotatedOutWhileSeeding verifies that the hunt for more peers to download from ends with the download
+// itself. Nothing can be downloading once the download is complete, so the count of downloading peers is permanently
+// 0: a client that keeps looking for downloaders gives up a connected peer on every pass for the whole seeding period,
+// closing the very uploads that period exists to serve.
+func TestPeersAreNotRotatedOutWhileSeeding(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+
+	// Every peer slot is taken, the download is complete, and the tracker has an alternate we could dial
+	client.peersWanted = 2
+	conn1, _ := newTestPeerFromHost(t, client, testPeerHost1, testPeerPort)
+	defer xio.CloseIgnoringErrors(conn1)
+	conn2, _ := newTestPeerFromHost(t, client, testPeerHost2, testPeerPort)
+	defer xio.CloseIgnoringErrors(conn2)
+	host, port, accepted := listenForTestDials(t)
+	setTrackerPeerAddresses(client, map[string]int{host: port})
+	markTestClientSeeding(client)
+	c.True(client.tracker.isDownloadComplete())
+	c.False(client.tracker.isSeedingComplete())
+
+	client.adjustPeers()
+	checkConnOpen(t, conn1, true)
+	checkConnOpen(t, conn2, true)
+	select {
+	case conn := <-accepted:
+		xio.CloseIgnoringErrors(conn)
+		t.Fatal("a peer was given up to make room for one there is nothing left to download from")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// TestSeedingFillsFreePeerSlots verifies that a client that has finished downloading still connects to the peers the
+// tracker gives it while it has room for them, since each peer added while seeding is another one we can upload to.
+func TestSeedingFillsFreePeerSlots(t *testing.T) {
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+
+	// There is room for another peer beyond the ones we have, and the download is complete
+	client.peersWanted = 3
+	conn1, _ := newTestPeerFromHost(t, client, testPeerHost1, testPeerPort)
+	defer xio.CloseIgnoringErrors(conn1)
+	conn2, _ := newTestPeerFromHost(t, client, testPeerHost2, testPeerPort)
+	defer xio.CloseIgnoringErrors(conn2)
+	host, port, accepted := listenForTestDials(t)
+	setTrackerPeerAddresses(client, map[string]int{host: port})
+	markTestClientSeeding(client)
+
+	client.adjustPeers()
+	select {
+	case conn := <-accepted:
+		xio.CloseIgnoringErrors(conn)
+	case <-time.After(peerMgmtWait):
+		t.Fatal("the peer the tracker gave us was never dialed, even though there was room for it")
+	}
+	checkConnOpen(t, conn1, true)
+	checkConnOpen(t, conn2, true)
+}
+
+// markTestClientSeeding puts the tracker into the state it holds once the download has completed and the seeding
+// period is under way.
+func markTestClientSeeding(client *Client) {
+	client.tracker.lock.Lock()
+	client.tracker.remainingBytes = 0
+	client.tracker.seedExpires = time.Now().Add(time.Hour)
+	client.tracker.lock.Unlock()
+}
+
+// setTrackerPeerAddresses stands in for the peer addresses an announce would have given the tracker.
+func setTrackerPeerAddresses(client *Client, addresses map[string]int) {
+	client.tracker.lock.Lock()
+	client.tracker.peerAddresses = addresses
+	client.tracker.lock.Unlock()
 }
 
 // TestBusyPeersAreNotRotatedOut verifies that no peer is given up when every one of them is actively downloading a
@@ -366,13 +486,14 @@ func TestBusyPeersAreNotRotatedOut(t *testing.T) {
 	d := newTestDispatcher(t)
 	client := newTestClient(d)
 
-	// Every peer slot is taken, so an alternate could only be added by giving one of the peers up, and there are still
-	// download slots to spare
-	client.peersWanted = 2
+	// Every peer slot is taken, so the alternate the tracker gave us could only be added by giving one of the peers up,
+	// and there are still download slots to spare
+	hosts := []string{testPeerHost1, testPeerHost2}
+	client.peersWanted = len(hosts)
 	c.True(client.peersWanted < client.concurrentDownloads)
 	conns := make([]net.Conn, 0, client.peersWanted)
-	for i := range cap(conns) {
-		conn, p := newTestPeer(t, client)
+	for i, host := range hosts {
+		conn, p := newTestPeerFromHost(t, client, host, testPeerPort)
 		conns = append(conns, conn)
 		p.lock.Lock()
 		p.peerChoking = false
@@ -385,10 +506,18 @@ func TestBusyPeersAreNotRotatedOut(t *testing.T) {
 			xio.CloseIgnoringErrors(conn)
 		}
 	}()
+	host, port, accepted := listenForTestDials(t)
+	setTrackerPeerAddresses(client, map[string]int{host: port})
 
 	client.adjustPeers()
 	for _, conn := range conns {
 		checkConnOpen(t, conn, true)
+	}
+	select {
+	case conn := <-accepted:
+		xio.CloseIgnoringErrors(conn)
+		t.Fatal("a peer delivering a piece was given up for an alternate")
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 
@@ -490,9 +619,7 @@ func TestDialInFlightIsNotDialedAgain(t *testing.T) {
 	d := newTestDispatcher(t)
 	client := newTestClient(d)
 	host, port, accepted := listenForTestDials(t)
-	client.tracker.lock.Lock()
-	client.tracker.peerAddresses = map[string]int{host: port}
-	client.tracker.lock.Unlock()
+	setTrackerPeerAddresses(client, map[string]int{host: port})
 
 	// An attempt from an earlier adjustment is still in flight, so this adjustment must not make another
 	c.True(client.startDial(host))

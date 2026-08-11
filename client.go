@@ -732,18 +732,33 @@ func (c *Client) adjustPeers() {
 		}
 		pd = append(pd, data)
 	}
-	c.logger.Debug("managing peers", "download_count", downloadCount, "seeding_complete", c.tracker.isSeedingComplete())
-	if downloadCount < c.concurrentDownloads && !c.tracker.isSeedingComplete() {
+	// Hunting for more peers to download from is only worth doing while there is still something left to download.
+	// Once the download is complete no peer can be downloading, so downloadCount is permanently 0: a gate that looks
+	// only at the seeding deadline leaves this searching for downloaders — and rotating peers out to make room for
+	// them — for the whole seed period, where the only thing it can accomplish is closing a connection we're uploading
+	// on. Filling slots that are genuinely free is still worthwhile while seeding, since each peer added to one is
+	// another peer we can upload to.
+	seedingComplete := c.tracker.isSeedingComplete()
+	needDownloaders := downloadCount < c.concurrentDownloads && !c.tracker.isDownloadComplete()
+	count := min(c.peersWanted-len(pd), 4)
+	c.logger.Debug("managing peers", "download_count", downloadCount, "need_downloaders", needDownloaders,
+		"seeding_complete", seedingComplete)
+	if !seedingComplete && (count > 0 || needDownloaders) {
 		existing := c.hostsInUse(pd)
-		count := min(c.peersWanted-len(pd), 4)
-		if count < 1 && len(pd) > 0 {
+		// The candidates are collected before anything is given up for them, since a peer must not be closed for an
+		// alternate that doesn't exist. In a small or fully connected swarm the tracker's list holds nothing but hosts
+		// we already have a connection to, and a peer closed there is simply lost: the host we closed is free to be
+		// dialed again on the next pass, since a connection we closed ourselves isn't blocked, and it ranks worst
+		// again as the newest connection with the least read from it, so the drop repeats on every adjustment.
+		candidates := c.dialCandidates(existing)
+		if count < 1 && len(pd) > 0 && len(candidates) > 0 {
 			// Find one to disconnect so we can add an alternate, but only if the least useful of them isn't one that
 			// is actively downloading a piece for us. Every slot can be occupied by such a peer while we still have
 			// spare download slots (peersWanted below concurrentDownloads, for instance), and closing one of them
-			// throws away its partial piece and frees the host to be redialed on the next pass, since a connection we
-			// closed ourselves isn't blocked. That would repeat every adjustment, crippling the transfer rather than
-			// improving it. Peers that are stalled while free to send have already been dropped above, so a peer that
-			// is downloading and isn't being choked is one that is delivering data.
+			// throws away its partial piece and frees the host to be redialed on the next pass. That would repeat
+			// every adjustment, crippling the transfer rather than improving it. Peers that are stalled while free to
+			// send have already been dropped above, so a peer that is downloading and isn't being choked is one that
+			// is delivering data.
 			sort.Slice(pd, func(i, j int) bool { return pd[i].worseForRotation(pd[j], now) })
 			if !pd[0].state.downloading || pd[0].state.peerChoking {
 				xio.CloseIgnoringErrors(pd[0].peer.conn)
@@ -751,33 +766,20 @@ func (c *Client) adjustPeers() {
 				count = 1
 			}
 		}
-		c.logger.Debug("managing peers", "wanted", count)
-		if count > 0 {
-			peerAddressMap := c.tracker.peerAddressesMap()
-			pam := make(map[string]int, len(peerAddressMap))
-			for addr, port := range peerAddressMap {
-				blocked := c.dispatcher.GateKeeper().IsAddressStringBlocked(addr)
-				c.logger.Debug("managing peers", "address", addr, "port", port, "exists", existing[addr],
-					"blocked", blocked)
-				if _, exists := existing[addr]; !exists && !blocked {
-					pam[addr] = port
-				}
-			}
-			c.logger.Debug("managing peers", "available", len(pam))
-			for i := 0; i < count; i++ {
-				added := false
-				for addr, port := range pam {
-					if !existing[addr] && !c.dispatcher.GateKeeper().IsAddressStringBlocked(addr) &&
-						c.startDial(addr) {
-						go c.connectToPeer(addr, port)
-						existing[addr] = true
-						added = true
-						break
-					}
-				}
-				if !added {
+		c.logger.Debug("managing peers", "wanted", count, "available", len(candidates))
+		for i := 0; i < count; i++ {
+			added := false
+			for addr, port := range candidates {
+				if !existing[addr] && !c.dispatcher.GateKeeper().IsAddressStringBlocked(addr) &&
+					c.startDial(addr) {
+					go c.connectToPeer(addr, port)
+					existing[addr] = true
+					added = true
 					break
 				}
+			}
+			if !added {
+				break
 			}
 		}
 	}
@@ -785,6 +787,21 @@ func (c *Client) adjustPeers() {
 	for i, one := range pd {
 		one.peer.setChoked(i > 3 && !one.state.downloading)
 	}
+}
+
+// dialCandidates returns the peers the tracker told us about that we could connect to, which is those we neither have
+// a connection to nor a connection attempt in flight for, and that aren't blocked.
+func (c *Client) dialCandidates(existing map[string]bool) map[string]int {
+	peerAddressMap := c.tracker.peerAddressesMap()
+	candidates := make(map[string]int, len(peerAddressMap))
+	for addr, port := range peerAddressMap {
+		blocked := c.dispatcher.GateKeeper().IsAddressStringBlocked(addr)
+		c.logger.Debug("managing peers", "address", addr, "port", port, "exists", existing[addr], "blocked", blocked)
+		if !existing[addr] && !blocked {
+			candidates[addr] = port
+		}
+	}
+	return candidates
 }
 
 func (c *Client) dropPeerIfPossible() bool {
