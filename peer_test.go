@@ -963,6 +963,143 @@ func TestChunkRequestsAreCappedToWhatAPeerWillHold(t *testing.T) {
 	}
 }
 
+// TestAPieceReclaimedWhileItsQueueEntryIsSettledKeepsIt verifies that a piece re-claimed while the requests for the
+// previous claim were being built keeps its place in the queue of things to ask for. The decision that an index has
+// nothing left to ask for is made from a snapshot taken before the peer's lock was released, so a claim made in that
+// window — which is every claim, since a piece becomes available the moment it is given back — would otherwise have
+// its just-queued entry deleted, its chunks never asked for, and the claim left to sit idle until maxDownloadStall
+// released it two minutes later.
+func TestAPieceReclaimedWhileItsQueueEntryIsSettledKeepsIt(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+
+	// The piece was given back and re-claimed after the caller looked, so what it saw is no longer what we hold
+	p.queuePieceDownload(0)
+	p.lock.RLock()
+	reclaimed := p.pieces[0]
+	p.lock.RUnlock()
+	c.NotNil(reclaimed)
+	p.dropSettledChunkRequests(map[int]*piece{0: nil})
+	p.lock.RLock()
+	_, queued := p.pendingChunkRequests[0]
+	p.lock.RUnlock()
+	c.True(queued, "a piece claimed again must keep its place in the queue of chunks to ask for")
+
+	// The same goes for a claim that was replaced by a different one rather than merely re-made
+	p.dropSettledChunkRequests(map[int]*piece{0: {}})
+	p.lock.RLock()
+	_, queued = p.pendingChunkRequests[0]
+	p.lock.RUnlock()
+	c.True(queued, "a piece claimed by a later download must keep its place in the queue")
+
+	// And the entry of a claim that really is the one that was settled still goes
+	p.dropSettledChunkRequests(map[int]*piece{0: reclaimed})
+	p.lock.RLock()
+	_, queued = p.pendingChunkRequests[0]
+	p.lock.RUnlock()
+	c.False(queued, "a piece with nothing left to ask for must leave the queue")
+
+	// As does one for a piece we no longer hold at all, which is what a completed or released piece leaves behind
+	p.queueChunkRequests(1)
+	p.dropSettledChunkRequests(map[int]*piece{1: nil})
+	p.lock.RLock()
+	_, queued = p.pendingChunkRequests[1]
+	p.lock.RUnlock()
+	c.False(queued, "a piece we no longer hold must leave the queue")
+}
+
+// TestAStorageReadFailureStopsTheTorrent verifies that storage we can't read isn't left as one connection's problem.
+// Nothing a peer does fixes it, so every other peer asking for data runs into the same failure and is dropped for it,
+// leaving a torrent that goes on running as a seeder which serves no one and says nothing about it beyond a log line
+// per peer.
+func TestAStorageReadFailureStopsTheTorrent(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	defer client.closeRateLimiters()
+	client.file = newWriteOnlyTestStorage(t, client)
+	markTestPiecesAvailable(client, 0)
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+	// The peer isn't choked, so what it asks for is actually served
+	p.setChoked(false)
+
+	requests := make(chan *pieceRequest)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		p.processPieceRequests(requests)
+	}()
+	requests <- &pieceRequest{index: 0, begin: 0, length: chunkSize}
+	close(requests)
+	select {
+	case <-done:
+	case <-time.After(peerMgmtWait):
+		t.Fatal("the request was never processed")
+	}
+
+	c.HasError(client.fatalError(), "storage that can't be read must stop the torrent")
+	checkConnOpen(t, conn, false)
+}
+
+// TestStorageClosedByTheShutdownIsNotAFailure verifies that a request being served as the client shuts down doesn't
+// turn the shutdown into a reported failure. This goroutine isn't tracked by the peer wait group, so it can still be
+// draining requests after the storage file has been taken away, and that is the shutdown it is running behind rather
+// than anything wrong with the storage.
+func TestStorageClosedByTheShutdownIsNotAFailure(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	defer client.closeRateLimiters()
+	markTestPiecesAvailable(client, 0)
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+	// The peer isn't choked, so what it asks for is actually served
+	p.setChoked(false)
+
+	// No storage file at all, which is what the shutdown leaves behind once it has closed it
+	requests := make(chan *pieceRequest)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		p.processPieceRequests(requests)
+	}()
+	requests <- &pieceRequest{index: 0, begin: 0, length: chunkSize}
+	close(requests)
+	select {
+	case <-done:
+	case <-time.After(peerMgmtWait):
+		t.Fatal("the request was never processed")
+	}
+
+	c.NoError(client.fatalError(), "storage the shutdown has already closed is not a failure")
+}
+
+// newWriteOnlyTestStorage creates the storage file for the test torrent and hands back a handle that can only be
+// written to, so that reading a piece from it fails the way an unreadable file would.
+func newWriteOnlyTestStorage(t *testing.T, client *Client) *os.File {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "test"+tfs.DownloadExt)
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.Write(make([]byte, client.torrentFile.Size())); err != nil {
+		t.Fatal(err)
+	}
+	if err = f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if f, err = os.OpenFile(path, os.O_WRONLY, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { xio.CloseIgnoringErrors(f) })
+	return f
+}
+
 // TestChunkRequestsStayWithinWhatWeWouldBanAPeerFor verifies that the burst of requests we put in front of a peer is
 // one this library's own upload side is willing to hold. Two instances of it would otherwise be unable to transfer a
 // torrent whose piece length is above 8MB at all: every attempt has the seeder decide the downloader is flooding it

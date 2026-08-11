@@ -77,6 +77,9 @@ type Client struct {
 	peersWanted              int
 	seedDuration             time.Duration
 	peerMgmtLock             sync.Mutex
+	// admitLock serializes taking a connection on as a peer, so that the check for room, the drop that makes it and
+	// the registration that takes it can't interleave with another connection doing the same.
+	admitLock                sync.Mutex
 	lock                     sync.RWMutex
 	id                       dispatcher.PeerID
 	stopRequested            bool // protected by lock
@@ -169,6 +172,11 @@ func (c *Client) Stop(timeout time.Duration) {
 	}
 	c.stopRequested = true
 	c.lock.Unlock()
+	// Cut short whatever announce is in flight. Every stage of the startup that can take a while looks for the stop
+	// request itself, but an announce can't: it is parked in the HTTP client, which answers to nothing but its own 30
+	// second timeout, and the start announce holds run() while it is. Everything the shutdown owes — the stopped
+	// announce, the close of the storage file, the stopped notification — queues behind it.
+	c.tracker.cancelAnnounce()
 	// The whole stop has to fit within the timeout, so the wait for peer management to return is bounded by it too and
 	// whatever it consumes comes out of what is left for the shutdown itself. Waiting for peer management on its own
 	// schedule first would let a Stop with a short timeout block for far longer than the caller asked for.
@@ -377,7 +385,10 @@ func (c *Client) HandleConnection(conn net.Conn, logger *slog.Logger, _ dispatch
 	infoHash tfs.InfoHash, sendHandshake bool, handshakeDone func(),
 ) {
 	remoteAddr := conn.RemoteAddr()
-	logger = logger.With("torrent_file", torrentLabel(c.torrentFile), "remote_addr", remoteAddr.String())
+	// Only the torrent is added here. Every caller — the dispatcher's dispatch and connectToPeer alike — hands us a
+	// logger that already carries the remote address, so attaching it again would put the key on every line of a peer
+	// session twice.
+	logger = logger.With("torrent_file", torrentLabel(c.torrentFile))
 	logger.Debug("new connection")
 	if !bytes.Equal(infoHash[:], c.torrentFile.InfoHash[:]) {
 		c.dispatcher.GateKeeper().BlockAddress(remoteAddr)
@@ -419,27 +430,9 @@ func (c *Client) HandleConnection(conn net.Conn, logger *slog.Logger, _ dispatch
 	if c.shouldStop() {
 		return
 	}
-	c.lock.RLock()
-	needRoom := len(c.peers) >= c.peersWanted
-	c.lock.RUnlock()
-	if needRoom {
-		if !c.dropPeerIfPossible() {
-			return
-		}
-	}
-	// The peer is registered while holding the peer management lock so that it is either fully tracked before the stop
-	// begins, and therefore closed by closeAllPeers, or not added at all. Adding it to the map first would leave a
-	// stale entry behind, with a write queue nothing would ever drain, when the client is already stopping.
-	c.peerMgmtLock.Lock()
-	if c.peerMgmtStopping {
-		c.peerMgmtLock.Unlock()
+	if !c.admitPeer(conn, p) {
 		return
 	}
-	c.peerWaitGroup.Add(1)
-	c.lock.Lock()
-	c.peers[conn] = p
-	c.lock.Unlock()
-	c.peerMgmtLock.Unlock()
 	defer func() {
 		xio.CloseIgnoringErrors(conn)
 		c.lock.Lock()
@@ -448,6 +441,39 @@ func (c *Client) HandleConnection(conn net.Conn, logger *slog.Logger, _ dispatch
 		c.peerWaitGroup.Done()
 	}()
 	p.processIncomingMessages()
+}
+
+// admitPeer takes the peer on, making room for it by giving up an existing one if every slot is taken, and returns
+// whether it was registered.
+//
+// The whole of the admission — the check for room, the drop that makes it, and the registration that takes it — is
+// serialized, since the three are only meaningful together. Two connections arriving at once would otherwise both read
+// the same count, both settle on the same victim, and both be admitted for the one peer that was actually dropped,
+// which is how a burst of simultaneous incoming connections pushes the peer count past peersWanted. The client's own
+// lock can't stand in for this: choosing a victim asks each peer what it is doing, which takes that peer's lock and the
+// tracker's.
+func (c *Client) admitPeer(conn net.Conn, p *peer) bool {
+	c.admitLock.Lock()
+	defer c.admitLock.Unlock()
+	c.lock.RLock()
+	needRoom := len(c.peers) >= c.peersWanted
+	c.lock.RUnlock()
+	if needRoom && !c.dropPeerIfPossible() {
+		return false
+	}
+	// The peer is registered while holding the peer management lock so that it is either fully tracked before the stop
+	// begins, and therefore closed by closeAllPeers, or not added at all. Adding it to the map first would leave a
+	// stale entry behind, with a write queue nothing would ever drain, when the client is already stopping.
+	c.peerMgmtLock.Lock()
+	defer c.peerMgmtLock.Unlock()
+	if c.peerMgmtStopping {
+		return false
+	}
+	c.peerWaitGroup.Add(1)
+	c.lock.Lock()
+	c.peers[conn] = p
+	c.lock.Unlock()
+	return true
 }
 
 // connectToPeer dials the peer and, if the handshake exchange succeeds, hands the connection off to be serviced. The
@@ -775,11 +801,11 @@ func (c *Client) adjustPeers() {
 		c.logger.Debug("managing peers", "wanted", count, "available", len(candidates))
 		for i := 0; i < count; i++ {
 			added := false
-			for addr, port := range candidates {
-				if !existing[addr] && !c.dispatcher.GateKeeper().IsAddressStringBlocked(addr) &&
-					c.startDial(addr) {
-					go c.connectToPeer(addr, port)
-					existing[addr] = true
+			for _, one := range candidates {
+				if !existing[one.ip] && !c.dispatcher.GateKeeper().IsAddressStringBlocked(one.ip) &&
+					c.startDial(one.ip) {
+					go c.connectToPeer(one.ip, one.port)
+					existing[one.ip] = true
 					added = true
 					break
 				}
@@ -797,14 +823,15 @@ func (c *Client) adjustPeers() {
 
 // dialCandidates returns the peers the tracker told us about that we could connect to, which is those we neither have
 // a connection to nor a connection attempt in flight for, and that aren't blocked.
-func (c *Client) dialCandidates(existing map[string]bool) map[string]int {
-	peerAddressMap := c.tracker.peerAddressesMap()
-	candidates := make(map[string]int, len(peerAddressMap))
-	for addr, port := range peerAddressMap {
-		blocked := c.dispatcher.GateKeeper().IsAddressStringBlocked(addr)
-		c.logger.Debug("managing peers", "address", addr, "port", port, "exists", existing[addr], "blocked", blocked)
-		if !existing[addr] && !blocked {
-			candidates[addr] = port
+func (c *Client) dialCandidates(existing map[string]bool) []peerAddr {
+	known := c.tracker.knownPeers()
+	candidates := make([]peerAddr, 0, len(known))
+	for _, one := range known {
+		blocked := c.dispatcher.GateKeeper().IsAddressStringBlocked(one.ip)
+		c.logger.Debug("managing peers", "address", one.ip, "port", one.port, "exists", existing[one.ip],
+			"blocked", blocked)
+		if !existing[one.ip] && !blocked {
+			candidates = append(candidates, one)
 		}
 	}
 	return candidates
@@ -826,7 +853,16 @@ func (c *Client) dropPeerIfPossible() bool {
 	default:
 		sort.Slice(pd, func(i, j int) bool { return pd[i].worseForDropping(pd[j]) })
 	}
-	xio.CloseIgnoringErrors(pd[0].peer.conn)
+	// The victim leaves the map here rather than only when its own goroutine unwinds, which is what makes the room it
+	// gave up actually available: closing a connection doesn't remove it, and a caller that admitted a peer on the
+	// strength of this drop would otherwise still see the count it started with. It also keeps the next drop from
+	// settling on the same peer all over again — closing an already closed connection succeeds, so nothing about that
+	// says the room had already been taken. The peer's own teardown still runs; deleting an entry twice costs nothing.
+	victim := pd[0].peer
+	c.lock.Lock()
+	delete(c.peers, victim.conn)
+	c.lock.Unlock()
+	xio.CloseIgnoringErrors(victim.conn)
 	return true
 }
 

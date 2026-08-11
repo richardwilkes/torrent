@@ -11,6 +11,7 @@ package torrent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -18,6 +19,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,7 +27,6 @@ import (
 	"time"
 
 	"github.com/richardwilkes/toolbox/v2/check"
-	"github.com/richardwilkes/toolbox/v2/xio"
 	"github.com/richardwilkes/torrent/dispatcher"
 	"github.com/zeebo/bencode"
 )
@@ -35,35 +36,69 @@ import (
 func TestParseCompactPeers(t *testing.T) {
 	c := check.New(t)
 	const unknownAddr = "<unknown>"
+	const unknownPort = 0
 	list := string([]byte{
 		10, 0, 0, 1, 0x1A, 0xE1, // 10.0.0.1:6881
 		10, 0, 0, 2, 0x1A, 0xE2, // 10.0.0.2:6882
 		10, 0, 0, 3, 0x1A, 0xE3, // 10.0.0.3:6883
 	})
 
-	peers := parseCompactPeers(list, unknownAddr)
-	c.Equal(3, len(peers))
-	c.Equal(6881, peers["10.0.0.1"])
-	c.Equal(6882, peers["10.0.0.2"])
-	c.Equal(6883, peers["10.0.0.3"])
+	peers := parseCompactPeers(list, unknownAddr, unknownPort)
+	c.Equal([]peerAddr{
+		{ip: testPeerIP1, port: 6881},
+		{ip: testPeerIP2, port: 6882},
+		{ip: testPeerIP3, port: 6883},
+	}, peers)
 
 	// A truncated final entry is discarded rather than read beyond the end of the list
 	for i := 1; i < 6; i++ {
 		truncated := list[:len(list)-i]
-		c.NotPanics(func() { parseCompactPeers(truncated, unknownAddr) }, "truncated by %d", i)
-		c.Equal(2, len(parseCompactPeers(truncated, unknownAddr)), "truncated by %d", i)
+		c.NotPanics(func() { parseCompactPeers(truncated, unknownAddr, unknownPort) }, "truncated by %d", i)
+		c.Equal(2, len(parseCompactPeers(truncated, unknownAddr, unknownPort)), "truncated by %d", i)
 	}
 
 	// A list too short to hold even one entry yields nothing
 	for i := range 6 {
-		c.NotPanics(func() { parseCompactPeers(list[:i], unknownAddr) }, "length %d", i)
-		c.Equal(0, len(parseCompactPeers(list[:i], unknownAddr)), "length %d", i)
+		c.NotPanics(func() { parseCompactPeers(list[:i], unknownAddr, unknownPort) }, "length %d", i)
+		c.Equal(0, len(parseCompactPeers(list[:i], unknownAddr, unknownPort)), "length %d", i)
 	}
-	c.Equal(0, len(parseCompactPeers("", unknownAddr)))
+	c.Equal(0, len(parseCompactPeers("", unknownAddr, unknownPort)))
 
-	// Our own address is omitted, as are entries without a port
-	c.Equal(2, len(parseCompactPeers(list, "10.0.0.2")))
-	c.Equal(0, len(parseCompactPeers(string([]byte{10, 0, 0, 4, 0, 0}), unknownAddr)))
+	// Only the entry that is actually us is omitted, not every peer sharing our IP, and entries without a port go too
+	c.Equal([]peerAddr{
+		{ip: testPeerIP1, port: 6881},
+		{ip: testPeerIP3, port: 6883},
+	}, parseCompactPeers(list, testPeerIP2, 6882))
+	c.Equal(3, len(parseCompactPeers(list, testPeerIP2, 6889)),
+		"a peer sharing our address on a port of its own is a NAT-mate, not us")
+	c.Equal(0, len(parseCompactPeers(string([]byte{10, 0, 0, 4, 0, 0}), unknownAddr, unknownPort)))
+}
+
+// TestParsePeersKeepsPeersSharingAnAddress verifies that the peers of a swarm that sit behind one NAT, and so share
+// one IP, all survive the parse. Keyed by IP alone, every one of them but the last is lost — and in a swarm that is
+// mostly one NAT that is most of the peers we were given.
+func TestParsePeersKeepsPeersSharingAnAddress(t *testing.T) {
+	c := check.New(t)
+	behindOneNAT := string([]byte{
+		10, 0, 0, 1, 0x1A, 0xE1, // 10.0.0.1:6881
+		10, 0, 0, 1, 0x1A, 0xE2, // 10.0.0.1:6882
+		10, 0, 0, 1, 0x1A, 0xE3, // 10.0.0.1:6883
+	})
+	c.Equal([]peerAddr{
+		{ip: testPeerIP1, port: 6881},
+		{ip: testPeerIP1, port: 6882},
+		{ip: testPeerIP1, port: 6883},
+	}, parseCompactPeers(behindOneNAT, "<unknown>", 0))
+
+	// The dict model says the same thing the long way around
+	in := decodeTestTrackerResponse(t, []any{
+		testPeerDict("", testPeerIP1, 6881),
+		testPeerDict("", testPeerIP1, 6882),
+		testPeerDict("", testPeerIP1, 6883),
+	})
+	peers, err := parsePeers(discardLogger(), in.PeerAddresses, "<unknown>", 0)
+	c.NoError(err)
+	c.Equal(3, len(peers), "peers behind one NAT must not collapse into a single entry")
 }
 
 // TestParsePeersDictModel verifies that a tracker which ignores our request for the compact peer list and answers with
@@ -72,20 +107,18 @@ func TestParseCompactPeers(t *testing.T) {
 func TestParsePeersDictModel(t *testing.T) {
 	c := check.New(t)
 	in := decodeTestTrackerResponse(t, []any{
-		testPeerDict("aaaaaaaaaaaaaaaaaaaa", "10.0.0.1", 6881),
-		testPeerDict("", "10.0.0.2", 6882),
-		testPeerDict("", "10.0.0.3", 0),    // No port, so it is dropped
-		testPeerDict("", "10.0.0.9", 6889), // Our own address, so it is dropped
+		testPeerDict("aaaaaaaaaaaaaaaaaaaa", testPeerIP1, 6881),
+		testPeerDict("", testPeerIP2, 6882),
+		testPeerDict("", testPeerIP3, 0),   // No port, so it is dropped
+		testPeerDict("", "10.0.0.9", 6889), // Our own address and port, so it is dropped
 	})
-	peers, err := parsePeers(discardLogger(), in.PeerAddresses, "10.0.0.9")
+	peers, err := parsePeers(discardLogger(), in.PeerAddresses, "10.0.0.9", 6889)
 	c.NoError(err)
-	c.Equal(2, len(peers))
-	c.Equal(6881, peers["10.0.0.1"])
-	c.Equal(6882, peers["10.0.0.2"])
+	c.Equal([]peerAddr{{ip: testPeerIP1, port: 6881}, {ip: testPeerIP2, port: 6882}}, peers)
 
 	// An empty list is legal and simply yields no peers
 	in = decodeTestTrackerResponse(t, []any{})
-	peers, err = parsePeers(discardLogger(), in.PeerAddresses, "10.0.0.9")
+	peers, err = parsePeers(discardLogger(), in.PeerAddresses, "10.0.0.9", 6889)
 	c.NoError(err)
 	c.Equal(0, len(peers))
 }
@@ -97,11 +130,9 @@ func TestParsePeersCompact(t *testing.T) {
 		10, 0, 0, 1, 0x1A, 0xE1, // 10.0.0.1:6881
 		10, 0, 0, 2, 0x1A, 0xE2, // 10.0.0.2:6882
 	}))
-	peers, err := parsePeers(discardLogger(), in.PeerAddresses, "<unknown>")
+	peers, err := parsePeers(discardLogger(), in.PeerAddresses, "<unknown>", 0)
 	c.NoError(err)
-	c.Equal(2, len(peers))
-	c.Equal(6881, peers["10.0.0.1"])
-	c.Equal(6882, peers["10.0.0.2"])
+	c.Equal([]peerAddr{{ip: testPeerIP1, port: 6881}, {ip: testPeerIP2, port: 6882}}, peers)
 }
 
 // TestParsePeersMalformed verifies that a response without a usable peer list is handled rather than misread. A
@@ -112,16 +143,16 @@ func TestParsePeersMalformed(t *testing.T) {
 	// A response with no "peers" key at all leaves nothing to parse
 	var missing trackerWire
 	c.NoError(bencode.DecodeBytes([]byte("d8:intervali1800ee"), &missing))
-	peers, err := parsePeers(discardLogger(), missing.PeerAddresses, "<unknown>")
+	peers, err := parsePeers(discardLogger(), missing.PeerAddresses, "<unknown>", 0)
 	c.NoError(err)
 	c.Equal(0, len(peers))
 
 	// Neither a string nor a list, so there is nothing sensible to make of it
-	_, err = parsePeers(discardLogger(), decodeTestTrackerResponse(t, 5).PeerAddresses, "<unknown>")
+	_, err = parsePeers(discardLogger(), decodeTestTrackerResponse(t, 5).PeerAddresses, "<unknown>", 0)
 	c.HasError(err)
 
 	// A list holding something other than peer dictionaries
-	_, err = parsePeers(discardLogger(), decodeTestTrackerResponse(t, []any{"10.0.0.1"}).PeerAddresses, "<unknown>")
+	_, err = parsePeers(discardLogger(), decodeTestTrackerResponse(t, []any{testPeerIP1}).PeerAddresses, "<unknown>", 0)
 	c.HasError(err)
 }
 
@@ -137,6 +168,11 @@ const (
 	// failureResponse is a tracker refusing the announce, the one thing in a response that is an error in its own
 	// right rather than something missing from it.
 	failureResponse = "d14:failure reason9:not founde"
+
+	// testPeerIP1, testPeerIP2 and testPeerIP3 stand in for the addresses a tracker hands back in its peer list.
+	testPeerIP1 = "10.0.0.1"
+	testPeerIP2 = "10.0.0.2"
+	testPeerIP3 = "10.0.0.3"
 
 	// testUserAgent stands in for whatever an application puts in the user agent header of its announces.
 	testUserAgent = "torrent-test-agent"
@@ -236,15 +272,18 @@ func TestCheckBencode(t *testing.T) {
 // unbounded response nor talk us into a huge allocation with a few bytes.
 func TestTrackerResponseIsBounded(t *testing.T) {
 	c := check.New(t)
-	var body string
+	// Held behind a lock of its own, since it is written here between announces and read by the handler's goroutine,
+	// which the shared httpClient's keep-alive connections have serving more than one of them
+	response := &testTrackerResponse{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		body, _ := response.get()
 		fmt.Fprint(w, body)
 	}))
 	defer srv.Close()
 	var tr tracker
 
 	// A response declaring a 2GB string, with nothing behind it, must not be allocated for
-	body = unbackedStringResponse
+	response.setBody(unbackedStringResponse)
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
 	_, err := fetchAnnounceResponse(&tr, srv.URL)
@@ -252,23 +291,25 @@ func TestTrackerResponseIsBounded(t *testing.T) {
 	c.HasError(err)
 	const allowed = 64 * 1024 * 1024
 	c.True(after.TotalAlloc-before.TotalAlloc < allowed, "allocated %d bytes for a %d byte response",
-		after.TotalAlloc-before.TotalAlloc, len(body))
+		after.TotalAlloc-before.TotalAlloc, len(unbackedStringResponse))
 
 	// A response larger than the cap is refused rather than read into memory
-	body = "d5:peers" + strconv.Itoa(2*maxTrackerResponseSize) + ":" + strings.Repeat("x", 2*maxTrackerResponseSize) + "e"
+	response.setBody("d5:peers" + strconv.Itoa(2*maxTrackerResponseSize) + ":" +
+		strings.Repeat("x", 2*maxTrackerResponseSize) + "e")
 	_, err = fetchAnnounceResponse(&tr, srv.URL)
 	c.HasError(err)
 
 	// A normal response still decodes
-	body = "d8:intervali1800e8:completei2e10:incompletei1e5:peers6:" + string([]byte{10, 0, 0, 1, 0x1A, 0xE1}) + "e"
+	response.setBody("d8:intervali1800e8:completei2e10:incompletei1e5:peers6:" +
+		string([]byte{10, 0, 0, 1, 0x1A, 0xE1}) + "e")
 	in, err := fetchAnnounceResponse(&tr, srv.URL)
 	c.NoError(err)
 	c.Equal(1800, in.Interval)
 	c.Equal(2, in.Seeders)
 	c.Equal(1, in.Leechers)
-	peers, err := parsePeers(discardLogger(), in.PeerAddresses, "<unknown>")
+	peers, err := parsePeers(discardLogger(), in.PeerAddresses, "<unknown>", 0)
 	c.NoError(err)
-	c.Equal(6881, peers["10.0.0.1"])
+	c.Equal([]peerAddr{{ip: testPeerIP1, port: 6881}}, peers)
 }
 
 // TestAnnounceReportsTransferTotals verifies that the bytes moved on this torrent's behalf reach the tracker. Every
@@ -312,8 +353,7 @@ func TestAnnounceToleratesTheShutdownResponse(t *testing.T) {
 			c := check.New(t)
 			d := newTestDispatcher(t)
 			client, response := newTestTrackerClient(t, d)
-			response.body = one.body
-			response.status = one.status
+			response.set(one.body, one.status)
 			client.tracker.lock.Lock()
 			client.tracker.started = true
 			client.tracker.lock.Unlock()
@@ -356,15 +396,13 @@ func TestAFailedStartStillOwesAStoppedEvent(t *testing.T) {
 			c := check.New(t)
 			d := newTestDispatcher(t)
 			client, response := newTestTrackerClient(t, d)
-			response.body = one.body
-			response.status = one.status
+			response.set(one.body, one.status)
 
 			c.HasError(client.tracker.announce(context.Background(), startedMsg))
 			c.True(client.tracker.hasStarted(), "the tracker answered, so it has us in its swarm")
 
 			// Which means the stopped event is actually sent rather than quietly skipped
-			response.body = noPeersResponse
-			response.status = 0
+			response.set(noPeersResponse, 0)
 			c.NoError(client.tracker.announceStopped())
 			c.False(client.tracker.hasStarted())
 		})
@@ -386,18 +424,18 @@ func TestAnnounceKeepsTheIntervalWhenOneIsNotReturned(t *testing.T) {
 	c := check.New(t)
 	d := newTestDispatcher(t)
 	client, response := newTestTrackerClient(t, d)
-	response.body = noPeersResponse
+	response.setBody(noPeersResponse)
 
 	c.NoError(client.tracker.announce(context.Background(), startedMsg))
 	c.True(client.tracker.hasStarted())
 	c.Equal(30*time.Minute, client.tracker.announceInterval())
 
-	response.body = "d5:peers0:e"
+	response.setBody("d5:peers0:e")
 	c.NoError(client.tracker.announce(context.Background(), "completed"))
 	c.Equal(30*time.Minute, client.tracker.announceInterval())
 
 	// A failure reason is still an error for anything but the shutdown announce
-	response.body = failureResponse
+	response.setBody(failureResponse)
 	c.HasError(client.tracker.announce(context.Background(), ""))
 }
 
@@ -410,23 +448,23 @@ func TestAnnounceKeepsTheTrackerID(t *testing.T) {
 	d := newTestDispatcher(t)
 	client, response := newTestTrackerClient(t, d)
 
-	response.body = "d8:intervali1800e5:peers0:10:tracker id5:abcdee"
+	response.setBody("d8:intervali1800e5:peers0:10:tracker id5:abcdee")
 	c.NoError(client.tracker.announce(context.Background(), startedMsg))
 	c.Contains(client.tracker.announceURL(""), "&trackerid=abcde")
 
 	// A response that simply leaves the key out isn't taking the id away
-	response.body = noPeersResponse
+	response.setBody(noPeersResponse)
 	c.NoError(client.tracker.announce(context.Background(), ""))
 	c.Contains(client.tracker.announceURL(""), "&trackerid=abcde")
 
 	// A new id does replace it, and is escaped for the query it goes into
-	response.body = "d8:intervali1800e5:peers0:10:tracker id5:a b&ce"
+	response.setBody("d8:intervali1800e5:peers0:10:tracker id5:a b&ce")
 	c.NoError(client.tracker.announce(context.Background(), ""))
 	c.Contains(client.tracker.announceURL(""), "&trackerid=a%20b%26c")
 
 	// A tracker that never issues one leaves the parameter out entirely
 	client, response = newTestTrackerClient(t, d)
-	response.body = noPeersResponse
+	response.setBody(noPeersResponse)
 	c.NoError(client.tracker.announce(context.Background(), startedMsg))
 	c.NotContains(client.tracker.announceURL(""), "trackerid")
 }
@@ -515,7 +553,7 @@ func TestAnnounceLogsThroughTheClientLogger(t *testing.T) {
 	defaultSink := captureDefaultLogger(t)
 
 	// The compact peer list, which is what we ask for
-	response.body = "d8:intervali1800e5:peers6:" + string([]byte{10, 0, 0, 1, 0x1A, 0xE1}) + "e"
+	response.setBody("d8:intervali1800e5:peers6:" + string([]byte{10, 0, 0, 1, 0x1A, 0xE1}) + "e")
 	c.NoError(client.tracker.announce(context.Background(), startedMsg))
 	c.Contains(sink.contents(), "url=")
 	c.Contains(sink.contents(), "peers_list=")
@@ -523,10 +561,10 @@ func TestAnnounceLogsThroughTheClientLogger(t *testing.T) {
 	// The dict model, which a tracker is free to answer with instead
 	raw, err := bencode.EncodeBytes(map[string]any{
 		"interval": 1800,
-		"peers":    []any{testPeerDict("", "10.0.0.2", 6882)},
+		"peers":    []any{testPeerDict("", testPeerIP2, 6882)},
 	})
 	c.NoError(err)
-	response.body = string(raw)
+	response.setBody(string(raw))
 	c.NoError(client.tracker.announce(context.Background(), ""))
 	c.Contains(sink.contents(), `msg="announce map"`)
 
@@ -555,7 +593,7 @@ func TestStopWaitsForThePeriodicAnnounce(t *testing.T) {
 	c := check.New(t)
 	d := newTestDispatcher(t)
 	client, response := newTestTrackerClient(t, d)
-	response.body = noPeersResponse
+	response.setBody(noPeersResponse)
 	c.NoError(client.tracker.announce(context.Background(), startedMsg))
 
 	// A stand-in for the periodic announce goroutine, which the stop waits on exactly as it would the real one
@@ -624,13 +662,91 @@ func TestStopAbortsTheAnnounceInFlight(t *testing.T) {
 	c.True(client.tracker.announceStopping())
 }
 
+// TestStopAbortsTheStartAnnounce verifies that a Stop arriving while the start announce is parked on an unresponsive
+// tracker cuts it short, the way it can every later announce. Left uncancelable, run() stays inside the start for up
+// to the HTTP client's 30 second timeout, and the stopped announce, the close of the storage file and the stopped
+// notification all land well past the bound Stop's caller asked for.
+func TestStopAbortsTheStartAnnounce(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+
+	// A tracker that never answers, leaving the announce parked on the response for as long as it is allowed
+	held := make(chan struct{})
+	reached := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		reached <- struct{}{}
+		select {
+		case <-r.Context().Done():
+		case <-held:
+		}
+	}))
+	defer srv.Close()
+	defer close(held)
+	client, _ := newTestTrackerClient(t, d)
+	client.torrentFile.Announce = srv.URL
+
+	returned := make(chan error, 1)
+	go func() { returned <- client.tracker.announceStart() }()
+	select {
+	case <-reached:
+	case <-time.After(peerMgmtWait):
+		t.Fatal("the start announce never reached the tracker")
+	}
+	select {
+	case <-returned:
+		t.Fatal("the start announce came back before the tracker answered it")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Which is what a Stop has to be able to cut short. No wait is asked of it, since this client's run goroutine was
+	// never started and so has nothing to report finishing; signaling the stop is the whole of what is being tested.
+	client.Stop(0)
+	select {
+	case err := <-returned:
+		c.True(errors.Is(err, errStopRequested),
+			"a start announce cut short by the stop is the requested stop, not a torrent that errored: %v", err)
+	case <-time.After(peerMgmtWait):
+		t.Fatal("the start announce was left to run out the HTTP timeout")
+	}
+	c.False(client.tracker.hasStarted(), "an announce that never reached the tracker leaves us out of the swarm")
+}
+
+// TestAnnounceBodyDiscardIsBounded verifies that draining what is left of a tracker's answer takes no more than the cap
+// every response is held to. The drain runs on the paths that never read the body at all — the stopped announce, an
+// answer carrying a failure reason, one already refused for being too large — so an uncapped one hands a hostile
+// tracker a way to keep the announce goroutine streaming discarded bytes until the HTTP client's timeout runs out,
+// which is the whole of what the cap exists to prevent.
+func TestAnnounceBodyDiscardIsBounded(t *testing.T) {
+	c := check.New(t)
+	body := &endlessBody{}
+	discardAndCloseAnnounceBody(body)
+	c.True(body.read <= maxTrackerResponseSize+1, "%d bytes were read of an endless response", body.read)
+	c.True(body.closed, "the body must be closed whatever it held")
+}
+
+// endlessBody stands in for the response of a tracker that never stops sending, counting what was taken from it.
+type endlessBody struct {
+	read   int
+	closed bool
+}
+
+func (b *endlessBody) Read(p []byte) (int, error) {
+	b.read += len(p)
+	return len(p), nil
+}
+
+func (b *endlessBody) Close() error {
+	b.closed = true
+	return nil
+}
+
 // TestPeriodicAnnounceStopsWhenTold verifies that the goroutine returns on the stop and closes the channel the stop
 // waits on, rather than the two waiting on each other.
 func TestPeriodicAnnounceStopsWhenTold(t *testing.T) {
 	c := check.New(t)
 	d := newTestDispatcher(t)
 	client, response := newTestTrackerClient(t, d)
-	response.body = noPeersResponse
+	response.setBody(noPeersResponse)
 
 	client.tracker.startPeriodicAnnounce()
 	client.tracker.lock.RLock()
@@ -656,16 +772,16 @@ func TestAnnounceOvertakenByTheStopIsNotApplied(t *testing.T) {
 	c := check.New(t)
 	d := newTestDispatcher(t)
 	client, response := newTestTrackerClient(t, d)
-	response.body = noPeersResponse
+	response.setBody(noPeersResponse)
 	c.NoError(client.tracker.announce(context.Background(), startedMsg))
-	c.Equal(0, len(client.tracker.peerAddressesMap()))
+	c.Equal(0, len(client.tracker.knownPeers()))
 
 	// The announce is made with a context of its own, standing in for a request that was already on the wire when the
 	// stop was signaled and only came back afterwards
 	client.tracker.stopPeriodicAnnounce()
-	response.body = "d8:intervali3600e8:completei9e5:peers6:" + string([]byte{10, 0, 0, 1, 0x1A, 0xE1}) + "e"
+	response.setBody("d8:intervali3600e8:completei9e5:peers6:" + string([]byte{10, 0, 0, 1, 0x1A, 0xE1}) + "e")
 	c.NoError(client.tracker.announce(context.Background(), ""))
-	c.Equal(0, len(client.tracker.peerAddressesMap()), "the peer list of a swarm we have left must not be taken up")
+	c.Equal(0, len(client.tracker.knownPeers()), "the peer list of a swarm we have left must not be taken up")
 	c.Equal(30*time.Minute, client.tracker.announceInterval())
 	c.Equal(0, client.Status().Seeders)
 }
@@ -677,24 +793,25 @@ func TestAnnounceOvertakenByTheStopIsNotApplied(t *testing.T) {
 func TestParsePeersRejectsUnusablePorts(t *testing.T) {
 	c := check.New(t)
 	in := decodeTestTrackerResponse(t, []any{
-		testPeerDict("", "10.0.0.1", 6881),
-		testPeerDict("", "10.0.0.2", 1),
-		testPeerDict("", "10.0.0.3", math.MaxUint16),
+		testPeerDict("", testPeerIP1, 6881),
+		testPeerDict("", testPeerIP2, 1),
+		testPeerDict("", testPeerIP3, math.MaxUint16),
 		testPeerDict("", "10.0.0.4", 0),
 		testPeerDict("", "10.0.0.5", -1),
 		testPeerDict("", "10.0.0.6", -6881),
 		testPeerDict("", "10.0.0.7", math.MaxUint16+1),
 		testPeerDict("", "10.0.0.8", math.MaxInt32),
 	})
-	peers, err := parsePeers(discardLogger(), in.PeerAddresses, "<unknown>")
+	peers, err := parsePeers(discardLogger(), in.PeerAddresses, "<unknown>", 0)
 	c.NoError(err)
-	c.Equal(3, len(peers))
-	c.Equal(6881, peers["10.0.0.1"])
-	c.Equal(1, peers["10.0.0.2"])
-	c.Equal(math.MaxUint16, peers["10.0.0.3"])
+	c.Equal([]peerAddr{
+		{ip: testPeerIP1, port: 6881},
+		{ip: testPeerIP2, port: 1},
+		{ip: testPeerIP3, port: math.MaxUint16},
+	}, peers)
 	for _, addr := range []string{"10.0.0.4", "10.0.0.5", "10.0.0.6", "10.0.0.7", "10.0.0.8"} {
-		_, exists := peers[addr]
-		c.False(exists, "%s has a port outside the range a dial can use", addr)
+		c.False(slices.ContainsFunc(peers, func(one peerAddr) bool { return one.ip == addr }),
+			"%s has a port outside the range a dial can use", addr)
 	}
 }
 
@@ -844,11 +961,37 @@ func TestTrackerUserAgentIsSafeToSetWhileAnnouncing(t *testing.T) {
 	c.HasPrefix(TrackerUserAgent(), testUserAgent)
 }
 
-// testTrackerResponse is what the stub tracker answers with. Either field may be changed between announces; a status
-// of zero means the ordinary 200.
+// testTrackerResponse is what the stub tracker answers with. It may be changed between announces; a status of zero
+// means the ordinary 200.
+//
+// The fields are written by the test goroutine and read by the httptest handler's, and the shared httpClient keeps its
+// connections alive, so the same server goroutine reads them across requests: without synchronization of their own
+// that is a data race under the Go memory model, which the race detector flags whenever the two happen to overlap.
 type testTrackerResponse struct {
 	body   string
 	status int
+	lock   sync.RWMutex
+}
+
+// set records what the stub tracker will answer the announces that follow with.
+func (r *testTrackerResponse) set(body string, status int) {
+	r.lock.Lock()
+	r.body = body
+	r.status = status
+	r.lock.Unlock()
+}
+
+// setBody records the body the stub tracker will answer the announces that follow with, leaving the status as the
+// ordinary 200.
+func (r *testTrackerResponse) setBody(body string) {
+	r.set(body, 0)
+}
+
+// get returns what the stub tracker should answer the announce it is handling with.
+func (r *testTrackerResponse) get() (body string, status int) {
+	r.lock.RLock()
+	defer r.lock.RUnlock()
+	return r.body, r.status
 }
 
 // newTestTrackerClient returns a client whose announces go to a stub tracker, along with the response that stub will
@@ -857,10 +1000,11 @@ func newTestTrackerClient(t *testing.T, d *dispatcher.Dispatcher) (client *Clien
 	t.Helper()
 	response = &testTrackerResponse{}
 	return newTestTrackerClientWithHandler(t, d, func(w http.ResponseWriter, _ *http.Request) {
-		if response.status != 0 {
-			w.WriteHeader(response.status)
+		body, status := response.get()
+		if status != 0 {
+			w.WriteHeader(status)
 		}
-		fmt.Fprint(w, response.body)
+		fmt.Fprint(w, body)
 	}), response
 }
 
@@ -897,7 +1041,7 @@ func fetchAnnounceResponse(tr *tracker, urlStr string) (*trackerWire, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer xio.DiscardAndCloseIgnoringErrors(resp.Body)
+	defer discardAndCloseAnnounceBody(resp.Body)
 	return readAnnounceResponse(resp)
 }
 

@@ -28,6 +28,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/richardwilkes/toolbox/v2/check"
+	"github.com/richardwilkes/toolbox/v2/xfilepath"
 	"github.com/richardwilkes/torrent/tfs"
 	"github.com/zeebo/bencode"
 )
@@ -607,6 +608,10 @@ func TestStoragePathStaysAValidFilename(t *testing.T) {
 		{label: "escaped characters", name: strings.Repeat("@", 200)},
 		{label: "both", name: strings.Repeat("日@", 100)},
 		{label: "ascii", name: strings.Repeat("a", 400)},
+		// Every case above happens to have the cut land between two escapes rather than inside one: an odd byte in
+		// front of them is what puts the second half of an escape at the truncation point, which is the only thing
+		// that can leave an orphaned '@' behind.
+		{label: "escape split by the cut", name: "a" + strings.Repeat("@", 200)},
 	} {
 		t.Run(one.label, func(t *testing.T) {
 			c := check.New(t)
@@ -620,8 +625,17 @@ func TestStoragePathStaysAValidFilename(t *testing.T) {
 			c.True(len(base) <= maxStorageNameLength, "%d bytes exceeds the limit", len(base))
 			c.True(utf8.ValidString(base), "storage name must be valid UTF-8")
 			c.True(strings.HasSuffix(base, tfs.DownloadExt))
+			// The readable part is what truncation acts on, so the info hash and the extension that follow it have to
+			// come off before it can be judged: with them left on, the name always ends in a hex digit and every
+			// assertion about how it was cut is answered by the suffix rather than by the truncation.
+			readable := strings.TrimSuffix(base, storageSuffix(f))
+			c.NotEqual(base, readable, "the storage name must carry the info hash")
 			// A trailing '@' would be the orphaned first half of an escape pair.
-			c.False(strings.HasSuffix(strings.TrimSuffix(base, tfs.DownloadExt), "@"))
+			c.False(strings.HasSuffix(readable, "@"), "the name was cut in the middle of an escape: %q", readable)
+			// Which is the same thing said in terms of what the escapes are for: a name carrying half of one no longer
+			// describes the name it was made from.
+			c.Equal(readable, xfilepath.SanitizeName(xfilepath.UnsanitizeName(readable)),
+				"the truncated name must still be one that unsanitizes to itself")
 
 			// The real test of all of the above: the filesystem accepts the name.
 			file, err := os.OpenFile(f.StoragePath(), os.O_CREATE|os.O_RDWR, 0o600)
@@ -640,7 +654,13 @@ func TestStoragePathStaysAValidFilename(t *testing.T) {
 // storageName returns the base name the storage file of the given torrent is expected to have: the readable part the
 // caller supplies, followed by the info hash that keeps two torrents from ever being handed the same storage file.
 func storageName(f *tfs.File, readable string) string {
-	return readable + "-" + hex.EncodeToString(f.InfoHash[:]) + tfs.DownloadExt
+	return readable + storageSuffix(f)
+}
+
+// storageSuffix returns everything a storage name carries after its readable part, which is the info hash that keeps
+// two torrents from ever being handed the same storage file, followed by the extension.
+func storageSuffix(f *tfs.File) string {
+	return "-" + hex.EncodeToString(f.InfoHash[:]) + tfs.DownloadExt
 }
 
 // TestStoragePathKeepsCollidingNamesDistinct covers the names that a storage path derived from the torrent's name

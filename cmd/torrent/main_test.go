@@ -546,6 +546,43 @@ func TestExtractFilesDoesNotOverwriteAnExistingFile(t *testing.T) {
 	c.Equal(existing, string(data), "the file already in the current directory must not be overwritten")
 }
 
+// TestAFailedExtractionLeavesNothingBehind verifies that a copy which fails part way takes the file it was writing
+// with it. What it would otherwise leave is a truncated file indistinguishable from a completed extraction, and since
+// the target is created exclusively, every later extraction and every -unpack retry then fails with "file exists" on
+// that partial file — defeating the retry the monitor keeps the storage around for.
+func TestAFailedExtractionLeavesNothingBehind(t *testing.T) {
+	c := check.New(t)
+	t.Chdir(t.TempDir())
+	const target = "partial.bin"
+
+	err := copyToNewFile(target, &failingReader{content: sampleContent})
+	c.HasError(err, "a copy that fails must be reported")
+	_, err = os.Stat(target)
+	c.True(os.IsNotExist(err), "a partial extraction must not be left behind: %v", err)
+
+	// And with nothing in the way, the retry that failure leaves room for succeeds
+	c.NoError(copyToNewFile(target, strings.NewReader(sampleContent)))
+	data, err := os.ReadFile(target)
+	c.NoError(err)
+	c.Equal(sampleContent, string(data))
+}
+
+// failingReader hands back the first few bytes of its content and then fails, standing in for a storage file that
+// can't be read through to the end.
+type failingReader struct {
+	content string
+	read    int
+}
+
+func (r *failingReader) Read(p []byte) (int, error) {
+	if r.read != 0 || len(p) == 0 {
+		return 0, errors.New("the storage cannot be read")
+	}
+	n := copy(p, r.content[:min(len(r.content), 4)])
+	r.read = n
+	return n, nil
+}
+
 // TestUnpackRefusesStorageThatIsNotComplete verifies that unpacking a torrent whose download never finished writes
 // nothing at all. The storage file is preallocated at its full length the moment a download starts, so extracting from
 // it without checking produces full-size files of whatever it happens to hold — zeros, for the most part — and
@@ -662,6 +699,18 @@ func TestSanitizePath(t *testing.T) {
 		{in: "./a/../" + fileB, want: []string{fileB}},
 		{in: "a//" + fileB, want: []string{"a", fileB}},
 		{in: "a/:" + fileB, want: []string{"a", "@6" + fileB}},
+		// Names Windows resolves to a device rather than to a file, which CreateFile answers with the device itself
+		// in any directory, whatever extension the name carries and however it is spelled
+		{in: "CON", want: []string{reservedNameEscape + "CON"}},
+		{in: "nul", want: []string{reservedNameEscape + "nul"}},
+		{in: "COM1.txt", want: []string{reservedNameEscape + "COM1.txt"}},
+		{in: "LPT9/aux.tar.gz", want: []string{reservedNameEscape + "LPT9", reservedNameEscape + "aux.tar.gz"}},
+		{in: "CON /" + fileB, want: []string{reservedNameEscape + "CON ", fileB}},
+		// A name that merely starts with one isn't a device, and neither is one that already carries the escape,
+		// since a literal '@' is written as "@3"
+		{in: "CONSOLE", want: []string{"CONSOLE"}},
+		{in: "COM10", want: []string{"COM10"}},
+		{in: reservedNameEscape + "CON", want: []string{"@37CON"}},
 		// Paths whose components all fall away are sanitized as a single name, the same way ".." already is, since a
 		// caller joining an empty result onto a directory would silently be left with the directory itself
 		{in: "..", want: []string{"@2"}},

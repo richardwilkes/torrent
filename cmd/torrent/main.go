@@ -342,15 +342,40 @@ func extractFile(tf *tfs.File, p, target string) error {
 			return err
 		}
 	}
+	return copyToNewFile(target, r)
+}
+
+// copyToNewFile creates target, which must not already exist, and copies everything r has into it.
+//
+// A copy that fails part way — a full disk, a storage file that can't be read — takes the target with it. What it
+// would otherwise leave behind is a truncated file that is indistinguishable from a completed extraction, and since
+// the target is created exclusively, every later extraction and every -unpack retry then fails with "file exists" on
+// that partial file rather than replacing it. That defeats the retry the monitor deliberately keeps the storage around
+// for and leaves whoever asked for the extraction to work out which file to delete by hand. A close that fails is
+// treated the same way, since data buffered on our behalf may never have reached the disk.
+func copyToNewFile(target string, r io.Reader) error {
 	f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}
 	if _, err = io.Copy(f, r); err != nil {
 		xio.CloseIgnoringErrors(f) // The copy failure is the more meaningful error, so keep it
+		removePartialExtraction(target)
 		return err
 	}
-	return f.Close()
+	if err = f.Close(); err != nil {
+		removePartialExtraction(target)
+		return err
+	}
+	return nil
+}
+
+// removePartialExtraction discards what a failed extraction left at target. A removal that fails itself is logged
+// rather than reported, since the failure that led here is the one worth telling the caller about.
+func removePartialExtraction(target string) {
+	if err := os.Remove(target); err != nil {
+		errs.Log(err)
+	}
 }
 
 // sameFile reports whether both paths name the same existing file. Comparing the paths themselves would miss ones
@@ -380,11 +405,49 @@ func sanitizePath(p string) string {
 	list := make([]string, 0, len(parts))
 	for _, part := range parts {
 		if part != "" && part != "." {
-			list = append(list, xfilepath.SanitizeName(part))
+			list = append(list, sanitizeComponent(part))
 		}
 	}
 	if len(list) == 0 {
-		return xfilepath.SanitizeName(cleaned)
+		return sanitizeComponent(cleaned)
 	}
 	return filepath.Join(list...)
+}
+
+// reservedNameEscape is what a name Windows resolves to a device is prefixed with. It follows xfilepath.SanitizeName's
+// "@n" scheme and uses a number that scheme doesn't, so it can't collide with anything a sanitized name produces: a
+// literal '@' is written as "@3", which leaves "@7" as something only this can put at the front of a name.
+const reservedNameEscape = "@7"
+
+// windowsReservedNames are the names Windows resolves to a device rather than to a file, in the upper case form the
+// comparison is made against.
+var windowsReservedNames = map[string]bool{
+	"CON": true, "PRN": true, "AUX": true, "NUL": true,
+	"COM0": true, "COM1": true, "COM2": true, "COM3": true, "COM4": true,
+	"COM5": true, "COM6": true, "COM7": true, "COM8": true, "COM9": true,
+	"LPT0": true, "LPT1": true, "LPT2": true, "LPT3": true, "LPT4": true,
+	"LPT5": true, "LPT6": true, "LPT7": true, "LPT8": true, "LPT9": true,
+}
+
+// sanitizeComponent makes one component of a path safe to use as a local file name. xfilepath.SanitizeName covers the
+// characters a filesystem refuses, but not the names Windows resolves to a device: CreateFile answers "CON", "NUL",
+// "COM1" and their kind with the device itself, in any directory and whatever extension the name carries, and it does
+// so before the filesystem is consulted at all. A torrent names its own content, so one naming a file that way has an
+// extraction on Windows open the console or the null device — O_EXCL doesn't refuse it, since no file is involved —
+// write the content there, and report a successful extraction with nothing on disk to show for it.
+//
+// The escape is applied on every platform rather than only on Windows, so that the same torrent extracts to the same
+// layout wherever it is unpacked and so that the behavior is testable everywhere.
+func sanitizeComponent(name string) string {
+	sanitized := xfilepath.SanitizeName(name)
+	// Windows resolves the device from what precedes the first '.', ignoring trailing spaces and dots, so "COM1.txt"
+	// and "CON " name devices just as bare "CON" does.
+	device := sanitized
+	if i := strings.IndexByte(device, '.'); i != -1 {
+		device = device[:i]
+	}
+	if windowsReservedNames[strings.ToUpper(strings.TrimRight(device, " "))] {
+		return reservedNameEscape + sanitized
+	}
+	return sanitized
 }

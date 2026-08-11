@@ -104,16 +104,16 @@ type tracker struct {
 }
 
 type trackerLockData struct {
-	have          *fixedbits.Bits
-	downloading   *fixedbits.Bits
-	who           map[int]*peer
-	peerAddresses map[string]int
+	have        *fixedbits.Bits
+	downloading *fixedbits.Bits
+	who         map[int]*peer
 	// periodicAnnounceDone is closed by the periodic announce goroutine as it returns, which is what the shutdown
 	// waits on. It stays nil while no such goroutine exists, so a tracker whose start announce failed has nothing to
 	// wait for.
 	periodicAnnounceDone chan struct{}
 	seedExpires          time.Time
 	trackerID            string
+	peerAddresses        []peerAddr
 	currentState         State
 	totalBytes           int64
 	remainingBytes       int64
@@ -211,7 +211,8 @@ func (t *tracker) requestCompleteAnnounce() {
 	}
 }
 
-func (t *tracker) peerAddressesMap() map[string]int {
+// knownPeers returns the peers the last announce told us about.
+func (t *tracker) knownPeers() []peerAddr {
 	t.lock.RLock()
 	defer t.lock.RUnlock()
 	return t.peerAddresses
@@ -284,11 +285,22 @@ func (t *tracker) hasStarted() bool {
 	return t.started
 }
 
+// announceStart makes the announce that puts us in the swarm and, if it succeeds, starts the periodic announce.
+//
+// It is made with the context the stop cancels, like every announce that follows it. Left uncancelable, a Stop that
+// arrives while this is parked on a slow or unresponsive tracker can't cut it short the way it can every later
+// announce, so run() stays blocked here for up to the HTTP client's 30 second timeout and the stopped announce, the
+// close of the storage file and the stopped notification all land well past the bound the caller asked for. Being cut
+// short that way isn't a failure to report: the stop is what asked for it, so it is reported as the requested stop it
+// is, which is what keeps a torrent shut down while it was starting from being recorded as one that errored.
 func (t *tracker) announceStart() error {
 	if t.hasStarted() {
 		return nil
 	}
-	if err := t.announce(context.Background(), startedMsg); err != nil {
+	if err := t.announce(t.announceCtx, startedMsg); err != nil {
+		if t.announceStopping() {
+			return errStopRequested
+		}
 		return err
 	}
 	if t.isDownloadComplete() {
@@ -409,18 +421,33 @@ func (t *tracker) periodicAnnounce() {
 	}
 }
 
+// peerAddr is one entry of a tracker's peer list.
+type peerAddr struct {
+	ip   string
+	port int
+}
+
+// isSelf returns true if this entry is the address we announced ourselves under. Both halves have to match: a swarm
+// commonly has several peers behind one NAT, and dropping every entry whose IP equals our external address discards
+// those peers rather than only us. An unknown external address matches nothing, which is what the caller passes when
+// the lookup didn't succeed.
+func (a peerAddr) isSelf(externalAddr string, externalPort int) bool {
+	return a.ip == externalAddr && a.port == externalPort
+}
+
 // parseCompactPeers extracts the peer addresses from the compact peer list format, which is a series of 6-byte
 // entries, each holding a 4-byte IPv4 address followed by a 2-byte port. A tracker response is unverified data, so a
-// trailing partial entry is ignored rather than allowed to run off the end of the list. Our own address, which the
-// caller passes in, is omitted, as are entries with no port.
-func parseCompactPeers(value, externalAddr string) map[string]int {
-	peerAddresses := make(map[string]int, len(value)/6)
+// trailing partial entry is ignored rather than allowed to run off the end of the list. Our own address is omitted, as
+// are entries with no port.
+func parseCompactPeers(value, externalAddr string, externalPort int) []peerAddr {
+	peerAddresses := make([]peerAddr, 0, len(value)/6)
 	for i := 0; i+6 <= len(value); i += 6 {
-		addr := net.IPv4(value[i], value[i+1], value[i+2], value[i+3]).String()
-		if addr != externalAddr {
-			if port := int(binary.BigEndian.Uint16([]byte(value[i+4 : i+6]))); port != 0 {
-				peerAddresses[addr] = port
-			}
+		one := peerAddr{
+			ip:   net.IPv4(value[i], value[i+1], value[i+2], value[i+3]).String(),
+			port: int(binary.BigEndian.Uint16([]byte(value[i+4 : i+6]))),
+		}
+		if one.port != 0 && !one.isSelf(externalAddr, externalPort) {
+			peerAddresses = append(peerAddresses, one)
 		}
 	}
 	return peerAddresses
@@ -429,12 +456,14 @@ func parseCompactPeers(value, externalAddr string) map[string]int {
 // parsePeers extracts the peer addresses from a tracker's "peers" value. Although we always ask for the compact form,
 // a tracker is free to ignore that and answer with the dict model instead, so both are accepted: a bencoded string is
 // the compact form and a bencoded list is the dict model. A missing or empty value simply yields no peers. Our own
-// address, which the caller passes in, is omitted, as are entries whose port isn't one that can be dialed. What was
-// found is logged to the caller's logger, since a peer list is per-torrent detail that belongs wherever the rest of
-// that client's logging goes.
-func parsePeers(logger *slog.Logger, raw bencode.RawMessage, externalAddr string) (map[string]int, error) {
+// address is omitted, as are entries whose port isn't one that can be dialed. What was found is logged to the caller's
+// logger, since a peer list is per-torrent detail that belongs wherever the rest of that client's logging goes.
+//
+// The result is a list rather than a map keyed by IP, since several peers of a swarm sharing one IP is the ordinary
+// state of affairs behind a NAT: keyed that way, all but the last of them are lost.
+func parsePeers(logger *slog.Logger, raw bencode.RawMessage, externalAddr string, externalPort int) ([]peerAddr, error) {
 	if len(raw) == 0 {
-		return make(map[string]int), nil
+		return nil, nil
 	}
 	switch {
 	case raw[0] >= '0' && raw[0] <= '9': // A bencoded string, so the compact form
@@ -443,21 +472,24 @@ func parsePeers(logger *slog.Logger, raw bencode.RawMessage, externalAddr string
 			return nil, errs.NewWithCause("unable to decode compact peer list", err)
 		}
 		logger.Debug("announce string", "peers_list", compact)
-		return parseCompactPeers(compact, externalAddr), nil
+		return parseCompactPeers(compact, externalAddr, externalPort), nil
 	case raw[0] == 'l': // A bencoded list, so the dict model
 		var list []peerWire
 		if err := bencode.DecodeBytes(raw, &list); err != nil {
 			return nil, errs.NewWithCause("unable to decode peer list", err)
 		}
 		logger.Debug("announce map", "count", len(list))
-		peerAddresses := make(map[string]int, len(list))
+		peerAddresses := make([]peerAddr, 0, len(list))
 		for _, one := range list {
 			// The dict model carries the port as a bencoded integer, so unlike the compact form — whose ports are
 			// inherently 16 bit — a hostile or buggy tracker can hand us a negative one or one past the end of the port
 			// range. Kept, they become dial attempts that cannot possibly succeed, retried on every peer management
 			// pass until the next announce replaces the list.
-			if one.IP != externalAddr && one.Port > 0 && one.Port <= math.MaxUint16 {
-				peerAddresses[one.IP] = one.Port
+			if one.Port > 0 && one.Port <= math.MaxUint16 {
+				entry := peerAddr{ip: one.IP, port: one.Port}
+				if !entry.isSelf(externalAddr, externalPort) {
+					peerAddresses = append(peerAddresses, entry)
+				}
 			}
 		}
 		return peerAddresses, nil
@@ -473,7 +505,7 @@ func (t *tracker) announce(ctx context.Context, event string) error {
 	if err != nil {
 		return err
 	}
-	defer xio.DiscardAndCloseIgnoringErrors(resp.Body)
+	defer discardAndCloseAnnounceBody(resp.Body)
 	switch event {
 	case startedMsg:
 		// The tracker has us in its swarm from the moment it answers this request, whatever the response then turns
@@ -513,7 +545,8 @@ func (t *tracker) announce(ctx context.Context, event string) error {
 	if extIP := t.client.ExternalIP(); extIP != nil {
 		externalAddr = extIP.String()
 	}
-	peerAddresses, err := parsePeers(t.client.logger, in.PeerAddresses, externalAddr)
+	peerAddresses, err := parsePeers(t.client.logger, in.PeerAddresses, externalAddr,
+		int(t.client.dispatcher.ExternalPort()))
 	if err != nil {
 		return err
 	}
@@ -619,6 +652,17 @@ func (t *tracker) request(ctx context.Context, urlStr string) (*http.Response, e
 		return nil, errs.Wrap(err)
 	}
 	return resp, nil
+}
+
+// discardAndCloseAnnounceBody reads off what is left of a tracker's answer and closes it, taking no more than the cap
+// every announce response is held to. Draining is what lets the connection be reused for the next announce, but the
+// body is untrusted data: an uncapped drain hands a hostile tracker the paths that never read the body at all — the
+// stopped announce, an answer carrying a failure reason, one already refused for being larger than the cap — as a way
+// to keep the announce goroutine streaming discarded bytes until the HTTP client's timeout runs out, which is the
+// whole of what the cap exists to prevent.
+func discardAndCloseAnnounceBody(body io.ReadCloser) {
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, maxTrackerResponseSize)) //nolint:errcheck // Nothing to be done about it
+	xio.CloseIgnoringErrors(body)
 }
 
 // readAnnounceResponse reads and decodes the tracker's answer to an announce.

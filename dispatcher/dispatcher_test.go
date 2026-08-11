@@ -129,8 +129,9 @@ func occupiedPort(t *testing.T) (uint32, net.Listener) {
 func TestStopReleasesResources(t *testing.T) {
 	c := check.New(t)
 	before := settledGoroutineCount(t)
-	d, err := NewDispatcher(FixedExternalIP(nil))
-	c.NoError(err)
+	// Built through the helper, whose failure is fatal: everything below uses the dispatcher, so carrying on from a
+	// failed create would dereference nil and panic, taking the whole test binary down instead of failing this test
+	d := newTestDispatcher(t)
 	d.Stop()
 	c.True(d.InRate.Closed(), "the inbound rate limiter must be closed")
 	c.True(d.OutRate.Closed(), "the outbound rate limiter must be closed")
@@ -147,8 +148,7 @@ func TestStopReleasesResources(t *testing.T) {
 func TestStoppingASecondTimeReportsNoError(t *testing.T) {
 	c := check.New(t)
 	logger, sink := newTestLogger()
-	d, err := NewDispatcher(FixedExternalIP(nil), LogTo(logger))
-	c.NoError(err)
+	d := newTestDispatcher(t, LogTo(logger))
 	d.Stop()
 	d.Stop()
 	c.NotContains(sink.contents(), "level=ERROR", "stopping a dispatcher must not report an error")
@@ -161,7 +161,7 @@ func TestListenerAcceptsWhileTheExternalIPIsBeingDetermined(t *testing.T) {
 	c := check.New(t)
 	release := make(chan struct{})
 	probing := make(chan struct{}, 1)
-	d, err := NewDispatcher(func(one *Dispatcher) error {
+	d := newTestDispatcher(t, func(one *Dispatcher) error {
 		one.lookupExternalIP = func(_ context.Context, _ time.Duration) net.IP {
 			probing <- struct{}{}
 			<-release
@@ -169,8 +169,8 @@ func TestListenerAcceptsWhileTheExternalIPIsBeingDetermined(t *testing.T) {
 		}
 		return nil
 	})
-	c.NoError(err)
-	defer d.Stop()
+	// Released before the dispatcher is stopped, since a lookup still parked would keep the stop waiting. Deferred
+	// rather than left to a cleanup because every deferred call runs ahead of the cleanup the helper registered.
 	defer close(release)
 
 	// The lookup is now under way and will not be completing

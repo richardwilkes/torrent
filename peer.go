@@ -541,12 +541,12 @@ func (p *peer) nextChunkRequests() [][]byte {
 		one.lock.RUnlock()
 	}
 	var requests [][]byte
-	settled := make([]int, 0, len(indexes))
+	settled := make(map[int]*piece, len(indexes))
 	for _, index := range indexes {
 		one, ok := pieces[index]
 		if !ok {
 			// The piece finished, or was given back, while it sat in the queue, so there is nothing left to ask for
-			settled = append(settled, index)
+			settled[index] = nil
 			continue
 		}
 		one.lock.Lock()
@@ -560,18 +560,36 @@ func (p *peer) nextChunkRequests() [][]byte {
 			one.askedTo += size
 		}
 		if one.askedTo >= len(one.buffer) {
-			settled = append(settled, index)
+			settled[index] = one
 		}
 		one.lock.Unlock()
 	}
-	if len(settled) != 0 {
-		p.lock.Lock()
-		for _, index := range settled {
+	p.dropSettledChunkRequests(settled)
+	return requests
+}
+
+// dropSettledChunkRequests takes out of the queue of pieces to ask for those that have nothing left to ask for,
+// which is what the caller decided from a snapshot taken before the lock was released. Each entry names the piece the
+// decision was made about, with a nil piece for one that was already gone, and only an index whose claim is still that
+// same piece is dropped.
+//
+// The re-check is what keeps a piece re-claimed in that window from being silently dropped: queuePieceDownload records
+// the fresh claim and queues it, and deleting the entry the caller saw would take that queuing with it, leaving the
+// piece's chunks never asked for and the claim to sit idle until maxDownloadStall releases it two minutes later. A
+// piece has every chance to be re-claimed there, since it becomes available the moment it is given back — by
+// clearExpiredDownloads, which removes the piece but leaves the queue entry behind, or by the completion that takes it
+// out of the map.
+func (p *peer) dropSettledChunkRequests(settled map[int]*piece) {
+	if len(settled) == 0 {
+		return
+	}
+	p.lock.Lock()
+	for index, one := range settled {
+		if p.pieces[index] == one {
 			delete(p.pendingChunkRequests, index)
 		}
-		p.lock.Unlock()
 	}
-	return requests
+	p.lock.Unlock()
 }
 
 // newStateMessage creates one of the messages that consists of nothing more than its ID.
@@ -1167,9 +1185,16 @@ func (p *peer) processPieceRequests(in chan *pieceRequest) {
 			_, err = f.ReadAt(buffer[13:], p.client.torrentFile.OffsetOf(req.index)+int64(req.begin))
 		}
 		if err != nil {
-			errs.LogTo(p.logger, errs.NewWithCause("unable to read piece", err), "index", req.index, "begin", req.begin, "length", req.length)
+			readErr := errs.NewWithCause("unable to read piece", err)
+			errs.LogTo(p.logger, readErr, "index", req.index, "begin", req.begin, "length", req.length)
 			xio.CloseIgnoringErrors(p.conn)
 			process = false
+			// Nothing a peer can do fixes storage we can't read, so this can't be left as one connection's problem:
+			// every other peer asking for data runs into the same failure and is dropped for it, leaving a torrent
+			// that goes on running as a seeder which serves no one, with nothing said about it beyond a log line per
+			// peer. The torrent is stopped with the error instead, the same way an unwritable storage stops it.
+			// Storage the shutdown has already closed is not a failure and is filtered out by failWithStorageError.
+			p.client.failWithStorageError(readErr)
 			continue
 		}
 		p.writeQueue <- buffer

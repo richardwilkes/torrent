@@ -367,7 +367,7 @@ func TestLeastUsefulPeerIsRotatedOut(t *testing.T) {
 	idleConn, idle := newTestPeerFromHost(t, client, testPeerHost2, testPeerPort)
 	defer xio.CloseIgnoringErrors(idleConn)
 	host, port, accepted := listenForTestDials(t)
-	setTrackerPeerAddresses(client, map[string]int{host: port})
+	setTrackerPeerAddresses(client, peerAddr{ip: host, port: port})
 	downloading.lock.Lock()
 	downloading.peerChoking = false
 	downloading.lock.Unlock()
@@ -407,7 +407,7 @@ func TestPeerIsNotRotatedOutWithoutAnAlternate(t *testing.T) {
 	checkConnOpen(t, conn2, true)
 
 	// The only peer the tracker knows about is one we're already connected to, which is no alternate either
-	setTrackerPeerAddresses(client, map[string]int{testPeerHost1: testPeerPort})
+	setTrackerPeerAddresses(client, peerAddr{ip: testPeerHost1, port: testPeerPort})
 	client.adjustPeers()
 	checkConnOpen(t, conn1, true)
 	checkConnOpen(t, conn2, true)
@@ -429,7 +429,7 @@ func TestPeersAreNotRotatedOutWhileSeeding(t *testing.T) {
 	conn2, _ := newTestPeerFromHost(t, client, testPeerHost2, testPeerPort)
 	defer xio.CloseIgnoringErrors(conn2)
 	host, port, accepted := listenForTestDials(t)
-	setTrackerPeerAddresses(client, map[string]int{host: port})
+	setTrackerPeerAddresses(client, peerAddr{ip: host, port: port})
 	markTestClientSeeding(client)
 	c.True(client.tracker.isDownloadComplete())
 	c.False(client.tracker.isSeedingComplete())
@@ -458,7 +458,7 @@ func TestSeedingFillsFreePeerSlots(t *testing.T) {
 	conn2, _ := newTestPeerFromHost(t, client, testPeerHost2, testPeerPort)
 	defer xio.CloseIgnoringErrors(conn2)
 	host, port, accepted := listenForTestDials(t)
-	setTrackerPeerAddresses(client, map[string]int{host: port})
+	setTrackerPeerAddresses(client, peerAddr{ip: host, port: port})
 	markTestClientSeeding(client)
 
 	client.adjustPeers()
@@ -482,7 +482,7 @@ func markTestClientSeeding(client *Client) {
 }
 
 // setTrackerPeerAddresses stands in for the peer addresses an announce would have given the tracker.
-func setTrackerPeerAddresses(client *Client, addresses map[string]int) {
+func setTrackerPeerAddresses(client *Client, addresses ...peerAddr) {
 	client.tracker.lock.Lock()
 	client.tracker.peerAddresses = addresses
 	client.tracker.lock.Unlock()
@@ -519,7 +519,7 @@ func TestBusyPeersAreNotRotatedOut(t *testing.T) {
 		}
 	}()
 	host, port, accepted := listenForTestDials(t)
-	setTrackerPeerAddresses(client, map[string]int{host: port})
+	setTrackerPeerAddresses(client, peerAddr{ip: host, port: port})
 
 	client.adjustPeers()
 	for _, conn := range conns {
@@ -568,7 +568,7 @@ func TestPeerRankingDoesNotRacePeerCounters(t *testing.T) {
 	// The rotation ranking is only sorted when the tracker has given us an alternate we aren't already connected to.
 	// Without one, adjustPeers never reaches worseForRotation at all and a reintroduced unsynchronized read of the
 	// counters there would sail through this test, so the premise is checked rather than assumed.
-	setTrackerPeerAddresses(client, map[string]int{testDialHost: testPeerPort})
+	setTrackerPeerAddresses(client, peerAddr{ip: testDialHost, port: testPeerPort})
 	pd := make([]*peerData, 0, len(peers))
 	for _, p := range peers {
 		pd = append(pd, &peerData{peer: p})
@@ -609,7 +609,14 @@ func TestPeerRankingDoesNotRacePeerCounters(t *testing.T) {
 		p.lock.Unlock()
 		client.tracker.clearDownload(i, p)
 	}
+	// A drop takes its victim out of the map, so the peers are put back each time around: what is being raced against
+	// is the ranking, and it only has something to sort while there is more than one peer to choose between.
 	for range 10 {
+		client.lock.Lock()
+		for _, p := range peers {
+			client.peers[p.conn] = p
+		}
+		client.lock.Unlock()
 		c.True(client.dropPeerIfPossible())
 	}
 	close(stop)
@@ -689,7 +696,7 @@ func TestDialInFlightIsNotDialedAgain(t *testing.T) {
 	d := newTestDispatcher(t)
 	client := newTestClient(d)
 	host, port, accepted := listenForTestDials(t)
-	setTrackerPeerAddresses(client, map[string]int{host: port})
+	setTrackerPeerAddresses(client, peerAddr{ip: host, port: port})
 
 	// An attempt from an earlier adjustment is still in flight, so this adjustment must not make another
 	c.True(client.startDial(host))
@@ -1375,6 +1382,107 @@ func waitForDownloadsCleared(t *testing.T, p *peer) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+}
+
+// TestPeerLoggingNamesTheRemoteAddressOnce verifies that a peer session's logging doesn't carry the remote address
+// twice. Both callers — the dispatcher's dispatch and connectToPeer — attach it before handing the logger over, so
+// adding it again in HandleConnection puts the key on every line the session produces a second time.
+func TestPeerLoggingNamesTheRemoteAddressOnce(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	sink := &logSink{}
+	conn, remote := newTestConnPair(t)
+	// The logger the callers hand over already names the remote
+	logger := slog.New(slog.NewTextHandler(sink, &slog.HandlerOptions{Level: slog.LevelDebug})).With("remote_addr",
+		remote.RemoteAddr().String())
+
+	// An info hash that isn't ours, so the connection is refused as soon as its arrival has been logged
+	otherHash := client.torrentFile.InfoHash
+	otherHash[0]++
+	var extensions dispatcher.ProtocolExtensions
+	waitFor(t, "HandleConnection", func() {
+		client.HandleConnection(remote, logger, extensions, otherHash, false, nil)
+	})
+	xio.CloseIgnoringErrors(conn)
+
+	logged := sink.contents()
+	c.Contains(logged, `msg="new connection"`)
+	c.Equal(1, strings.Count(logged, "remote_addr="), "the remote address must appear once per line: %s", logged)
+}
+
+// TestSimultaneousConnectionsCannotOverfillThePeerSlots verifies that a burst of connections arriving at once can't
+// push the peer count past peersWanted. Each of them checks for room, gives a peer up to make some and then registers
+// itself, and those three steps only mean anything together: left to interleave, every one of them reads the same
+// count, settles on the same victim — closing an already closed connection succeeds, so nothing about that says the
+// room has already been taken — and is admitted for the one peer that was actually dropped.
+func TestSimultaneousConnectionsCannotOverfillThePeerSlots(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	// An ID of our own, since each remote presents one of its own below and a client whose ID is still the zero value
+	// would take the first of them for a connection to ourselves
+	for i := range client.id {
+		client.id[i] = urlQuerySafeBytes[i%len(urlQuerySafeBytes)]
+	}
+
+	// One peer, which is all we want, and it is idle, so it is something a new connection may be given room by
+	client.peersWanted = 1
+	existing, _ := newTestPeerFromHost(t, client, testPeerHost1, testPeerPort)
+	defer xio.CloseIgnoringErrors(existing)
+
+	const arriving = 4
+	var wg sync.WaitGroup
+	var extensions dispatcher.ProtocolExtensions
+	for i := range arriving {
+		conn, remote := newTestConnPair(t)
+		var peerID dispatcher.PeerID
+		// An ID of the remote's own, and a different one for each of them, since a peer presenting ours is refused
+		for j := range peerID {
+			peerID[j] = urlQuerySafeBytes[(j+i+1)%len(urlQuerySafeBytes)]
+		}
+		_, err := conn.Write(peerID[:])
+		c.NoError(err)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			client.HandleConnection(remote, client.logger, extensions, client.torrentFile.InfoHash, false, nil)
+		}()
+		t.Cleanup(func() { xio.CloseIgnoringErrors(conn) })
+	}
+
+	// The ones that lost their slot again are still unwinding, so the count is given a moment to settle
+	deadline := time.Now().Add(peerMgmtWait)
+	count := len(client.currentPeers())
+	for count > client.peersWanted && !time.Now().After(deadline) {
+		time.Sleep(time.Millisecond)
+		count = len(client.currentPeers())
+	}
+	c.True(count <= client.peersWanted, "%d peers were admitted, but only %d were wanted", count, client.peersWanted)
+	c.Equal(1, count, "a connection that had room made for it must still be taken on")
+
+	client.closeAllPeers(peerMgmtStopWait)
+	wg.Wait()
+}
+
+// TestDroppingAPeerFreesItsSlotAtOnce verifies that the peer given up to make room leaves the map where it is dropped
+// rather than only when its own goroutine unwinds. Closing a connection doesn't remove it, so a caller admitted on the
+// strength of the drop would otherwise still see the count it started with.
+func TestDroppingAPeerFreesItsSlotAtOnce(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	conn, p := newTestPeerFromHost(t, client, testPeerHost1, testPeerPort)
+	defer xio.CloseIgnoringErrors(conn)
+	c.Equal(1, len(client.currentPeers()))
+
+	c.True(client.dropPeerIfPossible(), "an idle peer must be one that can be given up")
+	c.Equal(0, len(client.currentPeers()), "the dropped peer must not still be occupying a slot")
+	checkConnOpen(t, conn, false)
+
+	// And with nothing left to give up, there is no room to be had
+	c.False(client.dropPeerIfPossible(), "a peer that has already been dropped must not be dropped a second time")
+	c.NotNil(p)
 }
 
 // peerManagementDone returns the channel that will be closed when peer management has stopped.
