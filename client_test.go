@@ -353,6 +353,42 @@ func TestLeastUsefulPeerIsRotatedOut(t *testing.T) {
 	checkConnOpen(t, idleConn, false)
 }
 
+// TestBusyPeersAreNotRotatedOut verifies that no peer is given up when every one of them is actively downloading a
+// piece for us. Fewer peers than concurrent downloads leaves that state with spare download slots, so the rotation is
+// reached with nothing worth rotating out: closing one there discards its partial piece and leaves its host free to be
+// dialed again on the next pass, since a connection we closed ourselves isn't blocked, repeating the whole cycle on
+// every adjustment.
+func TestBusyPeersAreNotRotatedOut(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+
+	// Every peer slot is taken, so an alternate could only be added by giving one of the peers up, and there are still
+	// download slots to spare
+	client.peersWanted = 2
+	c.True(client.peersWanted < client.concurrentDownloads)
+	conns := make([]net.Conn, 0, client.peersWanted)
+	for i := range cap(conns) {
+		conn, p := newTestPeer(t, client)
+		conns = append(conns, conn)
+		p.lock.Lock()
+		p.peerChoking = false
+		p.lock.Unlock()
+		p.queuePieceDownload(i)
+		c.True(p.updateInterest().downloading)
+	}
+	defer func() {
+		for _, conn := range conns {
+			xio.CloseIgnoringErrors(conn)
+		}
+	}()
+
+	client.adjustPeers()
+	for _, conn := range conns {
+		checkConnOpen(t, conn, true)
+	}
+}
+
 // TestPeerRankingDoesNotRacePeerCounters verifies that the peer rankings take the byte counts from the state snapshot
 // made under each peer's lock, rather than reading them from the peer while its own goroutines are updating them. The
 // race is only detected when the tests are run with -race.
@@ -517,16 +553,39 @@ func listenForTestDials(t *testing.T) (host string, port int, accepted chan net.
 }
 
 // unusedTestPort returns a loopback address and a port on it that nothing is listening on, so that a dial to it is
-// refused rather than left waiting.
+// refused rather than left waiting. The port has to be released before it can be handed back, which leaves a window in
+// which another process, or another test binary running at the same time, can bind it; a caller that dialed such a port
+// would connect and then sit through a handshake exchange instead of being refused, so the port is checked and a
+// different one taken if it turns out to have been claimed.
 func unusedTestPort(t *testing.T) (host string, port int) {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	for range 10 {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		host, port = testAddrHostAndPort(t, listener.Addr())
+		xio.CloseIgnoringErrors(listener)
+		var conn net.Conn
+		if conn, err = net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), peerMgmtWait); err != nil {
+			return host, port
+		}
+		xio.CloseIgnoringErrors(conn)
 	}
-	host, port = testAddrHostAndPort(t, listener.Addr())
-	xio.CloseIgnoringErrors(listener)
-	return host, port
+	t.Fatal("unable to find a port that nothing is listening on")
+	return "", 0
+}
+
+// TestUnusedTestPortIsRefused verifies the premise the failed dial test rests on: that nothing answers on the port it
+// is given, so the dial made to it fails rather than reaching a handshake with whatever did answer.
+func TestUnusedTestPortIsRefused(t *testing.T) {
+	c := check.New(t)
+	host, port := unusedTestPort(t)
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), peerMgmtWait)
+	if err == nil {
+		xio.CloseIgnoringErrors(conn)
+	}
+	c.HasError(err, "something was listening on the port")
 }
 
 // testAddrHostAndPort splits an address into the host and port a dial takes.
@@ -597,12 +656,17 @@ func TestStoppedNotification(t *testing.T) {
 	notifier := make(chan *Client, 2)
 	client.stoppedNotifier = notifier
 
+	// Bounded, so that a delivery that regresses fails the test rather than hanging the suite
 	client.notifyStopped(peerMgmtWait)
-	c.Equal(client, <-notifier)
+	select {
+	case one := <-notifier:
+		c.Equal(client, one)
+	case <-time.After(peerMgmtWait):
+		t.Fatal("the stopped notification was not delivered")
+	}
 
-	// Both the run and the timed-out Stop paths must leave it at the single notification already delivered
+	// A later attempt must leave it at the single notification already delivered
 	client.notifyStopped(peerMgmtWait)
-	client.notifyStopped(0)
 	select {
 	case <-notifier:
 		t.Fatal("a second stopped notification was delivered")
@@ -620,22 +684,32 @@ func TestStoppedNotificationDoesNotBlockForever(t *testing.T) {
 	waitFor(t, "notifyStopped", func() { client.notifyStopped(100 * time.Millisecond) })
 }
 
-// TestStoppedNotificationIsNotLost verifies that the non-blocking attempt made when Stop times out doesn't consume the
-// notification when there is nothing there to accept it.
-func TestStoppedNotificationIsNotLost(t *testing.T) {
+// TestTimedOutStopDoesNotNotify verifies that a Stop that gives up waiting doesn't report that we've stopped. The
+// shutdown is still under way at that point: peers may still be writing to the storage file and the stopped announce
+// may not have been made, so a consumer acting on the notification could take the file away from underneath us. The
+// notification the client makes once it has actually finished must also still be delivered.
+func TestTimedOutStopDoesNotNotify(t *testing.T) {
 	c := check.New(t)
 	d := newTestDispatcher(t)
 	client := newTestClient(d)
-	notifier := make(chan *Client) // Unbuffered, with nothing listening yet
+	notifier := make(chan *Client, 2) // Buffered, as the API expects, so a notification would always be accepted
 	client.stoppedNotifier = notifier
 
-	waitFor(t, "notifyStopped", func() { client.notifyStopped(0) })
-	go client.notifyStopped(peerMgmtWait)
+	// Nothing will ever close the stopped channel, so this Stop can only end by timing out
+	waitFor(t, "Stop", func() { client.Stop(100 * time.Millisecond) })
+	select {
+	case <-notifier:
+		t.Fatal("a stopped notification was delivered while the shutdown was still in progress")
+	default:
+	}
+
+	// The notification made once the client has finished is still delivered
+	client.notifyStopped(peerMgmtWait)
 	select {
 	case one := <-notifier:
 		c.Equal(client, one)
 	case <-time.After(peerMgmtWait):
-		t.Fatal("the stopped notification was lost")
+		t.Fatal("the stopped notification was never delivered")
 	}
 }
 
@@ -647,8 +721,14 @@ func TestDownloadCompleteNotification(t *testing.T) {
 	notifier := make(chan *Client, 2)
 	client.downloadCompleteNotifier = notifier
 
+	// Bounded, so that a delivery that regresses fails the test rather than hanging the suite
 	client.tracker.setState(Seeding)
-	c.Equal(client, <-notifier)
+	select {
+	case one := <-notifier:
+		c.Equal(client, one)
+	case <-time.After(peerMgmtWait):
+		t.Fatal("the download complete notification was not delivered")
+	}
 
 	// Leaving the seeding state and returning to it must not produce a second notification
 	client.tracker.setState(Downloading)
@@ -667,9 +747,18 @@ func TestDownloadCompleteNotification(t *testing.T) {
 func TestDownloadCompleteNotificationDoesNotBlockForever(t *testing.T) {
 	d := newTestDispatcher(t)
 	client := newTestClient(d)
-	client.downloadCompleteNotifier = make(chan *Client) // Unbuffered, with nothing listening
+	notifier := make(chan *Client) // Unbuffered, with nothing listening
+	client.downloadCompleteNotifier = notifier
 
 	waitFor(t, "setState", func() { client.tracker.setState(Seeding) })
+
+	// Accept the notification the fallback goroutine is holding onto, which would otherwise leave it parked for the
+	// full downloadCompleteNotifyTimeout after the test has finished
+	select {
+	case <-notifier:
+	case <-time.After(peerMgmtWait):
+		t.Fatal("the download complete notification was never offered")
+	}
 }
 
 // TestDownloadCompleteNotificationReachesALateConsumer verifies that the notification isn't thrown away just because
@@ -722,7 +811,10 @@ func TestStorageIsNotClearedOutFromUnderPeers(t *testing.T) {
 	go func() {
 		defer close(fed)
 		defer close(requests)
-		for client.storageFile() != nil {
+		// Bounded by a deadline as well as by the file going away, so that a regression which leaves the file in
+		// place fails the test rather than feeding requests forever and hanging the suite
+		deadline := time.Now().Add(peerMgmtWait)
+		for client.storageFile() != nil && time.Now().Before(deadline) {
 			requests <- &pieceRequest{index: 1, length: chunkSize}
 		}
 	}()
@@ -761,6 +853,11 @@ func TestPeerIsNotLeftBehindWhileStopping(t *testing.T) {
 	c := check.New(t)
 	d := newTestDispatcher(t)
 	client := newTestClient(d)
+	// An ID of our own, since the remote presents one of all zeros: leaving ours as the zero value it is created with
+	// makes the connection look like one to ourselves, which is refused before the stopping check is ever reached
+	for i := range client.id {
+		client.id[i] = urlQuerySafeBytes[i%len(urlQuerySafeBytes)]
+	}
 	client.closeAllPeers()
 
 	conn, remote := newTestConnPair(t)
@@ -775,6 +872,8 @@ func TestPeerIsNotLeftBehindWhileStopping(t *testing.T) {
 		client.HandleConnection(remote, client.logger, extensions, client.torrentFile.InfoHash, false)
 	})
 	c.Equal(0, len(client.currentPeers()))
+	c.False(d.GateKeeper().IsAddressBlocked(remote.RemoteAddr()),
+		"the connection was refused by a check other than the one for the client stopping")
 }
 
 // TestConnectionToOurselvesIsRefused verifies that a remote presenting our own peer ID is severed rather than being

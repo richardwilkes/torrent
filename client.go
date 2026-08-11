@@ -158,31 +158,23 @@ func (c *Client) Stop(timeout time.Duration) {
 	c.closeAllPeers()
 	select {
 	case <-time.After(timeout):
-		// Notify that we've stopped, but only if we won't block
-		c.notifyStopped(0)
+		// The shutdown is still under way, so no notification is made here. Peers may still be writing to the storage
+		// file and the stopped announce may not have been sent yet, so a consumer told that we've stopped could act on
+		// state we still hold. The notification is left to run(), which delivers it once the client has actually
+		// finished.
+		c.logger.Warn("timed out waiting for the torrent to stop", "timeout", timeout)
 	case <-c.stoppedChan:
 	}
 }
 
 // notifyStopped delivers the stopped notification, if one was asked for and one hasn't been delivered already. Waits
 // up to 'wait' for it to be accepted, so that a consumer that is no longer listening can't leave us blocked forever.
-// A 'wait' of zero or less means the notification is only delivered if it can be done without blocking.
 func (c *Client) notifyStopped(wait time.Duration) {
 	if c.stoppedNotifier == nil {
 		return
 	}
 	c.lock.Lock()
 	if c.stoppedNotified {
-		c.lock.Unlock()
-		return
-	}
-	if wait <= 0 {
-		// Only claim the notification if it can be handed off right now, so that a later attempt can still deliver it
-		select {
-		case c.stoppedNotifier <- c:
-			c.stoppedNotified = true
-		default:
-		}
 		c.lock.Unlock()
 		return
 	}
@@ -690,11 +682,19 @@ func (c *Client) adjustPeers() {
 		existing := c.hostsInUse(pd)
 		count := min(c.peersWanted-len(pd), 4)
 		if count < 1 && len(pd) > 0 {
-			// Find one to disconnect so we can add an alternate
+			// Find one to disconnect so we can add an alternate, but only if the least useful of them isn't one that
+			// is actively downloading a piece for us. Every slot can be occupied by such a peer while we still have
+			// spare download slots (peersWanted below concurrentDownloads, for instance), and closing one of them
+			// throws away its partial piece and frees the host to be redialed on the next pass, since a connection we
+			// closed ourselves isn't blocked. That would repeat every adjustment, crippling the transfer rather than
+			// improving it. Peers that are stalled while free to send have already been dropped above, so a peer that
+			// is downloading and isn't being choked is one that is delivering data.
 			sort.Slice(pd, func(i, j int) bool { return pd[i].worseForRotation(pd[j], now) })
-			xio.CloseIgnoringErrors(pd[0].peer.conn)
-			pd = pd[1:]
-			count = 1
+			if !pd[0].state.downloading || pd[0].state.peerChoking {
+				xio.CloseIgnoringErrors(pd[0].peer.conn)
+				pd = pd[1:]
+				count = 1
+			}
 		}
 		slog.Debug("managing peers", "wanted", count)
 		if count > 0 {
