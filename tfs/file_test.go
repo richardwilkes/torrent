@@ -260,6 +260,92 @@ func bstr(s string) string {
 	return strconv.Itoa(len(s)) + ":" + s
 }
 
+// nestedLists returns a value made of depth lists nested one inside the next.
+func nestedLists(depth int) any {
+	var v any = "x"
+	for range depth {
+		v = []any{v}
+	}
+	return v
+}
+
+// torrentWithNesting bencodes a valid torrent carrying an extra key whose value nests to the given depth. The
+// torrent's own dictionary is the first level, so the depth of the result is one more than what is asked for here.
+func torrentWithNesting(t *testing.T, depth int) []byte {
+	t.Helper()
+	data, err := bencode.EncodeBytes(map[string]any{
+		"announce": "http://example.com/announce",
+		"info":     singleFileInfo(),
+		"nested":   nestedLists(depth),
+	})
+	check.New(t).NoError(err)
+	return data
+}
+
+// TestNewFileFromBytesRejectsDeeplyNestedData covers the depth of the bencoded structure itself. The decoder recurses
+// once per level of nesting, so a small file of nothing but list heads used to run the goroutine stack out and take
+// the whole process down with a stack overflow, which is a fatal runtime error that no recover() can catch. This test
+// reaching its end at all is most of what it asserts.
+func TestNewFileFromBytesRejectsDeeplyNestedData(t *testing.T) {
+	c := check.New(t)
+
+	// Nesting right up to the limit is still accepted.
+	f, err := tfs.NewFileFromBytes(torrentWithNesting(t, tfs.MaxNestingDepth-1))
+	c.NoError(err)
+	c.Equal(int64(20), f.Size())
+
+	// One level beyond it is not.
+	_, err = tfs.NewFileFromBytes(torrentWithNesting(t, tfs.MaxNestingDepth))
+	c.HasError(err)
+
+	// Nesting deep enough to overflow the stack is rejected no matter what leads up to it: the depth is measured
+	// before the decoder is handed the bytes, and the measurement can't be shaken off by a token in front of it.
+	deep := strings.Repeat("l", 1000000)
+	for _, one := range []struct {
+		name string
+		data string
+	}{
+		{name: "nothing but list heads", data: deep},
+		{name: "dictionaries", data: strings.Repeat("d1:x", 1000000)},
+		{name: "after a string", data: "l" + bstr("announce") + deep},
+		{name: "after an integer", data: "li17e" + deep},
+		{name: "inside the info dictionary", data: "d" + bstr("info") + "d" + bstr("name") + deep},
+		{name: "mixed", data: strings.Repeat("dl", 500000)},
+	} {
+		t.Run(one.name, func(_ *testing.T) {
+			_, decodeErr := tfs.NewFileFromBytes([]byte(one.data))
+			c.HasError(decodeErr, one.name)
+		})
+	}
+}
+
+// endlessReader stands in for a reader with nothing bounding it, such as a network stream, reporting every byte asked
+// of it as delivered.
+type endlessReader struct {
+	read int
+}
+
+func (r *endlessReader) Read(p []byte) (int, error) {
+	r.read += len(p)
+	return len(p), nil
+}
+
+// TestNewFileFromReaderStopsAtTheSizeLimit verifies the public entry point that takes a reader can't be driven to
+// arbitrary memory consumption by a caller handing it an untrusted stream.
+func TestNewFileFromReaderStopsAtTheSizeLimit(t *testing.T) {
+	c := check.New(t)
+
+	f, err := tfs.NewFileFromReader(bytes.NewReader(encodeTorrent(t, singleFileInfo())))
+	c.NoError(err)
+	c.Equal(int64(20), f.Size())
+
+	r := &endlessReader{}
+	_, err = tfs.NewFileFromReader(r)
+	c.HasError(err)
+	// One byte beyond the limit is read, which is what proves the file is over it rather than exactly at it.
+	c.Equal(tfs.MaxTorrentFileLength+1, r.read)
+}
+
 // torrentWithUnsortedInfoKeys returns a bencoded torrent whose info dictionary carries its keys in an order other
 // than the sorted one, along with the exact bytes of that dictionary. Decoders accept it as-is, but re-encoding the
 // decoded form sorts the keys, changing the bytes an info hash would be taken over.
@@ -280,6 +366,66 @@ func torrentWithUnsortedInfoKeys() (torrent, info []byte) {
 	buf.Write(infoBuf.Bytes())
 	buf.WriteString("e")
 	return buf.Bytes(), infoBuf.Bytes()
+}
+
+// infoWithPath returns a valid two-file info dictionary whose first entry carries the supplied path.
+func infoWithPath(parts ...string) map[string]any {
+	list := make([]any, 0, len(parts))
+	for _, one := range parts {
+		list = append(list, one)
+	}
+	info := multiFileInfo()
+	info["files"] = []any{
+		map[string]any{lengthKey: int64(12), pathKey: list},
+		map[string]any{lengthKey: int64(8), pathKey: []any{fileB}},
+	}
+	return info
+}
+
+// TestNewFileFromBytesBoundsFilePaths covers the depth and length of a file entry's path. Both validation and the
+// building of the virtual tree do work for every ancestor of every entry, so an unbounded depth makes a single entry
+// cost O(depth²): a 240KB torrent naming one 80,000-component path took 7.5 seconds to parse, and grew from there,
+// while decoding the same bytes is linear.
+func TestNewFileFromBytesBoundsFilePaths(t *testing.T) {
+	c := check.New(t)
+
+	// A path at the depth limit is accepted, and the whole of it is reachable in the virtual tree.
+	deepest := make([]string, tfs.MaxPathDepth)
+	for i := range deepest {
+		deepest[i] = "d"
+	}
+	deepest[len(deepest)-1] = fileA
+	f := newPopulatedFile(t, infoWithPath(deepest...), []byte("0123456789abcdefghij"))
+	fi, err := fs.Stat(f, strings.Join(deepest, "/"))
+	c.NoError(err)
+	c.Equal(int64(12), fi.Size())
+
+	// So is one at the length limit, separators included.
+	longest := strings.Repeat("a", tfs.MaxPathLength-(len(fileA)+1))
+	_, err = tfs.NewFileFromBytes(encodeTorrent(t, infoWithPath(longest, fileA)))
+	c.NoError(err)
+
+	// Beyond either limit, the torrent is rejected rather than parsed at leisure.
+	for _, one := range []struct {
+		name  string
+		parts []string
+	}{
+		{name: "one component too deep", parts: append(slices.Clone(deepest), fileA)},
+		{name: "one byte too long", parts: []string{longest + "a", fileA}},
+		{name: "separators count toward the length", parts: []string{longest, "a", fileA}},
+		{name: "components hidden inside one string", parts: []string{strings.Join(deepest, "/") + "/" + fileA}},
+		{name: "the reported case", parts: []string{strings.Repeat("a/", 79999) + fileA}},
+	} {
+		t.Run(one.name, func(_ *testing.T) {
+			_, pathErr := tfs.NewFileFromBytes(encodeTorrent(t, infoWithPath(one.parts...)))
+			c.HasError(pathErr, one.name)
+			if pathErr != nil {
+				// The rejected path came out of the torrent, so the message may not quote all of it back.
+				message, _, _ := strings.Cut(pathErr.Error(), "\n")
+				c.True(len(message) < 256, "%s: %d byte message", one.name, len(message))
+			}
+		})
+	}
 }
 
 // TestInfoHashComesFromTheRawInfoDictionary verifies the hash is taken over the info dictionary exactly as it

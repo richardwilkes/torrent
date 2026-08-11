@@ -48,9 +48,35 @@ const (
 	// count, as well as the piece hash data itself, which is 20 bytes per piece.
 	MaxPieceCount = 1 << 21
 
+	// MaxTorrentFileLength is the largest .torrent file that will be accepted. A torrent declaring MaxPieceCount
+	// pieces carries 40MB of piece hashes by itself, so the bound has to sit above that; what it rules out is an
+	// input that exists only to make the parser allocate, which matters because a reader handed to
+	// NewFileFromReader may be a network stream with no end to it.
+	MaxTorrentFileLength = 64 * 1024 * 1024
+
+	// MaxNestingDepth is the deepest that bencoded lists and dictionaries may nest. The decoder recurses once per
+	// level, and a torrent may be as little as a megabyte of nothing but list heads, so the depth has to be bounded
+	// before decoding rather than after. Real torrents sit at five levels or so, and even the per-component
+	// dictionaries of a v2 file tree stay far below this.
+	MaxNestingDepth = 64
+
+	// MaxPathDepth is the largest number of components the path of a file within a torrent may have. Every ancestor
+	// of an entry is visited while validating and again while building the virtual tree, so an unbounded depth makes
+	// a single entry cost O(depth²) to process; the tree is also walked recursively when sorting it.
+	MaxPathDepth = 64
+
+	// MaxPathLength is the largest number of bytes the path of a file within a torrent may occupy, separators
+	// included. This matches the limit nearly every filesystem in common use places on a path, and together with
+	// MaxPathDepth it keeps the work done per entry proportional to the bytes the torrent spent on it.
+	MaxPathLength = 4096
+
 	// maxStorageNameLength is the largest number of bytes a single path element may occupy in the storage path. 255 is
 	// the limit imposed by nearly every filesystem in common use.
 	maxStorageNameLength = 255
+
+	// maxPathInError is the largest number of bytes of a rejected path that an error message will quote. The path
+	// came out of the torrent, so it can be as large as the file that carried it.
+	maxPathInError = 96
 
 	// openOp is the operation name carried by the *fs.PathError values this package returns.
 	openOp = "open"
@@ -96,9 +122,12 @@ func NewFileFromPath(filePath string) (*File, error) {
 	return f, err
 }
 
-// NewFileFromReader creates a torrent file structure from the raw torrent file data.
+// NewFileFromReader creates a torrent file structure from the raw torrent file data. At most MaxTorrentFileLength
+// bytes are read, since the reader may be attached to something unbounded, such as a network stream.
 func NewFileFromReader(r io.Reader) (*File, error) {
-	data, err := io.ReadAll(r)
+	// One byte beyond the limit is read so that a file sitting exactly at it is still accepted while anything larger
+	// is seen to be larger and rejected by NewFileFromBytes.
+	data, err := io.ReadAll(io.LimitReader(r, MaxTorrentFileLength+1))
 	if err != nil {
 		return nil, errs.Wrap(err)
 	}
@@ -107,6 +136,12 @@ func NewFileFromReader(r io.Reader) (*File, error) {
 
 // NewFileFromBytes creates a torrent file structure from the raw torrent file data.
 func NewFileFromBytes(data []byte) (*File, error) {
+	if len(data) > MaxTorrentFileLength {
+		return nil, errs.Newf("torrent file length of %d exceeds the maximum of %d", len(data), MaxTorrentFileLength)
+	}
+	if err := checkNesting(data); err != nil {
+		return nil, err
+	}
 	var f File
 	if err := bencode.DecodeBytes(data, &f); err != nil {
 		return nil, errs.Wrap(err)
@@ -129,6 +164,67 @@ func NewFileFromBytes(data []byte) (*File, error) {
 	f.InfoHash = sha1.Sum(raw.Info) //nolint:gosec // The spec requires sha1
 	f.Path = xfilepath.SanitizeName(f.Info.Name)
 	return &f, nil
+}
+
+// checkNesting rejects data whose bencoded lists and dictionaries nest more than MaxNestingDepth levels deep. The
+// decoder recurses once per level, so a file that is little more than a long run of list heads drives it past the
+// goroutine stack limit, and the resulting stack overflow is a fatal runtime error that no recover() can catch. The
+// depth therefore has to be measured before the decoder ever sees the bytes. Only the nesting is judged here: input
+// this scan can't make sense of is left for the decoder to report, since the decoder walks the same tokens the same
+// way and stops at the same place, without ever recursing deeper than what was measured up to it.
+func checkNesting(data []byte) error {
+	depth := 0
+	for i := 0; i < len(data); {
+		switch c := data[i]; {
+		case c == 'd' || c == 'l':
+			depth++
+			if depth > MaxNestingDepth {
+				return errs.Newf("torrent data nests more than %d levels deep", MaxNestingDepth)
+			}
+			i++
+		case c == 'e':
+			depth--
+			i++
+		case c == 'i':
+			end := bytes.IndexByte(data[i+1:], 'e')
+			if end == -1 {
+				return nil
+			}
+			i += end + 2
+		case c >= '0' && c <= '9':
+			next, ok := skipBencodedString(data, i)
+			if !ok {
+				return nil
+			}
+			i = next
+		default:
+			return nil
+		}
+		if depth <= 0 {
+			// The value that started the data is complete, which is exactly where the decoder stops as well.
+			return nil
+		}
+	}
+	return nil
+}
+
+// skipBencodedString returns the index just past the bencoded string starting at i, or false if what is there isn't
+// one the decoder could read either.
+func skipBencodedString(data []byte, i int) (int, bool) {
+	length := 0
+	for ; i < len(data) && data[i] >= '0' && data[i] <= '9'; i++ {
+		length = length*10 + int(data[i]-'0')
+		if length > len(data) {
+			return 0, false // Longer than everything we hold, so no decoder could satisfy it.
+		}
+	}
+	if i == len(data) || data[i] != ':' {
+		return 0, false
+	}
+	if i += 1 + length; i > len(data) {
+		return 0, false
+	}
+	return i, true
 }
 
 // validate rejects metadata that is internally inconsistent. Without this, a corrupt or hostile .torrent file can
@@ -189,7 +285,7 @@ func (f *File) validateEntries() (int64, error) {
 		size += one.length
 		p, ok := cleanVirtualPath(one.path)
 		if !ok {
-			return 0, errs.Newf("invalid torrent file path: %v", one.path)
+			return 0, errs.Newf("invalid torrent file path: %q", describePath(one.path))
 		}
 		if files[p] {
 			return 0, errs.Newf("duplicate torrent file path: %s", p)
@@ -425,14 +521,25 @@ func (f *File) mkdirs(dirPath string) (*vfs, bool) {
 
 // cleanVirtualPath turns the path components of a torrent file entry into a slash-separated path usable with io/fs,
 // dropping empty and dot components rather than letting them escape or collapse onto the root. false is returned if
-// nothing usable remains.
+// nothing usable remains, or if the result would be deeper than MaxPathDepth or longer than MaxPathLength, since
+// everything downstream of here does work per ancestor of a path and a torrent is free to claim any depth at all.
 func cleanVirtualPath(parts []string) (string, bool) {
-	list := make([]string, 0, len(parts))
+	list := make([]string, 0, min(len(parts), MaxPathDepth))
+	length := 0
 	for _, part := range parts {
 		for sub := range strings.SplitSeq(part, "/") {
 			switch sub {
 			case "", ".", "..":
 			default:
+				if len(list) == MaxPathDepth {
+					return "", false
+				}
+				if length != 0 {
+					length++ // The separator this component will be joined with.
+				}
+				if length += len(sub); length > MaxPathLength {
+					return "", false
+				}
 				list = append(list, sub)
 			}
 		}
@@ -445,6 +552,34 @@ func cleanVirtualPath(parts []string) (string, bool) {
 		return "", false
 	}
 	return result, true
+}
+
+// describePath renders the path components of a torrent file entry for an error message. Only the first
+// maxPathInError bytes are shown, cut at a rune boundary, since a path that was rejected for its size would
+// otherwise put the whole of it into the message.
+func describePath(parts []string) string {
+	var buf strings.Builder
+	for i, part := range parts {
+		if i != 0 {
+			buf.WriteByte('/')
+		}
+		if remaining := maxPathInError + 1 - buf.Len(); remaining <= len(part) {
+			if remaining > 0 {
+				buf.WriteString(part[:remaining])
+			}
+			break
+		}
+		buf.WriteString(part)
+	}
+	result := buf.String()
+	if len(result) <= maxPathInError {
+		return result
+	}
+	cut := maxPathInError
+	for cut > 0 && !utf8.RuneStart(result[cut]) {
+		cut--
+	}
+	return result[:cut] + "..."
 }
 
 func sortDirs(dir *vfs) {
