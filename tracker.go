@@ -52,6 +52,14 @@ const (
 	// recurses for each level, so an unbounded depth is a way to run us out of stack with very little data.
 	maxBencodeDepth = 16
 
+	// maxPeerListOverage is how many times the number of peers we asked for a tracker may answer with before the rest
+	// of its list is dropped. Every announce says how many we want, and nothing obliges the tracker to honor it: a
+	// megabyte of compact entries, which the response cap allows, is about 174,000 peers, each of them retained for
+	// the life of the torrent and walked — with a gatekeeper lookup and a log line apiece — on every fifteen-second
+	// peer adjustment. Several times what we asked for is room enough for a tracker that rounds our request up or
+	// hands out its whole small swarm, while what it can't be is unbounded.
+	maxPeerListOverage = 4
+
 	// stopAnnounceWait is how long the shutdown will wait for the periodic announce goroutine to finish. The request
 	// that goroutine may be in the middle of is aborted before the wait begins, so this is only reached if the
 	// transport doesn't unwind from that promptly; the shutdown then goes ahead rather than being held up further.
@@ -122,6 +130,14 @@ type trackerLockData struct {
 	seeders              int
 	progress             float64
 	started              bool
+	// inSwarm is set once peers can reach us, which is what separates a download this session earned from one that was
+	// already sitting on disk when we started. Only the former has a "completed" event to report.
+	inSwarm bool
+	// completePending records a completion that arrived before the start announce had been answered, which is the
+	// window between the dispatcher registration and the tracker's reply — up to the HTTP client's timeout, and long
+	// enough for an inbound peer to deliver the last pieces of a nearly complete torrent. announceStart hands it over
+	// once there is both a started swarm to report it to and a goroutine to report it from.
+	completePending bool
 }
 
 type trackerWire struct { //nolint:govet // We can't change the order of these fields
@@ -129,10 +145,15 @@ type trackerWire struct { //nolint:govet // We can't change the order of these f
 	// PeerAddresses is left as raw bencode because a tracker may answer with either the compact form (a string) or the
 	// dict model (a list of dictionaries), regardless of our request for the compact form.
 	PeerAddresses bencode.RawMessage `bencode:"peers"`
-	Seeders       int                `bencode:"complete"`
-	Leechers      int                `bencode:"incomplete"`
-	TrackerID     string             `bencode:"tracker id"`
-	Failure       string             `bencode:"failure reason"`
+	// PeerAddresses6 is BEP-7's list of IPv6 peers, which this client doesn't speak — it announces and dials IPv4 —
+	// but which it has to be able to see. Without the field the key is dropped by the decoder, so a tracker answering
+	// with nothing but IPv6 peers leaves the client with no one to talk to and nothing said about why; with it, the
+	// announce reports what it was offered and couldn't use.
+	PeerAddresses6 bencode.RawMessage `bencode:"peers6"`
+	Seeders        int                `bencode:"complete"`
+	Leechers       int                `bencode:"incomplete"`
+	TrackerID      string             `bencode:"tracker id"`
+	Failure        string             `bencode:"failure reason"`
 }
 
 // peerWire is one entry of a tracker's dict-model peer list.
@@ -173,10 +194,16 @@ func (t *tracker) addUploadedBytes(count int64) {
 	t.uploadedBytes.Add(count)
 }
 
+// markBlockValid records a piece we now hold. A repeat call for an index we already have changes nothing and says
+// nothing: the "have" message goes out with the rest of the state change, inside the guard, so that a piece claimed
+// twice — which the claim bookkeeping makes unlikely rather than impossible — doesn't queue a second announcement of
+// it to every peer we have.
 func (t *tracker) markBlockValid(index int) {
+	fresh := false
 	announce := false
 	t.lock.Lock()
 	if !t.have.IsSet(index) {
+		fresh = true
 		t.have.Set(index)
 		t.downloading.Unset(index)
 		delete(t.who, index)
@@ -187,6 +214,9 @@ func (t *tracker) markBlockValid(index int) {
 		}
 	}
 	t.lock.Unlock()
+	if !fresh {
+		return
+	}
 	t.client.informPeersWeHavePiece(index)
 	if announce {
 		// The piece that finishes the download is what starts the seeding clock, and the run goroutine is waiting on a
@@ -194,6 +224,16 @@ func (t *tracker) markBlockValid(index int) {
 		t.client.wakeRun()
 		t.requestCompleteAnnounce()
 	}
+}
+
+// enterSwarm records that peers can now reach us, which is what makes everything downloaded from here on something
+// this session earned. It is called as the client registers with the dispatcher, before the start announce, since an
+// inbound peer can deliver pieces from that moment and the announce it would report them through may still be in
+// flight.
+func (t *tracker) enterSwarm() {
+	t.lock.Lock()
+	t.inSwarm = true
+	t.lock.Unlock()
 }
 
 // requestCompleteAnnounce hands the "completed" announce to the periodic announce goroutine rather than making it
@@ -204,14 +244,47 @@ func (t *tracker) markBlockValid(index int) {
 // announce within. A download that finished before we ever announced a start, which is what verifying an already
 // complete file on disk does, has no completion to report and no goroutine to report it: the event describes a
 // torrent downloaded during this session.
+//
+// A completion that lands after we joined the swarm but before the start announce has been answered is that kind of
+// event and is recorded rather than dropped, since the peer that delivered it is one this session took the pieces
+// from. Nothing re-checks afterwards on its own: the goroutine that services the request only starts with the
+// periodic announce, and it drains the channel from that point on, so a request made now would be seen while one
+// merely dropped would not.
 func (t *tracker) requestCompleteAnnounce() {
-	if !t.hasStarted() {
+	t.lock.Lock()
+	if !t.started {
+		t.completePending = t.inSwarm
+		t.lock.Unlock()
+		return
+	}
+	t.lock.Unlock()
+	select {
+	case t.completeAnnounceRequested <- struct{}{}:
+	default:
+	}
+}
+
+// servicePendingCompleteAnnounce hands over a completion that arrived while the start announce was still in flight.
+// The request is queued rather than announced here: this runs on the client's run goroutine, which the rest of the
+// startup is waiting on, and the periodic announce goroutine is where every announce after the start is made from.
+func (t *tracker) servicePendingCompleteAnnounce() {
+	t.lock.Lock()
+	pending := t.completePending
+	t.completePending = false
+	t.lock.Unlock()
+	if !pending {
 		return
 	}
 	select {
 	case t.completeAnnounceRequested <- struct{}{}:
 	default:
 	}
+}
+
+// peerListLimit returns how many peers an announce may take from a tracker's answer. It is a multiple of what we asked
+// for rather than a fixed number, since the request is what the tracker was told we wanted.
+func (t *tracker) peerListLimit() int {
+	return t.client.peersWanted * maxPeerListOverage
 }
 
 // knownPeers returns the peers the last announce told us about.
@@ -320,6 +393,9 @@ func (t *tracker) announceStart() error {
 		t.setStateAndProgress(Downloading, -1)
 	}
 	t.startPeriodicAnnounce()
+	// A download that finished while this announce was in flight had nowhere to send its completion: the tracker had
+	// no record of us to report it to, and the goroutine that makes that announce didn't exist. Both hold now.
+	t.servicePendingCompleteAnnounce()
 	return nil
 }
 
@@ -450,26 +526,49 @@ func (a peerAddr) isSelf(externalAddr string, externalPort int) bool {
 // it from formats whose ranges differ; what is checked here is the host, which the compact form always fills in but
 // which the dict model takes verbatim from the tracker.
 //
-// A peer list is unverified data, and an entry naming no host in particular is what a hostile tracker uses to point us
-// at ourselves: an empty "ip" makes net.JoinHostPort produce ":6881", and the unspecified address — which both formats
-// can carry — produces "0.0.0.0:6881". Either dials our own machine, so what receives our BitTorrent handshakes is
-// whatever local service happens to be listening on the port the tracker chose rather than a peer. Anything else that
-// isn't an address is left alone: BEP 3 lets the dict model carry a DNS name, and resolving it is the dial's business.
+// A peer list is unverified data, and whoever supplies a .torrent chooses both the tracker it announces to and the
+// peers that tracker hands back, so an entry is an address of the tracker's choosing that we open a TCP connection to
+// and write a 68 byte handshake carrying 20 bytes it also chose. What is refused here are the addresses that name
+// something other than a peer somewhere out on the network:
+//
+//   - No host at all, which makes net.JoinHostPort produce ":6881", and the unspecified address, which produces
+//     "0.0.0.0:6881". Either dials our own machine, so what receives the handshake is whatever local service happens
+//     to be listening on the port the tracker chose.
+//   - Loopback, so that the whole of 127.0.0.0/8 — every port of it a distinct key, and so unthrottled by the
+//     gatekeeper's per-address block — can't be swept for services that don't expect to hear from the network at all.
+//   - Link-local, multicast and the IPv4 broadcast address, none of which a TCP peer can live at.
+//   - 0.0.0.0/8, "this network", which is no destination either. It is also where much of what a compact IPv6 list
+//     misread as IPv4 entries lands, since the addresses that list holds are mostly zero bytes.
+//
+// Private addresses are deliberately left dialable: a swarm on a LAN, announced to a tracker on that same LAN, is an
+// ordinary arrangement rather than an attack, and refusing them here would break it. Anything that isn't an address at
+// all is left alone too: BEP 3 lets the dict model carry a DNS name, and resolving it is the dial's business.
 func (a peerAddr) isDialable() bool {
 	if a.ip == "" {
 		return false
 	}
 	ip := net.ParseIP(a.ip)
-	return ip == nil || !ip.IsUnspecified()
+	if ip == nil {
+		return true
+	}
+	// IsGlobalUnicast is false for exactly the unspecified, loopback, link-local, multicast and broadcast addresses,
+	// and true for the private ranges, which is the division wanted here.
+	if !ip.IsGlobalUnicast() {
+		return false
+	}
+	v4 := ip.To4()
+	return v4 == nil || v4[0] != 0
 }
 
 // parseCompactPeers extracts the peer addresses from the compact peer list format, which is a series of 6-byte
 // entries, each holding a 4-byte IPv4 address followed by a 2-byte port. A tracker response is unverified data, so a
-// trailing partial entry is ignored rather than allowed to run off the end of the list. Our own address is omitted, as
-// are entries with no port and entries naming no host.
-func parseCompactPeers(value, externalAddr string, externalPort int) []peerAddr {
-	peerAddresses := make([]peerAddr, 0, len(value)/6)
-	for i := 0; i+6 <= len(value); i += 6 {
+// trailing partial entry is ignored rather than allowed to run off the end of the list — parsePeers refuses a list of
+// such a length outright, but this stays safe whatever it is handed — and no more than limit entries are returned, so
+// that neither the list built here nor the walk every peer adjustment makes over it is decided by the tracker. Our
+// own address is omitted, as are entries with no port and entries naming no host.
+func parseCompactPeers(value, externalAddr string, externalPort, limit int) []peerAddr {
+	peerAddresses := make([]peerAddr, 0, min(len(value)/6, limit))
+	for i := 0; i+6 <= len(value) && len(peerAddresses) < limit; i += 6 {
 		one := peerAddr{
 			ip:   net.IPv4(value[i], value[i+1], value[i+2], value[i+3]).String(),
 			port: int(binary.BigEndian.Uint16([]byte(value[i+4 : i+6]))),
@@ -484,12 +583,15 @@ func parseCompactPeers(value, externalAddr string, externalPort int) []peerAddr 
 // parsePeers extracts the peer addresses from a tracker's "peers" value. Although we always ask for the compact form,
 // a tracker is free to ignore that and answer with the dict model instead, so both are accepted: a bencoded string is
 // the compact form and a bencoded list is the dict model. A missing or empty value simply yields no peers. Our own
-// address is omitted, as are entries whose port or host isn't one that can be dialed. What was found is logged to the
-// caller's logger, since a peer list is per-torrent detail that belongs wherever the rest of that client's logging goes.
+// address is omitted, as are entries whose port or host isn't one that can be dialed. At most limit entries are kept,
+// since the announce says how many peers we want but nothing makes the tracker honor it, and everything downstream —
+// the list held per torrent, and the walk over it every peer adjustment makes — is sized by what comes back. What was
+// found, and anything dropped for the limit, is reported to the caller's logger, since a peer list is per-torrent
+// detail that belongs wherever the rest of that client's logging goes.
 //
 // The result is a list rather than a map keyed by IP, since several peers of a swarm sharing one IP is the ordinary
 // state of affairs behind a NAT: keyed that way, all but the last of them are lost.
-func parsePeers(logger *slog.Logger, raw bencode.RawMessage, externalAddr string, externalPort int) ([]peerAddr, error) {
+func parsePeers(logger *slog.Logger, raw bencode.RawMessage, externalAddr string, externalPort, limit int) ([]peerAddr, error) {
 	if len(raw) == 0 {
 		return nil, nil
 	}
@@ -500,15 +602,34 @@ func parsePeers(logger *slog.Logger, raw bencode.RawMessage, externalAddr string
 			return nil, errs.NewWithCause("unable to decode compact peer list", err)
 		}
 		logger.Debug("announce string", "peers_list", compact)
-		return parseCompactPeers(compact, externalAddr, externalPort), nil
+		// A compact list is whole 6-byte entries or it is not a compact list. Refusing a length that isn't says so
+		// rather than quietly keeping whatever prefix happens to divide evenly, which is the shape a response takes
+		// when it was truncated or when it holds something other than what BEP-23 says it holds. What this cannot
+		// catch is BEP-7's 18-byte IPv6 entries put in "peers" instead of "peers6": 18 divides by 6, so such a list
+		// looks exactly like three times as many IPv4 entries. Those entries are mostly zero bytes, so isDialable
+		// discards the bulk of what they misparse into, and a tracker that has IPv6 peers to offer is expected to
+		// offer them under the key BEP-7 gives them, which is answered below.
+		if len(compact)%6 != 0 {
+			return nil, errs.Newf("compact peer list of %d bytes is not a whole number of 6 byte entries", len(compact))
+		}
+		if entries := len(compact) / 6; entries > limit {
+			logger.Warn("tracker offered more peers than allowed", "offered", entries, "limit", limit)
+		}
+		return parseCompactPeers(compact, externalAddr, externalPort, limit), nil
 	case raw[0] == 'l': // A bencoded list, so the dict model
 		var list []peerWire
 		if err := bencode.DecodeBytes(raw, &list); err != nil {
 			return nil, errs.NewWithCause("unable to decode peer list", err)
 		}
 		logger.Debug("announce map", "count", len(list))
-		peerAddresses := make([]peerAddr, 0, len(list))
+		if len(list) > limit {
+			logger.Warn("tracker offered more peers than allowed", "offered", len(list), "limit", limit)
+		}
+		peerAddresses := make([]peerAddr, 0, min(len(list), limit))
 		for _, one := range list {
+			if len(peerAddresses) == limit {
+				break
+			}
 			// The dict model carries the port as a bencoded integer, so unlike the compact form — whose ports are
 			// inherently 16 bit — a hostile or buggy tracker can hand us a negative one or one past the end of the port
 			// range. Kept, they become dial attempts that cannot possibly succeed, retried on every peer management
@@ -574,9 +695,15 @@ func (t *tracker) announce(ctx context.Context, event string) error {
 		externalAddr = extIP.String()
 	}
 	peerAddresses, err := parsePeers(t.client.logger, in.PeerAddresses, externalAddr,
-		int(t.client.dispatcher.ExternalPort()))
+		int(t.client.dispatcher.ExternalPort()), t.peerListLimit())
 	if err != nil {
 		return err
+	}
+	// Said out loud rather than passed over: a tracker answering an IPv6-capable swarm may put every peer it has under
+	// this key, and a client that simply drops it looks like one the swarm has nothing for.
+	if len(in.PeerAddresses6) != 0 {
+		t.client.logger.Warn("ignoring the IPv6 peer list, which this client doesn't implement (BEP-7)",
+			"bytes", len(in.PeerAddresses6), "ipv4_peers", len(peerAddresses))
 	}
 	// An announce the shutdown overtook has nothing left to say. What it came back with describes a swarm we are on
 	// our way out of, and letting the peer list, the interval and the counts we report land after the stopped event
@@ -604,7 +731,14 @@ func (t *tracker) announce(ctx context.Context, event string) error {
 	}
 	t.seeders = in.Seeders
 	t.leechers = in.Leechers
-	t.peerAddresses = peerAddresses
+	// A response that simply leaves the peers key out isn't telling us the swarm is empty, any more than one leaving
+	// the interval or the tracker id out is taking those away, so the list already in hand is what dialCandidates goes
+	// on offering until an announce actually says otherwise. Cleared unconditionally, a single such response leaves
+	// the client unable to replace a lost connection until the next announce, which the interval allows to be as far
+	// off as a day. An explicitly empty list is a different statement and does clear it.
+	if len(in.PeerAddresses) != 0 {
+		t.peerAddresses = peerAddresses
+	}
 	if event == startedMsg {
 		t.started = true
 	}

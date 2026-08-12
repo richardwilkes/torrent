@@ -309,6 +309,11 @@ func (c *Client) run() {
 		c.finish(err)
 		return
 	}
+	// Recorded before the registration that makes it true, so that a peer arriving on the very first connection the
+	// dispatcher hands us already counts as one this session downloaded from. What it separates is a torrent finished
+	// here from one that was already complete on disk when the verification pass above read it, which has no
+	// completion to report to a tracker that has never heard of us.
+	c.tracker.enterSwarm()
 	// The registration is deregistered by way of the handle it returned rather than by info hash, so that a client
 	// which is still shutting down when the same torrent is started again — which Stop's contract allows, since it
 	// returns once its timeout expires whether or not the shutdown has finished — takes only its own registration with

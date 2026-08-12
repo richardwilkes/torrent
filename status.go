@@ -51,7 +51,7 @@ func (s *Status) String() string {
 	case Initializing:
 		return fmt.Sprintf("Initializing: %0.1f%%", s.PercentComplete)
 	case Downloading:
-		return fmt.Sprintf("Downloading: %.2f%% - Dn %.2f MB/s - Up %.2f MB/s - Peers %dD/%dC/%dL/%dP",
+		return fmt.Sprintf("Downloading: %.2f%% - Dn %.2f MB/s - Up %.2f MB/s - Peers %dD/%dC/%dL/%dS",
 			s.PercentComplete,
 			float64(s.DownloadBytesPerSecond)/toMegaBytesPerSecond,
 			float64(s.UploadBytesPerSecond)/toMegaBytesPerSecond,
@@ -60,7 +60,7 @@ func (s *Status) String() string {
 			s.Leechers,
 			s.Seeders)
 	case Seeding:
-		return fmt.Sprintf("Seeding: Up %.2f MB/s - %s remaining - Peers %dC/%dL/%dP",
+		return fmt.Sprintf("Seeding: Up %.2f MB/s - %s remaining - Peers %dC/%dL/%dS",
 			float64(s.UploadBytesPerSecond)/toMegaBytesPerSecond,
 			xtime.FormatDuration(time.Until(s.SeedingStopsAt), false),
 			s.PeersConnected,
