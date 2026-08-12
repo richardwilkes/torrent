@@ -19,6 +19,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,6 +37,16 @@ const (
 	startedMsg   = "started"
 	stoppedMsg   = "stopped"
 	completedMsg = "completed"
+
+	// maxPieceOwners is how many peers may be downloading the same piece at once. Only the endgame ever hands out the
+	// owners past the first, and what it is answering there is one slow peer sitting on a piece the whole download is
+	// waiting for: a single fast peer alongside it is enough to un-stick that, so this is the smallest count that does
+	// the job. Every owner beyond the one that wins the race is, at worst, a wholly wasted copy of the piece — paid
+	// for in bandwidth that had somewhere better to be — which is what keeps the number this low. A peer that never
+	// delivers at all remains the expiry machinery's business rather than something more duplicates paper over. A
+	// constant rather than an option, as maxOutstandingChunkRequests is: it is a detail of how a piece is fetched,
+	// which an application has no basis on which to choose.
+	maxPieceOwners = 2
 
 	// minAnnounceInterval and maxAnnounceInterval bound how long we wait between announces. The tracker's requested
 	// interval is only a request, and it is unverified data: too small a value has us hammering the tracker, while one
@@ -114,7 +125,23 @@ type tracker struct {
 type trackerLockData struct {
 	have        *fixedbits.Bits
 	downloading *fixedbits.Bits
-	who         map[int]*peer
+	// everyPiece has every one of its bits set and is never written to again once it has been built. It stands in for
+	// the pieces a peer holds in the one scan that isn't made on behalf of a peer at all: asking whether any piece is
+	// both missing and unclaimed, which is the question the endgame turns on, is then the same tested
+	// fixedbits.FirstAvailable walk every piece selection makes rather than a bit field operation of its own that
+	// would have to be written and tested from scratch.
+	everyPiece *fixedbits.Bits
+	// who records the peers that have claimed each piece. An index is present here exactly when its bit in
+	// downloading is set, and the owner list recorded for it is never empty: the two are written together under this
+	// lock, so an index in one and not the other would either be a piece being fetched that any peer may claim again
+	// or a piece nothing is fetching that no peer may claim at all. A piece we already hold is never in here either,
+	// since markBlockValid sets the have bit and drops every owner of the index in one critical section.
+	//
+	// A list holds one peer for as long as there is anything left to claim, since a piece is handed out once while
+	// that is so. It holds up to maxPieceOwners of them in the endgame, where a piece already being fetched is
+	// deliberately handed to another peer as well so that the tail of the download isn't held up by whichever peer
+	// turns out to be slowest.
+	who map[int][]*peer
 	// periodicAnnounceDone is closed by the periodic announce goroutine as it returns, which is what the shutdown
 	// waits on. It stays nil while no such goroutine exists, so a tracker whose start announce failed has nothing to
 	// wait for.
@@ -180,6 +207,10 @@ type peerWire struct { //nolint:govet // We can't change the order of these fiel
 func newTracker(client *Client) *tracker {
 	totalBytes := client.torrentFile.Size()
 	totalPieces := client.torrentFile.PieceCount()
+	everyPiece := fixedbits.New(totalPieces)
+	for i := range totalPieces {
+		everyPiece.Set(i)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &tracker{
 		client:                    client,
@@ -191,7 +222,8 @@ func newTracker(client *Client) *tracker {
 			remainingBytes: totalBytes,
 			have:           fixedbits.New(totalPieces),
 			downloading:    fixedbits.New(totalPieces),
-			who:            make(map[int]*peer),
+			everyPiece:     everyPiece,
+			who:            make(map[int][]*peer),
 		},
 	}
 }
@@ -209,9 +241,11 @@ func (t *tracker) addUploadedBytes(count int64) {
 }
 
 // markBlockValid records a piece we now hold. A repeat call for an index we already have changes nothing and says
-// nothing: the "have" message goes out with the rest of the state change, inside the guard, so that a piece claimed
-// twice — which the claim bookkeeping makes unlikely rather than impossible — doesn't queue a second announcement of
-// it to every peer we have.
+// nothing: the "have" message goes out with the rest of the state change, inside the guard, so that a piece delivered
+// twice — which the claim bookkeeping keeps rare while there is anything left to claim, and which the endgame
+// deliberately arranges, several peers being asked for the same piece so that the slowest of them can't hold the
+// download up — doesn't queue a second announcement of it to every peer we have. Dropping the index from who takes
+// every claim on it with it, the one owner or the several, since the piece is ours and nobody is fetching it now.
 func (t *tracker) markBlockValid(index int) {
 	fresh := false
 	announce := false
@@ -933,14 +967,21 @@ func checkBencode(data []byte) error {
 	return nil
 }
 
-// clearDownload gives up the claim the given peer has on a piece, so that another peer can download it. A claim that
-// has since passed to a different peer is left alone: a peer releasing a piece it no longer holds must not take the
-// claim away from the peer that has since taken it up.
+// clearDownload gives up the claim the given peer has on a piece, so that another peer can download it. Only this
+// peer's own claim is given up: a peer releasing a piece must not take the claim away from a co-owner that is still
+// fetching it, nor from the peer that has since taken the index up after this one was finished with it, either of
+// which would leave a piece being downloaded that nothing records as claimed. A peer that doesn't hold the index at
+// all — one that let its claim expire, then released the same piece a second time — changes nothing here. The piece
+// itself is only freed by the last owner to leave, since until then someone is still fetching it.
 func (t *tracker) clearDownload(index int, who *peer) {
 	t.lock.Lock()
-	if t.who[index] == who {
-		delete(t.who, index)
-		t.downloading.Unset(index)
+	if i := slices.Index(t.who[index], who); i != -1 {
+		if owners := slices.Delete(t.who[index], i, i+1); len(owners) != 0 {
+			t.who[index] = owners
+		} else {
+			delete(t.who, index)
+			t.downloading.Unset(index)
+		}
 	}
 	t.lock.Unlock()
 }
@@ -974,35 +1015,110 @@ func (t *tracker) isInteresting(has *fixedbits.Bits) bool {
 	return i != -1
 }
 
+// allMissingClaimed returns true when no piece is both missing and unclaimed, which is to say that every piece we
+// still need already has a peer fetching it. The lock must be held.
+func (t *tracker) allMissingClaimed() bool {
+	return fixedbits.FirstAvailable(t.everyPiece, t.downloading, t.have) == -1
+}
+
+// inEndgame returns true when the download is unfinished but every piece we still lack is already claimed by some
+// peer, which is the state in which duplicating a claim is the only way an idle peer can help. A download with
+// nothing left to fetch is not in it, however thoroughly claimed the nothing is.
+func (t *tracker) inEndgame() bool {
+	t.lock.RLock()
+	defer t.lock.RUnlock()
+	return t.remainingBytes > 0 && t.allMissingClaimed()
+}
+
 // selectForDownloading claims a piece the peer has and we still need, returning its index, or -1 if there is nothing
-// for it to take. Nothing is claimed once as many peers as ConcurrentDownloads allows are already downloading, which
-// is what makes that option the limit on simultaneous downloads it says it is: without the cap here it only decided
-// whether more peers were sought, while every peer that unchoked us went on to start a download of its own regardless.
+// for it to take.
+//
+// A fresh claim — a piece nothing else is fetching — is only made while a download slot is free, which is what makes
+// ConcurrentDownloads the limit on simultaneous downloads it says it is: without the cap here it only decided whether
+// more peers were sought, while every peer that unchoked us went on to start a download of its own regardless.
+//
+// Once every piece we still lack is claimed there is no fresh claim left for anyone to make, and the download is
+// waiting on whichever peers hold those last pieces while every other peer sits idle. From that point a peer may take
+// a duplicate of a piece someone else is already fetching, and the cap deliberately doesn't gate that: the peers
+// holding the slots are precisely the ones being backed up, so honoring it here would refuse the help exactly where it
+// was asked for. What bounds the duplication instead is maxPieceOwners per piece, which puts the worst case at
+// concurrentDownloads × maxPieceOwners distinct peers downloading at once. While any missing piece is still unclaimed
+// anywhere in the torrent this branch cannot be reached at all, so nothing outside the endgame behaves any
+// differently, and the check on remainingBytes keeps a finished download out of it — with nothing missing, nothing is
+// unclaimed either, and every last peer would otherwise qualify.
 func (t *tracker) selectForDownloading(who *peer, has *fixedbits.Bits) int {
 	t.lock.Lock()
 	defer t.lock.Unlock()
-	if !t.downloadSlotAvailable(who) {
-		return -1
+	i := -1
+	if t.downloadSlotAvailable(who) {
+		i = fixedbits.FirstAvailable(has, t.downloading, t.have)
 	}
-	i := fixedbits.FirstAvailable(has, t.downloading, t.have)
+	if i == -1 && t.remainingBytes > 0 && t.allMissingClaimed() {
+		i = t.selectEndgameDuplicate(who, has)
+	}
 	if i != -1 {
-		t.who[i] = who
+		t.who[i] = append(t.who[i], who)
 		t.downloading.Set(i)
 	}
 	return i
 }
 
+// selectEndgameDuplicate returns a piece this peer can join the peers already fetching it, or -1 if there is none.
+// Only what is already claimed is on offer, so the walk is over the claims: an index the peer doesn't have, one it is
+// already an owner of, and one with as many owners as maxPieceOwners allows are all passed over. Of what is left the
+// piece with the fewest owners is taken, so that the duplication spreads across the pieces still outstanding rather
+// than piling onto whichever one the walk reached first, and the lowest index wins a tie, since a map is walked in no
+// particular order and an answer that depends on that order is one that can neither be reasoned about nor tested.
+// Nothing is recorded here: the claim is registered by the caller, which is the only place it is registered from. The
+// lock must be held.
+//
+// The walk is cheap however large the torrent is: a fresh claim costs a download slot and a peer holds one piece at a
+// time, so the claim map holds on the order of concurrentDownloads entries. Nothing has to consult t.have either — a
+// piece we already hold is never in the map at all.
+func (t *tracker) selectEndgameDuplicate(who *peer, has *fixedbits.Bits) int {
+	best := -1
+	bestOwners := 0
+	for index, owners := range t.who {
+		if len(owners) >= maxPieceOwners || !has.IsSet(index) || slices.Contains(owners, who) {
+			continue
+		}
+		if best == -1 || len(owners) < bestOwners || (len(owners) == bestOwners && index < best) {
+			best = index
+			bestOwners = len(owners)
+		}
+	}
+	return best
+}
+
 // downloadSlotAvailable returns true if the peer may take on a piece, which it may either because it is already one of
 // the peers downloading or because fewer than ConcurrentDownloads peers are. The claims are counted by the peers
-// holding them rather than by the pieces claimed, since what the option limits is how many peers we download from.
-// The lock must be held.
+// holding them rather than by the pieces claimed, since what the option limits is how many peers we download from: a
+// peer answers for a slot once however many pieces it owns, and a piece owned by several peers costs a slot for each
+// of them. The lock must be held.
 func (t *tracker) downloadSlotAvailable(who *peer) bool {
 	downloaders := make(map[*peer]bool, len(t.who))
-	for _, one := range t.who {
-		if one == who {
-			return true
+	for _, owners := range t.who {
+		for _, one := range owners {
+			if one == who {
+				return true
+			}
+			downloaders[one] = true
 		}
-		downloaders[one] = true
 	}
 	return len(downloaders) < t.client.concurrentDownloads
+}
+
+// downloadingPeerCount returns how many distinct peers hold a claim on a piece, which is the number Status reports as
+// the peers we are downloading from. Peers rather than claims: one peer is one peer we're downloading from however
+// many pieces it has taken on, and one piece is as many of them as have been asked for it.
+func (t *tracker) downloadingPeerCount() int {
+	t.lock.RLock()
+	defer t.lock.RUnlock()
+	downloaders := make(map[*peer]bool, len(t.who))
+	for _, owners := range t.who {
+		for _, one := range owners {
+			downloaders[one] = true
+		}
+	}
+	return len(downloaders)
 }

@@ -292,9 +292,7 @@ func (c *Client) fatalError() error {
 
 // Status returns the current status of the torrent.
 func (c *Client) Status() *Status {
-	c.tracker.lock.RLock()
-	peersDownloading := len(c.tracker.who)
-	c.tracker.lock.RUnlock()
+	peersDownloading := c.tracker.downloadingPeerCount()
 	c.lock.RLock()
 	peersConnected := len(c.peers)
 	c.lock.RUnlock()

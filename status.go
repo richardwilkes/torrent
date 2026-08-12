@@ -40,10 +40,12 @@ type Status struct {
 	RemainingBytes         int64
 	UploadBytesPerSecond   int
 	DownloadBytesPerSecond int
-	PeersDownloading       int
-	PeersConnected         int
-	Leechers               int
-	Seeders                int
+	// PeersDownloading counts the distinct peers we are currently downloading a piece from, not the pieces being
+	// downloaded: a peer answers for itself once however many pieces it has been asked for.
+	PeersDownloading int
+	PeersConnected   int
+	Leechers         int
+	Seeders          int
 }
 
 func (s *Status) String() string {

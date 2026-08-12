@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -28,6 +29,7 @@ import (
 
 	"github.com/richardwilkes/toolbox/v2/check"
 	"github.com/richardwilkes/toolbox/v2/xio"
+	"github.com/richardwilkes/torrent/container/fixedbits"
 	"github.com/richardwilkes/torrent/dispatcher"
 	"github.com/zeebo/bencode"
 )
@@ -1462,4 +1464,370 @@ func TestAnnounceReportsAnIPv6PeerListItCannotUse(t *testing.T) {
 	response.setBody(oneCompactPeerResponse)
 	c.NoError(client.tracker.announce(context.Background(), ""))
 	c.NotContains(quiet.contents(), "BEP-7")
+}
+
+// TestClearDownloadOnlyGivesUpTheCallersClaim verifies that a peer releasing a piece takes nothing with it but its own
+// claim. The owners of an index are recorded as a list so that one piece can be asked of several peers at once, and
+// the piece stays claimed until the last of them lets go: a release that dropped the whole list would leave peers
+// still fetching a piece every other peer is free to take up, and one that cleared the downloading bit while an owner
+// remained would do the same by another route.
+func TestClearDownloadOnlyGivesUpTheCallersClaim(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+	otherConn, other := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(otherConn)
+	strangerConn, stranger := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(strangerConn)
+
+	// Two peers own the one piece, recorded directly rather than through the endgame selection that hands out such a
+	// pair, since what is being judged here is only what a release does with it
+	client.tracker.lock.Lock()
+	client.tracker.who[0] = []*peer{p, other}
+	client.tracker.downloading.Set(0)
+	client.tracker.lock.Unlock()
+
+	// A peer that was never an owner has nothing to give up, and mustn't give up anyone else's claim in its place
+	client.tracker.clearDownload(0, stranger)
+	c.Equal([]*peer{p, other}, testPieceOwners(client.tracker, 0))
+	c.True(testPieceIsBeingDownloaded(client.tracker, 0))
+
+	// The first owner to leave takes its own claim and only that
+	client.tracker.clearDownload(0, p)
+	c.Equal([]*peer{other}, testPieceOwners(client.tracker, 0))
+	c.True(testPieceIsBeingDownloaded(client.tracker, 0), "a piece another peer is still fetching stays claimed")
+
+	// Releasing it a second time is the case of a peer that no longer owns the index, so nothing moves
+	client.tracker.clearDownload(0, p)
+	c.Equal([]*peer{other}, testPieceOwners(client.tracker, 0))
+	c.True(testPieceIsBeingDownloaded(client.tracker, 0))
+
+	// And the last owner to leave is what frees the piece for someone else
+	client.tracker.clearDownload(0, other)
+	c.Equal(0, len(testPieceOwners(client.tracker, 0)))
+	c.False(testPieceIsBeingDownloaded(client.tracker, 0), "a piece no one is fetching must be free to claim")
+	client.tracker.lock.RLock()
+	_, present := client.tracker.who[0]
+	client.tracker.lock.RUnlock()
+	c.False(present, "an index left with no owners must not stay in the claim map")
+}
+
+// TestMarkBlockValidDropsEveryClaimOnThePiece verifies that a piece landing releases all of its owners at once and is
+// still announced only once. An owner left behind is a piece we already hold that no peer may claim and that the
+// download bit says is still on its way, and a second "have" for it is a message to every peer we have; both are the
+// same guard, which the delivery of a piece two peers were asked for is what tests.
+func TestMarkBlockValidDropsEveryClaimOnThePiece(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	conn, p := newTestPeerFromHost(t, client, testPeerHost1, testPeerPort)
+	defer xio.CloseIgnoringErrors(conn)
+	otherConn, other := newTestPeerFromHost(t, client, testPeerHost2, testPeerPort)
+	defer xio.CloseIgnoringErrors(otherConn)
+
+	// Both peers own the piece, recorded directly rather than through the endgame selection that asks two of them for
+	// one piece, since what the delivery does with the pair is the whole of what is being judged
+	client.tracker.lock.Lock()
+	client.tracker.who[0] = []*peer{p, other}
+	client.tracker.downloading.Set(0)
+	client.tracker.lock.Unlock()
+
+	// Both of them deliver it, which is what asking two peers for one piece is asking for
+	client.tracker.markBlockValid(0)
+	client.tracker.markBlockValid(0)
+
+	c.True(client.tracker.hasPiece(0))
+	c.Equal(0, len(testPieceOwners(client.tracker, 0)), "a piece we hold must be left claimed by no one")
+	c.False(testPieceIsBeingDownloaded(client.tracker, 0))
+	for _, one := range []*peer{p, other} {
+		one.lock.RLock()
+		queued := slices.Clone(one.haveQueue)
+		one.lock.RUnlock()
+		c.Equal([]int{0}, queued, "a piece must be announced once however many peers delivered it")
+	}
+}
+
+// TestStatusCountsThePeersWeDownloadFrom verifies that the downloading figure in the status is a count of peers, which
+// is what the "D" in the summary line stands for. The claims are recorded per piece, so counting them answers with the
+// pieces on their way instead — the same number only for as long as no piece is asked of more than one peer.
+func TestStatusCountsThePeersWeDownloadFrom(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+	otherConn, other := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(otherConn)
+	c.Equal(0, client.Status().PeersDownloading, "nothing is claimed, so we're downloading from no one")
+
+	// One peer on one piece
+	c.Equal(0, client.tracker.selectForDownloading(p, everyTestPiece()))
+	c.Equal(1, client.Status().PeersDownloading)
+
+	// Two peers, each on a piece of its own
+	c.Equal(1, client.tracker.selectForDownloading(other, everyTestPiece()))
+	c.Equal(2, client.Status().PeersDownloading)
+
+	// And two peers on the one piece, recorded directly rather than through the endgame that produces it, are two peers
+	client.tracker.clearDownload(1, other)
+	client.tracker.lock.Lock()
+	client.tracker.who[0] = append(client.tracker.who[0], other)
+	client.tracker.lock.Unlock()
+	c.Equal(2, client.Status().PeersDownloading, "two peers fetching one piece is two peers we download from")
+
+	// One of them letting go leaves the other still downloading
+	client.tracker.clearDownload(0, other)
+	c.Equal(1, client.Status().PeersDownloading)
+}
+
+// TestADuplicateClaimIsOnlyTakenOnceEveryMissingPieceIsClaimed verifies both halves of what puts a peer into the
+// endgame. Near the end of a download every piece we still lack can be claimed at once, leaving the whole thing
+// waiting on whichever peers hold those pieces while every other peer sits idle with nothing it is allowed to take;
+// from there an idle peer is put on a piece someone else is already fetching. What decides that is the state of the
+// torrent rather than of the peer being asked: a duplicate taken while some piece is still sitting there unclaimed
+// spends the peer on bytes already on their way and leaves that piece for nobody to fetch.
+func TestADuplicateClaimIsOnlyTakenOnceEveryMissingPieceIsClaimed(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+	idleConn, idle := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(idleConn)
+	last := testPieceCount - 1
+
+	// Everything but the last piece is ours, and one peer has claimed that one, so nothing we lack is free
+	markTestPiecesAvailable(client, 0, 1, 2)
+	c.Equal(last, client.tracker.selectForDownloading(p, everyTestPiece()))
+	c.True(client.tracker.inEndgame())
+
+	// Which is what lets the peer that would otherwise be idle back that claim up
+	c.Equal(last, client.tracker.selectForDownloading(idle, everyTestPiece()),
+		"an idle peer must be able to back up the claim the whole download is waiting on")
+	c.Equal([]*peer{p, idle}, testPieceOwners(client.tracker, last))
+	c.True(testPieceIsBeingDownloaded(client.tracker, last), "a duplicated piece is still a piece being downloaded")
+
+	// With a piece still unclaimed, that piece is what an idle peer is given, even though it holds the claimed one too
+	client = newTestClient(d)
+	busyConn, busy := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(busyConn)
+	freshConn, fresh := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(freshConn)
+	markTestPiecesAvailable(client, 0, 1)
+	c.Equal(last, client.tracker.selectForDownloading(busy, testPiecesHeld(last)))
+	c.False(client.tracker.inEndgame(), "a missing piece no one has claimed is one a peer can simply take")
+	c.Equal(2, client.tracker.selectForDownloading(fresh, everyTestPiece()),
+		"an unclaimed piece must be taken up rather than doubled up on one that isn't")
+	c.Equal([]*peer{busy}, testPieceOwners(client.tracker, last), "the claimed piece must be left with its one owner")
+}
+
+// TestADuplicateClaimIsBoundedPerPiece verifies that a piece stops being handed out at maxPieceOwners. Every owner
+// beyond the one that wins the race is a copy of the piece we pay for and throw away, so without the bound the tail of
+// a download — where every peer is idle and every missing piece is claimed — would be fetched as many times over as we
+// have peers.
+func TestADuplicateClaimIsBoundedPerPiece(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	last := testPieceCount - 1
+	markTestPiecesAvailable(client, 0, 1, 2)
+
+	// The last piece is given every owner it is allowed
+	conns := make([]net.Conn, 0, maxPieceOwners+1)
+	defer func() {
+		for _, conn := range conns {
+			xio.CloseIgnoringErrors(conn)
+		}
+	}()
+	for i := range maxPieceOwners {
+		conn, p := newTestPeer(t, client)
+		conns = append(conns, conn)
+		c.Equal(last, client.tracker.selectForDownloading(p, everyTestPiece()), "owner %d", i)
+	}
+	c.Equal(maxPieceOwners, len(testPieceOwners(client.tracker, last)))
+
+	// And the next peer to ask is turned away rather than made one more copy of it
+	conn, extra := newTestPeer(t, client)
+	conns = append(conns, conn)
+	c.Equal(-1, client.tracker.selectForDownloading(extra, everyTestPiece()),
+		"a piece with every owner it is allowed must not take another")
+	c.Equal(maxPieceOwners, len(testPieceOwners(client.tracker, last)))
+}
+
+// TestADuplicateClaimTakesTheLeastClaimedPiece verifies which piece the endgame hands over: the one the fewest peers
+// are already fetching, so that the backing up spreads across the pieces still outstanding rather than piling onto
+// whichever one happened to be looked at first, and the lowest index of those that are level. The claims are held in a
+// map, which is walked in no particular order, so an answer left to that order is one that can neither be reasoned
+// about nor tested.
+func TestADuplicateClaimTakesTheLeastClaimedPiece(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	conns := make([]net.Conn, 0, 4)
+	peers := make([]*peer, 0, cap(conns))
+	defer func() {
+		for _, conn := range conns {
+			xio.CloseIgnoringErrors(conn)
+		}
+	}()
+	for range cap(peers) {
+		conn, p := newTestPeer(t, client)
+		conns = append(conns, conn)
+		peers = append(peers, p)
+	}
+
+	// Pieces 2 and 3 are all that is left, with one peer on each of them
+	markTestPiecesAvailable(client, 0, 1)
+	c.Equal(2, client.tracker.selectForDownloading(peers[0], everyTestPiece()))
+	c.Equal(3, client.tracker.selectForDownloading(peers[1], everyTestPiece()))
+	c.True(client.tracker.inEndgame())
+
+	// The two being level at one owner apiece, the lower index is what settles it
+	c.Equal(2, client.tracker.selectForDownloading(peers[2], everyTestPiece()),
+		"an even choice must be settled by the index rather than by the order the claims are walked in")
+
+	// Which leaves piece 3 the one fewer peers are fetching, so it is what the next peer is put on
+	c.Equal(3, client.tracker.selectForDownloading(peers[3], everyTestPiece()),
+		"the piece with the fewest peers on it is the one that most needs another")
+	c.Equal(2, len(testPieceOwners(client.tracker, 2)))
+	c.Equal(2, len(testPieceOwners(client.tracker, 3)))
+}
+
+// TestAPeerNeverDuplicatesItsOwnClaim verifies that the endgame doesn't hand a peer the piece it is already fetching.
+// A peer racing itself backs up nothing — both copies come down the same connection, at whatever speed that connection
+// manages — while the owner it spends is one that a peer which could actually help is then refused.
+func TestAPeerNeverDuplicatesItsOwnClaim(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+	last := testPieceCount - 1
+
+	markTestPiecesAvailable(client, 0, 1, 2)
+	c.Equal(last, client.tracker.selectForDownloading(p, everyTestPiece()))
+	c.True(client.tracker.inEndgame())
+	c.Equal(-1, client.tracker.selectForDownloading(p, everyTestPiece()),
+		"the peer already fetching the piece is not a backup for it")
+	c.Equal([]*peer{p}, testPieceOwners(client.tracker, last))
+}
+
+// TestACompleteDownloadClaimsNothing verifies that a torrent with nothing left to fetch hands out no pieces of either
+// kind. Every piece being accounted for reads exactly as the endgame does — nothing missing is unclaimed — so without
+// the guard on what is left, a client that has finished downloading and is seeding would go on claiming pieces for
+// every peer that unchoked it.
+func TestACompleteDownloadClaimsNothing(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+
+	for i := range testPieceCount {
+		client.tracker.markBlockValid(i)
+	}
+	c.True(client.tracker.isDownloadComplete())
+	c.False(client.tracker.inEndgame(), "a download with nothing left to fetch is not in the endgame")
+	c.Equal(-1, client.tracker.selectForDownloading(p, everyTestPiece()),
+		"a torrent we hold every piece of has nothing to claim")
+	c.Equal(0, client.Status().PeersDownloading)
+}
+
+// TestInEndgameFollowsTheClaimsOnWhatIsMissing verifies the state the endgame is entered and left on, which is what
+// the peers ask before offering to duplicate a claim: unfinished, with every piece we still lack already being
+// fetched by someone.
+func TestInEndgameFollowsTheClaimsOnWhatIsMissing(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+	last := testPieceCount - 1
+
+	// A torrent with everything still to fetch and nothing claimed is as far from the endgame as it gets
+	c.False(client.tracker.inEndgame())
+
+	// Down to one missing piece that no one has taken, it still isn't in it: that piece is there for the taking
+	for i := range last {
+		client.tracker.markBlockValid(i)
+	}
+	c.False(client.tracker.inEndgame(), "a missing piece no one has claimed leaves an idle peer something to do")
+
+	// Someone taking it is what leaves the rest of the peers with nothing but a duplicate to offer
+	c.Equal(last, client.tracker.selectForDownloading(p, everyTestPiece()))
+	c.True(client.tracker.inEndgame())
+
+	// And its arrival ends the download, which ends the endgame with it
+	client.tracker.markBlockValid(last)
+	c.False(client.tracker.inEndgame(), "a finished download has nothing left worth duplicating")
+}
+
+// TestDuplicateClaimsRaceOnlyUpToTheBound verifies that two peers arriving at the last piece together can't both get
+// past maxPieceOwners. The owners are counted and added to in one critical section, which is what makes the pair of
+// them serial; counted outside it, the bound would hold only for peers that happened not to overlap, and a swarm
+// reaching the endgame is precisely a set of idle peers all offered the same piece at the same moment.
+func TestDuplicateClaimsRaceOnlyUpToTheBound(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	last := testPieceCount - 1
+	markTestPiecesAvailable(client, 0, 1, 2)
+	conns := make([]net.Conn, 0, maxPieceOwners+1)
+	defer func() {
+		for _, conn := range conns {
+			xio.CloseIgnoringErrors(conn)
+		}
+	}()
+
+	// The last piece is given every owner it is allowed but one, so that exactly one of the two peers that race for
+	// what is left of it can be handed it
+	for i := range maxPieceOwners - 1 {
+		conn, p := newTestPeer(t, client)
+		conns = append(conns, conn)
+		c.Equal(last, client.tracker.selectForDownloading(p, everyTestPiece()), "owner %d", i)
+	}
+
+	// Claiming a piece needs the tracker's lock, so holding it parks both peers inside the selection with neither of
+	// them having decided anything, which is the whole of the window they can race in
+	client.tracker.lock.Lock()
+	selected := make(chan int, 2)
+	for range cap(selected) {
+		conn, p := newTestPeer(t, client)
+		conns = append(conns, conn)
+		go func() { selected <- client.tracker.selectForDownloading(p, everyTestPiece()) }()
+	}
+	waitForParkedGoroutines(t, cap(selected), "torrent.(*tracker).selectForDownloading(")
+	client.tracker.lock.Unlock()
+
+	results := []int{<-selected, <-selected}
+	slices.Sort(results)
+	c.Equal([]int{-1, last}, results, "one of the two peers must be refused, results: %v", results)
+	c.Equal(maxPieceOwners, len(testPieceOwners(client.tracker, last)),
+		"the piece must be left with exactly the owners it is allowed")
+}
+
+// testPieceOwners returns the peers holding a claim on the piece, which is empty when no one has claimed it.
+func testPieceOwners(t *tracker, index int) []*peer {
+	t.lock.RLock()
+	defer t.lock.RUnlock()
+	return slices.Clone(t.who[index])
+}
+
+// testPieceIsBeingDownloaded returns whether the piece is recorded as one someone is fetching.
+func testPieceIsBeingDownloaded(t *tracker, index int) bool {
+	t.lock.RLock()
+	defer t.lock.RUnlock()
+	return t.downloading.IsSet(index)
+}
+
+// testPiecesHeld returns a bit set claiming exactly the given pieces of the test torrent, as a peer holding part of it
+// would, for the tests that need a peer which cannot be handed just any piece.
+func testPiecesHeld(indexes ...int) *fixedbits.Bits {
+	has := fixedbits.New(testPieceCount)
+	for _, index := range indexes {
+		has.Set(index)
+	}
+	return has
 }

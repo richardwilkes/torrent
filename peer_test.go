@@ -732,10 +732,7 @@ func TestAStorageWriteFailureStopsTheTorrent(t *testing.T) {
 	claimed := slices.Sorted(maps.Keys(p.pieces))
 	p.lock.RUnlock()
 	c.Equal(0, len(claimed), "the piece must not be claimed again, indexes: %v", claimed)
-	client.tracker.lock.RLock()
-	who := client.tracker.who[0]
-	client.tracker.lock.RUnlock()
-	c.Nil(who)
+	c.Equal(0, len(testPieceOwners(client.tracker, 0)))
 }
 
 // newReadOnlyTestStorage creates the storage file for the test torrent and hands back a handle that can only be read
@@ -1030,10 +1027,15 @@ func TestAPieceReclaimedWhileItsQueueEntryIsSettledKeepsIt(t *testing.T) {
 // TestACompletedPieceOnlyGivesUpTheClaimItFinished verifies that finishing a piece gives up the very piece that was
 // finished rather than whatever is claimed for that index by the time it is done. The hash and the disk write sit
 // between taking the buffer and giving the claim up and nothing holds the piece's lock across them, so
-// clearExpiredDownloads can release the index while the write is in flight and another peer's goroutine re-claim it —
-// it is available again, since the block isn't marked valid until afterwards. Giving up whatever is there then throws
-// that fresh claim away with its chunk requests already on the wire, and the peer answers with a whole piece we are
-// about to mark as had: every chunk of it ignored, and all of it charged to the tracker's downloaded total.
+// clearExpiredDownloads can release the index while the write is in flight and another goroutine re-claim it — it is
+// available again, since the block isn't marked valid until afterwards.
+//
+// The fresh claim is on its way out either way, since the announcement that follows takes back every record of a piece
+// we now hold, but which of the two drops it decides what the peer is left owing us. Giving up whatever is there loses
+// the requests already on the wire along with it, and they are never taken back: the peer answers with a whole piece we
+// have just marked as had, every chunk of it ignored on arrival and all of it charged to the tracker's downloaded
+// total. It is also what a storage failure would give the claim back on, handing away an index that belongs to whoever
+// took it up rather than to the write that failed.
 func TestACompletedPieceOnlyGivesUpTheClaimItFinished(t *testing.T) {
 	c := check.New(t)
 	d := newTestDispatcher(t)
@@ -1049,20 +1051,27 @@ func TestACompletedPieceOnlyGivesUpTheClaimItFinished(t *testing.T) {
 	p.lock.RUnlock()
 
 	// The index is released and re-claimed, which is what a completion still working through its hash and its write
-	// would find had happened underneath it
+	// would find had happened underneath it. The whole of the replacement has been asked for, so what the announcement
+	// takes back is what says whether the completion left it alone: only a record that was still there when the piece
+	// was announced has any requests to cancel.
 	c.True(p.releaseIfStillOurs(0, one))
 	p.queuePieceDownload(0)
 	p.lock.RLock()
 	fresh := p.pieces[0]
 	p.lock.RUnlock()
 	c.True(fresh != nil && fresh != one, "the index must have been re-claimed for a piece of its own")
+	fresh.lock.Lock()
+	fresh.askedTo = chunkSize
+	fresh.inFlight = 1
+	fresh.lock.Unlock()
 
 	c.NoError(p.completePiece(0, one, testStorageBytes(0, 0, chunkSize)))
 	c.True(client.tracker.hasPiece(0), "the piece that was finished must still be counted as one we have")
-	p.lock.RLock()
-	held := p.pieces[0]
-	p.lock.RUnlock()
-	c.True(held == fresh, "finishing a piece must not throw away the claim that replaced it")
+	held, _ := testClaims(p)
+	c.Equal(0, len(held), "the announcement drops every record of a piece we now hold, indexes: %v", held)
+	_, cancels := testStateQueues(p)
+	c.Equal([][3]int{{0, 0, chunkSize}}, decodeTestCancels(t, cancels),
+		"finishing a piece must not throw away the claim that replaced it, requests and all")
 }
 
 // TestCompletingAPieceDoesNotHoldThePiecesLock verifies that the hash and the disk write a finished piece goes through
@@ -1139,7 +1148,11 @@ func TestOnlyOnePieceIsClaimedForAPeerAtATime(t *testing.T) {
 	client.tracker.lock.RLock()
 	who := maps.Clone(client.tracker.who)
 	client.tracker.lock.RUnlock()
-	c.Equal(1, len(who), "the tracker must be left with the one claim the peer actually holds")
+	claims := 0
+	for _, owners := range who {
+		claims += len(owners)
+	}
+	c.Equal(1, claims, "the tracker must be left with the one claim the peer actually holds, claims: %v", who)
 }
 
 // TestAStorageReadFailureStopsTheTorrent verifies that storage we can't read isn't left as one connection's problem.
@@ -2482,10 +2495,9 @@ func TestPieceIsNotClaimedByAPeerThatIsOnItsWayOut(t *testing.T) {
 	c.Equal(0, held, "a peer that is bailing out must not take on a piece")
 	client.tracker.lock.RLock()
 	downloading := client.tracker.downloading.IsSet(0)
-	who := client.tracker.who[0]
 	client.tracker.lock.RUnlock()
 	c.False(downloading, "the piece must be left available for another peer")
-	c.Nil(who)
+	c.Equal(0, len(testPieceOwners(client.tracker, 0)))
 }
 
 // TestExpiredDownloadsLeaveAnotherPeersClaimAlone verifies that a peer giving up a piece can't take the claim away
@@ -2509,10 +2521,9 @@ func TestExpiredDownloadsLeaveAnotherPeersClaimAlone(t *testing.T) {
 	p.clearExpiredDownloads()
 	client.tracker.lock.RLock()
 	downloading := client.tracker.downloading.IsSet(0)
-	who := client.tracker.who[0]
 	client.tracker.lock.RUnlock()
 	c.True(downloading, "the claim of the peer that is downloading the piece must be left alone")
-	c.Equal(other, who)
+	c.Equal([]*peer{other}, testPieceOwners(client.tracker, 0))
 
 	// Its own record of the piece is still given up, and the claim goes away once its owner releases it
 	p.lock.RLock()
@@ -2573,10 +2584,9 @@ func TestAnExpiredDownloadReleaseOnlyGivesUpThePieceItDecidedAbout(t *testing.T)
 	c.True(stillHeld == fresh, "the freshly claimed piece must survive a release decided about the piece before it")
 	client.tracker.lock.RLock()
 	downloading = client.tracker.downloading.IsSet(0)
-	who := client.tracker.who[0]
 	client.tracker.lock.RUnlock()
 	c.True(downloading, "the freshly claimed piece must keep its tracker claim")
-	c.Equal(p, who)
+	c.Equal([]*peer{p}, testPieceOwners(client.tracker, 0))
 }
 
 // TestABitFieldStartsADownloadOnAPeerThatUnchokedFirst verifies that learning what a peer has starts a download even
@@ -2648,10 +2658,511 @@ func TestAFreedPieceNudgesTheOtherPeers(t *testing.T) {
 	claimed := slices.Sorted(maps.Keys(other.pieces))
 	other.lock.RUnlock()
 	c.Equal([]int{0}, claimed, "the freed piece must be taken up by a peer that can download it")
-	client.tracker.lock.RLock()
-	who := client.tracker.who[0]
-	client.tracker.lock.RUnlock()
-	c.Equal(other, who)
+	c.Equal([]*peer{other}, testPieceOwners(client.tracker, 0))
+}
+
+// TestTheEndgameOnsetNudgesTheOtherPeers verifies that the claim which takes the last unclaimed piece tells the rest of
+// the peers to look for something to download. That claim is the moment the endgame begins and nothing else carries it:
+// a piece being given back nudges them, but a claim is the opposite of that, and against a swarm of seeders no have and
+// no unchoke is coming either. The peers the endgame exists to recruit are precisely the ones that are already
+// connected, unchoked and idle, so without this they would sit out the tail of the download the whole thing is waiting
+// on.
+func TestTheEndgameOnsetNudgesTheOtherPeers(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	conn, p := newTestPeerFromHost(t, client, testPeerHost1, testPeerPort)
+	defer xio.CloseIgnoringErrors(conn)
+	otherConn, other := newTestPeerFromHost(t, client, testPeerHost2, testPeerPort)
+	defer xio.CloseIgnoringErrors(otherConn)
+	last := testPieceCount - 1
+
+	// Everything but the last piece is ours, and both peers hold the whole torrent, aren't choking us and have nothing
+	// to do
+	markTestPiecesAvailable(client, 0, 1, 2)
+	for _, one := range []*peer{p, other} {
+		one.lock.Lock()
+		one.peerChoking = false
+		one.has = everyTestPiece()
+		one.lock.Unlock()
+	}
+
+	// Only the first peer is told to look, and taking what is left is what puts the torrent in the endgame
+	p.startDownloadIfNeeded()
+	c.True(client.tracker.inEndgame())
+
+	owners := testPieceOwners(client.tracker, last)
+	c.Equal(2, len(owners), "the last piece must be fetched by both peers, owners: %v", owners)
+	c.True(slices.Contains(owners, p), "the peer that claimed the piece must own it")
+	c.True(slices.Contains(owners, other), "the peer that was never asked directly must have been recruited")
+	for _, one := range []*peer{p, other} {
+		one.lock.RLock()
+		claimed := slices.Sorted(maps.Keys(one.pieces))
+		one.lock.RUnlock()
+		c.Equal([]int{last}, claimed, "both peers must be downloading the piece they own")
+	}
+}
+
+// TestAClaimOutsideTheEndgameLeavesTheOtherPeersAlone verifies that an ordinary claim doesn't fan out to every peer we
+// have. While any missing piece is still unclaimed there is nothing for the fan-out to hand out — a peer it woke could
+// only take a piece it was already free to take whenever something did wake it — so the walk over every peer, and the
+// serialization lock each of them is taken through, would be spent on every claim of the download for nothing.
+func TestAClaimOutsideTheEndgameLeavesTheOtherPeersAlone(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	conn, p := newTestPeerFromHost(t, client, testPeerHost1, testPeerPort)
+	defer xio.CloseIgnoringErrors(conn)
+	otherConn, other := newTestPeerFromHost(t, client, testPeerHost2, testPeerPort)
+	defer xio.CloseIgnoringErrors(otherConn)
+	last := testPieceCount - 1
+
+	// Two pieces are still missing, so the claim the first peer makes leaves one of them for anybody to take
+	markTestPiecesAvailable(client, 0, 1)
+	for _, one := range []*peer{p, other} {
+		one.lock.Lock()
+		one.peerChoking = false
+		one.has = everyTestPiece()
+		one.lock.Unlock()
+	}
+
+	p.startDownloadIfNeeded()
+	c.False(client.tracker.inEndgame(), "a missing piece nobody has claimed keeps the torrent out of the endgame")
+
+	p.lock.RLock()
+	claimed := slices.Sorted(maps.Keys(p.pieces))
+	p.lock.RUnlock()
+	c.Equal([]int{2}, claimed, "the peer that was told to look must take the piece it was offered")
+	other.lock.RLock()
+	untouched := len(other.pieces)
+	other.lock.RUnlock()
+	c.Equal(0, untouched, "a claim outside the endgame must not put the other peers to work")
+	c.Equal(0, len(testPieceOwners(client.tracker, last)))
+	c.False(testPieceIsBeingDownloaded(client.tracker, last))
+}
+
+// TestAClaimACompletionOvertookIsGivenBack verifies that a peer handed a piece that has since been delivered by
+// somebody else drops it instead of downloading it. The claim is registered under the tracker's lock before the peer
+// has any record of the piece, and the endgame has several peers fetching one piece on purpose, so a completion landing
+// in that window is exactly what the tail of a download produces: without the re-check the peer would pull a whole
+// piece of data we already hold off the network, and hold a claim on it while it did.
+func TestAClaimACompletionOvertookIsGivenBack(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+	last := testPieceCount - 1
+
+	// The peer is handed the one piece we're still missing, and the peer that was already fetching it delivers it
+	// before this one has a record of its own
+	markTestPiecesAvailable(client, 0, 1, 2)
+	c.Equal(last, client.tracker.selectForDownloading(p, everyTestPiece()))
+	client.tracker.markBlockValid(last)
+
+	c.False(p.queuePieceDownload(last), "a piece the torrent already holds must be reported as one to look past")
+	p.lock.RLock()
+	held := slices.Sorted(maps.Keys(p.pieces))
+	queued := slices.Sorted(maps.Keys(p.pendingChunkRequests))
+	p.lock.RUnlock()
+	c.Equal(0, len(held), "a piece we already hold must not be taken on, indexes: %v", held)
+	c.Equal(0, len(queued), "nothing may be asked for on a piece that was given straight back, indexes: %v", queued)
+	c.Equal(0, len(testPieceOwners(client.tracker, last)), "the claim must not survive the piece being dropped")
+	c.False(testPieceIsBeingDownloaded(client.tracker, last))
+}
+
+// TestAPeerLooksAgainWhenItsClaimWasAlreadyHad verifies that a peer whose piece was given back because the torrent
+// already holds it goes on to take one that is actually missing. The drop leaves it exactly as idle as it was before
+// the tracker answered, and nothing would come back to it: no piece was given up, so no peer is nudged, and a peer that
+// has already unchoked us and told us what it holds has nothing left to say that would start a download.
+//
+// The window the drop needs is arranged rather than raced for. The tracker's lock parks the peer inside the selection,
+// and taking the peer's own lock before letting go of it parks the peer again at the point where it records the piece
+// it was handed, which is where a completion by somebody else lands.
+func TestAPeerLooksAgainWhenItsClaimWasAlreadyHad(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+	last := testPieceCount - 1
+
+	// The peer holds the whole torrent and isn't choking us, and the first two pieces are ours, so piece 2 is what it
+	// is offered
+	markTestPiecesAvailable(client, 0, 1)
+	p.lock.Lock()
+	p.peerChoking = false
+	p.has = everyTestPiece()
+	p.lock.Unlock()
+
+	client.tracker.lock.Lock()
+	done := make(chan struct{})
+	go func() { defer close(done); p.startDownloadIfNeeded() }()
+	waitForParkedGoroutines(t, 1, "torrent.(*tracker).selectForDownloading(")
+	p.lock.Lock()
+	client.tracker.lock.Unlock()
+	waitForParkedGoroutines(t, 1, "torrent.(*peer).queuePieceDownload(")
+
+	// The piece it was handed arrives from somewhere else while it is parked there
+	markTestPiecesAvailable(client, 2)
+	p.lock.Unlock()
+	select {
+	case <-done:
+	case <-time.After(peerMgmtWait):
+		t.Fatal("the peer never finished looking for something to download")
+	}
+
+	p.lock.RLock()
+	held := slices.Sorted(maps.Keys(p.pieces))
+	queued := slices.Sorted(maps.Keys(p.pendingChunkRequests))
+	p.lock.RUnlock()
+	c.Equal([]int{last}, held, "the peer must go on to the piece that is still missing")
+	c.Equal([]int{last}, queued, "only the piece it kept may be asked for")
+	c.Equal([]*peer{p}, testPieceOwners(client.tracker, last))
+	c.Equal(0, len(testPieceOwners(client.tracker, 2)), "the claim on a piece we already hold must be given back")
+	c.False(testPieceIsBeingDownloaded(client.tracker, 2))
+}
+
+// TestALostEndgameRaceCancelsWhatWasNeverAnswered verifies that the peer which loses an endgame race gives the piece up
+// and tells the remote to stop serving the chunks of it that are still outstanding. Left alone it would go on pulling
+// the whole rest of a piece we already hold off the network — every chunk of it ignored on arrival — and the one piece
+// at a time it may hold would keep it from taking anything else on until expiry reaped the record two minutes later.
+// Only what was actually asked for and never answered may be taken back: a cancel for a block the peer was never asked
+// for, or for one it has already sent, is a message it has to read and match against a queue that holds no such thing.
+func TestALostEndgameRaceCancelsWhatWasNeverAnswered(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	const chunks = 4
+	client := newTestClientForTorrent(d, newTestTorrentFileWithChunksPerPiece(chunks, testPieceCount))
+	race := newTestEndgameRace(t, client)
+
+	// Three of the piece's four chunks have been asked for and the middle one of those has come back, so the first and
+	// the third are what the peer still owes us
+	one := testPieceHeldBy(t, race.loser, race.index)
+	one.lock.Lock()
+	one.askedTo = 3 * chunkSize
+	one.inFlight = 2
+	one.spans.Insert(&spanlist.Span{Start: chunkSize, Length: chunkSize})
+	one.lock.Unlock()
+
+	client.tracker.markBlockValid(race.index)
+
+	held, queued := testClaims(race.loser)
+	c.Equal(0, len(held), "the piece somebody else finished must be given up, indexes: %v", held)
+	c.Equal(0, len(queued), "a piece we gave up may have nothing left to ask for, indexes: %v", queued)
+	haves, cancels := testStateQueues(race.loser)
+	c.Equal([]int{race.index}, haves, "the peer must still be told we have the piece")
+	c.Equal([][3]int{{race.index, 0, chunkSize}, {race.index, 2 * chunkSize, chunkSize}}, decodeTestCancels(t, cancels),
+		"only the chunks that were asked for and never answered may be taken back")
+}
+
+// TestALostEndgameRaceLooksForAnotherPiece verifies that the peer whose piece was taken out from under it goes on to
+// take up another. The abandonment leaves it exactly as idle as a fresh connection, and nothing would come back to it:
+// no piece was given back, so no peer is nudged, and a peer that has already unchoked us and told us what it holds has
+// nothing left to say that would start a download. Sitting it out is what the endgame exists to prevent.
+func TestALostEndgameRaceLooksForAnotherPiece(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClientForTorrent(d, newTestTorrentFileWithHashes())
+	defer client.closeRateLimiters()
+	client.file = newTestStorage(t, client)
+	winnerConn, winner := newTestPeerFromHost(t, client, testPeerHost1, testPeerPort)
+	defer xio.CloseIgnoringErrors(winnerConn)
+	otherConn, other := newTestPeerFromHost(t, client, testPeerHost2, testPeerPort)
+	defer xio.CloseIgnoringErrors(otherConn)
+	loserConn, loser := newTestPeerFromHost(t, client, testPeerHost3, testPeerPort)
+	defer xio.CloseIgnoringErrors(loserConn)
+
+	// The first two pieces are ours and the last two are each claimed by a peer of their own, which is the endgame and
+	// leaves the third peer a duplicate to take. The two claims are tied for the fewest owners, so the lower index wins
+	// it and the third peer joins the piece the winner is fetching.
+	markTestPiecesAvailable(client, 0, 1)
+	for _, one := range []*peer{winner, other, loser} {
+		one.lock.Lock()
+		one.peerChoking = false
+		one.has = everyTestPiece()
+		one.lock.Unlock()
+	}
+	c.Equal(2, client.tracker.selectForDownloading(winner, everyTestPiece()))
+	c.Equal(3, client.tracker.selectForDownloading(other, everyTestPiece()))
+	c.True(client.tracker.inEndgame())
+	c.Equal(2, client.tracker.selectForDownloading(loser, everyTestPiece()))
+	c.True(winner.queuePieceDownload(2))
+	c.True(other.queuePieceDownload(3))
+	c.True(loser.queuePieceDownload(2))
+
+	// Completing the piece is what carries the loss out to everyone else
+	c.NoError(winner.completePiece(2, testPieceHeldBy(t, winner, 2), testStorageBytes(2, 0, chunkSize)))
+
+	held, queued := testClaims(loser)
+	c.Equal([]int{3}, held, "a peer that lost its piece must take up the one the download is still waiting on")
+	c.Equal([]int{3}, queued, "the piece it took up must be one it will ask for")
+	c.True(slices.Contains(testPieceOwners(client.tracker, 3), loser),
+		"the tracker must record the claim the peer took up")
+}
+
+// TestCancelsGoOutBeforeTheHaveTheyCameWith verifies the order the two messages an abandonment produces reach the wire
+// in. A remote told first that we hold the piece and only then to stop serving it has every reason to wonder what we
+// were still asking for, while the other order says nothing surprising at all.
+func TestCancelsGoOutBeforeTheHaveTheyCameWith(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	const chunks = 4
+	client := newTestClientForTorrent(d, newTestTorrentFileWithChunksPerPiece(chunks, testPieceCount))
+	race := newTestEndgameRace(t, client)
+
+	// The first three chunks were asked for and the middle one answered, so two requests are outstanding
+	one := testPieceHeldBy(t, race.loser, race.index)
+	one.lock.Lock()
+	one.askedTo = 3 * chunkSize
+	one.inFlight = 2
+	one.spans.Insert(&spanlist.Span{Start: chunkSize, Length: chunkSize})
+	one.lock.Unlock()
+
+	done := make(chan bool)
+	defer close(done)
+	go race.loser.processStateChanges(done)
+
+	client.tracker.markBlockValid(race.index)
+
+	c.Equal(newCancelMessage(race.index, 0, chunkSize), nextQueuedMessage(t, race.loser))
+	c.Equal(newCancelMessage(race.index, 2*chunkSize, chunkSize), nextQueuedMessage(t, race.loser))
+	c.Equal(newHaveMessage(race.index), nextQueuedMessage(t, race.loser))
+}
+
+// TestTheWinnerOfAnEndgameRaceNeverAbandonsItsOwnPiece verifies that the peer which completed a piece isn't treated as
+// having lost the race for it. It announces the piece to itself along with every other peer, so a record of the piece
+// still sitting in its map at that point would have it canceling requests it just satisfied — and, with the piece
+// dropped a second time, telling the tracker to give back a claim that has already gone to somebody else.
+func TestTheWinnerOfAnEndgameRaceNeverAbandonsItsOwnPiece(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClientForTorrent(d, newTestTorrentFileWithHashes())
+	defer client.closeRateLimiters()
+	client.file = newTestStorage(t, client)
+	race := newTestEndgameRace(t, client)
+
+	// The whole of the piece arrives from the winner, which is what runs the announcement out to every peer we have
+	c.NoError(race.winner.receivedChunk(race.index, 0, testStorageBytes(race.index, 0, chunkSize)))
+	c.True(client.tracker.hasPiece(race.index))
+
+	held, _ := testClaims(race.winner)
+	c.Equal(0, len(held), "the piece must be gone from the peer that finished it, indexes: %v", held)
+	haves, cancels := testStateQueues(race.winner)
+	c.Equal([]int{race.index}, haves, "the peer that finished the piece is told about it like any other")
+	c.Equal(0, len(cancels), "nothing may be taken back from the peer that answered every request, cancels: %v",
+		decodeTestCancels(t, cancels))
+	loserHeld, _ := testClaims(race.loser)
+	c.Equal(0, len(loserHeld), "the peer that lost the race must have given the piece up, indexes: %v", loserHeld)
+}
+
+// TestAChunkForAnAbandonedPieceIsIgnored verifies that the chunks already on their way when a piece is abandoned are
+// dropped rather than treated as an offense. Canceling a request doesn't unsend what the remote has already put on the
+// wire, and a peer that answered us before our cancel reached it has done nothing wrong: banning it for that would cost
+// us a perfectly good peer, and the address for five minutes, every time an endgame race was lost.
+func TestAChunkForAnAbandonedPieceIsIgnored(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	const chunks = 4
+	client := newTestClientForTorrent(d, newTestTorrentFileWithChunksPerPiece(chunks, testPieceCount))
+	race := newTestEndgameRace(t, client)
+	one := testPieceHeldBy(t, race.loser, race.index)
+	one.lock.Lock()
+	one.askedTo = chunks * chunkSize
+	one.inFlight = chunks
+	one.lock.Unlock()
+
+	client.tracker.markBlockValid(race.index)
+
+	c.NoError(race.loser.receivedChunk(race.index, 0, testStorageBytes(race.index, 0, chunkSize)))
+	held, _ := testClaims(race.loser)
+	c.Equal(0, len(held), "a chunk for an abandoned piece must not bring the piece back, indexes: %v", held)
+	c.False(d.GateKeeper().IsAddressBlocked(race.loser.conn.RemoteAddr()),
+		"a peer that answered a request before our cancel reached it must not be banned for it")
+	checkConnOpen(t, race.loserConn, true)
+}
+
+// TestExpiryFindsNothingLeftOfAnAbandonedPiece verifies that the expiry pass makes nothing of a piece the abandonment
+// already took. The record it would have acted on is gone, so there is no second release to hand back a claim that has
+// since gone elsewhere — and, just as importantly, no peer to give up on: the piece it would be blamed for never
+// delivering is one we told it to stop sending.
+func TestExpiryFindsNothingLeftOfAnAbandonedPiece(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	const chunks = 4
+	client := newTestClientForTorrent(d, newTestTorrentFileWithChunksPerPiece(chunks, testPieceCount))
+	race := newTestEndgameRace(t, client)
+
+	// The piece is one the expiry pass would take, had the abandonment not reached it first: asked for, past its
+	// deadline and with nothing having arrived for longer than any peer is given
+	one := testPieceHeldBy(t, race.loser, race.index)
+	one.lock.Lock()
+	one.askedTo = 2 * chunkSize
+	one.requested = true
+	one.timeout = time.Now().Add(-time.Minute)
+	one.lastProgress = time.Now().Add(-2 * maxDownloadStall)
+	one.lock.Unlock()
+
+	client.tracker.markBlockValid(race.index)
+	race.loser.clearExpiredDownloads()
+
+	held, _ := testClaims(race.loser)
+	c.Equal(0, len(held), "the abandonment already took the piece, indexes: %v", held)
+	race.loser.lock.RLock()
+	bailing := race.loser.bail
+	race.loser.lock.RUnlock()
+	c.False(bailing, "a peer must not be dropped for failing to deliver a piece we told it to stop sending")
+	checkConnOpen(t, race.loserConn, true)
+	c.Equal(0, len(testPieceOwners(client.tracker, race.index)), "a piece we hold has no owners left to release")
+}
+
+// TestALostEndgameRaceOnAPieceExpiryAlreadyTookBack verifies the other order of the same pair: the piece is gone before
+// the announcement arrives, so there is nothing to abandon and nothing to cancel — the requests the expiry gave up on
+// were not taken back then and must not be taken back now. What the peer is still owed is the announcement itself.
+func TestALostEndgameRaceOnAPieceExpiryAlreadyTookBack(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	const chunks = 4
+	client := newTestClientForTorrent(d, newTestTorrentFileWithChunksPerPiece(chunks, testPieceCount))
+	race := newTestEndgameRace(t, client)
+
+	// Nothing has arrived for the piece in longer than any peer is given, which is the bound nothing renews. The
+	// requests never left our own write queue, so the peer keeps the connection.
+	one := testPieceHeldBy(t, race.loser, race.index)
+	one.lock.Lock()
+	one.askedTo = 3 * chunkSize
+	one.lastProgress = time.Now().Add(-2 * maxDownloadStall)
+	one.lock.Unlock()
+
+	race.loser.clearExpiredDownloads()
+	held, _ := testClaims(race.loser)
+	c.Equal(0, len(held), "an expired piece must be given back, indexes: %v", held)
+	c.Equal([]*peer{race.winner}, testPieceOwners(client.tracker, race.index))
+
+	client.tracker.markBlockValid(race.index)
+
+	haves, cancels := testStateQueues(race.loser)
+	c.Equal([]int{race.index}, haves, "a peer that no longer holds the piece is still told we have it")
+	c.Equal(0, len(cancels), "there is nothing to take back from a piece already given up, cancels: %v",
+		decodeTestCancels(t, cancels))
+}
+
+// TestAbandoningAPieceAChokeWoundBackCancelsNothing verifies that giving up a piece with no requests outstanding sends
+// no cancels. A peer that chokes us throws away everything it was asked for, and resuming winds the piece back to its
+// beginning so that what is missing can be asked for again, so between the two there is nothing for a cancel to take
+// back. The piece still has to be dropped and the announcement still has to go out.
+func TestAbandoningAPieceAChokeWoundBackCancelsNothing(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	const chunks = 4
+	client := newTestClientForTorrent(d, newTestTorrentFileWithChunksPerPiece(chunks, testPieceCount))
+	race := newTestEndgameRace(t, client)
+
+	// The whole piece had been asked for when the peer choked us, and the resume wound that back to the beginning. No
+	// goroutine is delivering the requests it queued, so the piece stays where the wind-back left it.
+	one := testPieceHeldBy(t, race.loser, race.index)
+	one.lock.Lock()
+	one.askedTo = chunks * chunkSize
+	one.inFlight = chunks
+	one.lock.Unlock()
+	race.loser.resumeDownloads()
+	one.lock.RLock()
+	askedTo := one.askedTo
+	one.lock.RUnlock()
+	c.Equal(0, askedTo, "the wind-back is what leaves nothing outstanding to cancel")
+
+	client.tracker.markBlockValid(race.index)
+
+	held, queued := testClaims(race.loser)
+	c.Equal(0, len(held), "the piece somebody else finished must be given up, indexes: %v", held)
+	c.Equal(0, len(queued), "a piece we gave up may have nothing left to ask for, indexes: %v", queued)
+	haves, cancels := testStateQueues(race.loser)
+	c.Equal([]int{race.index}, haves, "the peer must still be told we have the piece")
+	c.Equal(0, len(cancels), "requests a choke discarded must not be taken back, cancels: %v",
+		decodeTestCancels(t, cancels))
+}
+
+// testEndgameRace is the state a lost endgame race is decided from: two peers fetching the one piece the download is
+// still waiting on, the second of them holding the duplicate claim the endgame hands out.
+type testEndgameRace struct {
+	winner     *peer
+	loser      *peer
+	winnerConn net.Conn
+	loserConn  net.Conn
+	index      int
+}
+
+// newTestEndgameRace leaves every piece of the test torrent but the last one ours and puts both peers to work on that
+// last one. Both hold the whole torrent and neither is choking us, so nothing but the completion decides what becomes
+// of either claim.
+func newTestEndgameRace(t *testing.T, client *Client) *testEndgameRace {
+	t.Helper()
+	c := check.New(t)
+	race := &testEndgameRace{index: testPieceCount - 1}
+	race.winnerConn, race.winner = newTestPeerFromHost(t, client, testPeerHost1, testPeerPort)
+	race.loserConn, race.loser = newTestPeerFromHost(t, client, testPeerHost2, testPeerPort)
+	markTestPiecesAvailable(client, 0, 1, 2)
+	for _, one := range []*peer{race.winner, race.loser} {
+		one.lock.Lock()
+		one.peerChoking = false
+		one.has = everyTestPiece()
+		one.lock.Unlock()
+	}
+	c.Equal(race.index, client.tracker.selectForDownloading(race.winner, everyTestPiece()))
+	c.True(client.tracker.inEndgame(), "the last missing piece being claimed is what starts the endgame")
+	c.Equal(race.index, client.tracker.selectForDownloading(race.loser, everyTestPiece()),
+		"the idle peer must be handed a duplicate of the piece the download is waiting on")
+	c.True(race.winner.queuePieceDownload(race.index))
+	c.True(race.loser.queuePieceDownload(race.index))
+	return race
+}
+
+// testPieceHeldBy returns the record the peer holds for the piece, failing the test if it holds none.
+func testPieceHeldBy(t *testing.T, p *peer, index int) *piece {
+	t.Helper()
+	p.lock.RLock()
+	defer p.lock.RUnlock()
+	one, ok := p.pieces[index]
+	if !ok {
+		t.Fatalf("the peer holds no record of piece %d", index)
+	}
+	return one
+}
+
+// testClaims returns the pieces the peer is downloading and the ones it still has chunks to ask for.
+func testClaims(p *peer) (held, queued []int) {
+	p.lock.RLock()
+	defer p.lock.RUnlock()
+	return slices.Sorted(maps.Keys(p.pieces)), slices.Sorted(maps.Keys(p.pendingChunkRequests))
+}
+
+// testStateQueues returns what the peer has yet to be told about our state: the pieces we've acquired and the chunk
+// requests we're taking back.
+func testStateQueues(p *peer) (haves []int, cancels [][]byte) {
+	p.lock.RLock()
+	defer p.lock.RUnlock()
+	return slices.Clone(p.haveQueue), slices.Clone(p.cancelQueue)
+}
+
+// decodeTestCancels returns the piece, offset and length each message names, failing the test if any of them isn't a
+// cancel.
+func decodeTestCancels(t *testing.T, messages [][]byte) [][3]int {
+	t.Helper()
+	decoded := make([][3]int, 0, len(messages))
+	for i, buffer := range messages {
+		if len(buffer) != requestMessageLength {
+			t.Fatalf("message %d is %d bytes rather than the %d a cancel is", i, len(buffer), requestMessageLength)
+		}
+		if buffer[4] != cancelID {
+			t.Fatalf("message %d has the ID %d rather than a cancel's %d", i, buffer[4], cancelID)
+		}
+		decoded = append(decoded, [3]int{
+			int(binary.BigEndian.Uint32(buffer[5:9])),
+			int(binary.BigEndian.Uint32(buffer[9:13])),
+			int(binary.BigEndian.Uint32(buffer[13:])),
+		})
+	}
+	return decoded
 }
 
 // TestInterestCoversPiecesAnotherPeerHasClaimed verifies that our interest in a peer is decided by the pieces we lack

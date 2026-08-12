@@ -111,6 +111,32 @@ func TestConcurrentDownloadsLimitsThePeersWeDownloadFrom(t *testing.T) {
 	c.Equal(2, testDownloadingPeerCount(peers), "the freed slot must be taken up, and only once")
 }
 
+// TestTheEndgameIsExemptFromTheConcurrentDownloadsCap verifies that a peer the cap keeps from a claim of its own can
+// still back up someone else's once every piece we lack is claimed. The peers holding the download slots there are
+// precisely the ones the tail of the download is waiting on, so honoring the cap would refuse the help exactly where
+// it was asked for; what bounds the duplication instead is maxPieceOwners per piece.
+func TestTheEndgameIsExemptFromTheConcurrentDownloadsCap(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	c.NoError(ConcurrentDownloads(1)(client))
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+	blockedConn, blocked := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(blockedConn)
+	last := testPieceCount - 1
+
+	// Everything but the last piece is ours, and the one download slot there is belongs to the peer fetching that one
+	markTestPiecesAvailable(client, 0, 1, 2)
+	c.Equal(last, client.tracker.selectForDownloading(p, everyTestPiece()))
+	c.Equal(1, client.Status().PeersDownloading)
+
+	c.Equal(last, client.tracker.selectForDownloading(blocked, everyTestPiece()),
+		"a peer the cap refuses a claim of its own must still be able to duplicate one in the endgame")
+	c.Equal([]*peer{p, blocked}, testPieceOwners(client.tracker, last))
+	c.Equal(2, client.Status().PeersDownloading, "the cap bounds fresh claims, not the peers backing one up")
+}
+
 // testDownloadingPeerCount returns how many of the peers are holding a piece.
 func testDownloadingPeerCount(peers []*peer) int {
 	count := 0

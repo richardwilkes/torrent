@@ -150,8 +150,12 @@ type peer struct {
 	pieces               map[int]*piece // protected by lock
 	// haveQueue holds the pieces we've acquired that the peer has yet to be told about. Protected by lock.
 	haveQueue []int
-	peerState      // protected by lock
-	bail      bool // protected by lock
+	// cancelQueue holds the messages taking back chunk requests the peer has yet to be told we no longer want, built
+	// whole rather than as indexes because what is being withdrawn is a set of blocks within a piece we've already
+	// dropped every other record of. Protected by lock.
+	cancelQueue [][]byte
+	peerState        // protected by lock
+	bail        bool // protected by lock
 	// toldChoking and toldInterested are what the peer was last told about our choking and our interest. They trail
 	// amChoking and amInterested until the message saying so has been queued up. Both are protected by lock.
 	toldChoking    bool
@@ -405,11 +409,75 @@ func (p *peer) isChoking() bool {
 
 // queueHave records that the peer has yet to be told that we now have the given piece, leaving the delivery of the
 // message saying so to processStateChanges.
+//
+// A peer that is itself in the middle of downloading that very piece has just lost the endgame race for it. Its copy is
+// worth nothing to us now, so the piece is dropped here and the remote is told to stop serving what we asked it for:
+// left alone, it would go on sending the rest of the piece — every chunk of it landing in the branch of receivedChunk
+// that ignores chunks for pieces we aren't downloading — while the one piece at a time this peer may hold kept it from
+// taking on anything else until expiry reaped the record two minutes later. Nothing is given back to the tracker for
+// it, since markBlockValid drops every owner of the index in the same critical section that sets the have bit, which is
+// before any of this fan-out begins. Neither can the peer that completed the piece reach the abandonment at all:
+// completePiece takes its own record of the piece out before markBlockValid runs.
+//
+// informPeersWeHavePiece is the only caller, and it runs on the read goroutine of the peer that completed the piece,
+// walking every peer we have. So nothing here may wait on this peer's write queue, which for a peer we're uploading to
+// under a cap is backed up for tens of seconds: recording what has to be sent and signaling the goroutine that owns the
+// sending is the discipline the have alone already followed, and the cancels follow it too.
 func (p *peer) queueHave(index int) {
 	p.lock.Lock()
+	// Reading the piece and dropping it happen in the one critical section, so no re-check of the kind
+	// releaseIfStillOurs makes is needed: nothing can swap the entry for another between the two.
+	one, abandoned := p.pieces[index]
+	if abandoned {
+		delete(p.pieces, index)
+		delete(p.pendingChunkRequests, index)
+	}
+	p.lock.Unlock()
+	var cancels [][]byte
+	if abandoned {
+		// Built with the peer's lock released, since the piece's own lock is what guards what was asked for and the
+		// order between the two is the piece's first.
+		cancels = cancelsForAbandonedPiece(index, one)
+	}
+	// The two are recorded together, and the have is not recorded before them, because nextStateMessage decides the
+	// order it sends them in from whatever is queued at the moment it is asked: a delivery pass already under way for
+	// an earlier signal would otherwise find the have alone and put it on the wire ahead of the cancels it is supposed
+	// to follow.
+	p.lock.Lock()
+	p.cancelQueue = append(p.cancelQueue, cancels...)
 	p.haveQueue = append(p.haveQueue, index)
 	p.lock.Unlock()
 	p.signalStateChange()
+	if abandoned {
+		// The peer is idle again, and this being the endgame there is a duplicate of somebody else's piece for it to
+		// take, which nothing else would offer it: no piece was given back, so no peer is nudged, and a peer that has
+		// already unchoked us and told us what it holds has nothing left to say that would start a download. Called
+		// with no locks held, since it may cascade the endgame fan-out over every peer we have — on the completing
+		// peer's read goroutine, and bounded there for the reasons startDownloadIfNeeded gives.
+		p.startDownloadIfNeeded()
+	}
+}
+
+// cancelsForAbandonedPiece builds the messages that take back what the peer was asked for on a piece we've given up on,
+// which is exactly the blocks that were asked for and haven't been answered. The chunk aligned blocks are walked the
+// way nextChunkRequests walks them, since those are the requests that actually went out: what lies at or beyond askedTo
+// was never asked for, and what the spans cover has already arrived. A piece whose requests a choke discarded has
+// askedTo wound back to the beginning, so it names nothing at all here, which is right — the remote was already told to
+// throw those requests away.
+//
+// Only the piece's own lock is taken, and it is taken alone. The order this file keeps is the piece's lock before the
+// peer's, and nothing here needs anything from the peer.
+func cancelsForAbandonedPiece(index int, one *piece) [][]byte {
+	one.lock.RLock()
+	defer one.lock.RUnlock()
+	var cancels [][]byte
+	for begin := 0; begin < one.askedTo; begin += chunkSize {
+		size := min(chunkSize, len(one.buffer)-begin)
+		if !one.spans.Contains(&spanlist.Span{Start: begin, Length: size}) {
+			cancels = append(cancels, newCancelMessage(index, begin, size))
+		}
+	}
+	return cancels
 }
 
 // signalStateChange lets the goroutine delivering our state to the peer know that something is pending. The signal is
@@ -464,6 +532,17 @@ func (p *peer) nextStateMessage() []byte {
 			return newStateMessage(interestedID)
 		}
 		return newStateMessage(notInterestedID)
+	// The cancels for a piece somebody else finished go out ahead of the announcement that we have it. Both come from
+	// the same abandonment, and a remote told first that we hold the piece and only then to stop serving it has every
+	// reason to wonder what we were still asking for, while the other order says nothing surprising at all.
+	case len(p.cancelQueue) != 0:
+		buffer := p.cancelQueue[0]
+		if len(p.cancelQueue) == 1 {
+			p.cancelQueue = nil
+		} else {
+			p.cancelQueue = p.cancelQueue[1:]
+		}
+		return buffer
 	case len(p.haveQueue) != 0:
 		index := p.haveQueue[0]
 		if len(p.haveQueue) == 1 {
@@ -630,6 +709,20 @@ func newRequestMessage(index, begin, length int) []byte {
 	buffer := make([]byte, requestMessageLength)
 	binary.BigEndian.PutUint32(buffer[:4], 13)
 	buffer[4] = requestID
+	binary.BigEndian.PutUint32(buffer[5:9], uint32(index))
+	binary.BigEndian.PutUint32(buffer[9:13], uint32(begin))
+	binary.BigEndian.PutUint32(buffer[13:], uint32(length))
+	return buffer
+}
+
+// newCancelMessage creates the message that tells a peer we no longer want a chunk we asked it for. Its layout is the
+// request message's down to the length, the ID alone telling the two apart, which is what noteRequestSent keys on: a
+// cancel going out must not start the clocks that decide whether the peer is still delivering a piece, since the piece
+// it names is precisely one we've stopped waiting for.
+func newCancelMessage(index, begin, length int) []byte {
+	buffer := make([]byte, requestMessageLength)
+	binary.BigEndian.PutUint32(buffer[:4], 13)
+	buffer[4] = cancelID
 	binary.BigEndian.PutUint32(buffer[5:9], uint32(index))
 	binary.BigEndian.PutUint32(buffer[9:13], uint32(begin))
 	binary.BigEndian.PutUint32(buffer[13:], uint32(length))
@@ -924,55 +1017,120 @@ func (p *peer) startDownloadsOnOtherPeers() {
 }
 
 // startDownloadIfNeeded claims a piece for this peer to work on, unless it already holds one, is being choked, or is
-// on its way out. The whole of it is serialized, since whether the peer may take one on is decided from a snapshot of
+// on its way out. The claiming is serialized, since whether the peer may take one on is decided from a snapshot of
 // what it holds and acted on afterwards, with the tracker's lock taken in between: two callers left to interleave both
 // find it holding nothing and both claim, leaving it with two pieces, a single maxOutstandingChunkRequests budget that
 // the first can consume entirely, and a second piece that is never asked for and that no other peer can take until
 // maxDownloadStall gives it back two minutes later.
+//
+// Each pass around the loop re-reads what the peer holds, so a bail or a choke that lands in the middle of it is
+// honored rather than run past. It goes around only when queuePieceDownload reports that the piece it was handed was
+// given straight back because the torrent already holds it, which leaves the peer as idle as it was before and is
+// worth one more look. That can happen at most once per piece, since a piece we have is one nothing hands out again.
 func (p *peer) startDownloadIfNeeded() {
 	p.downloadStartLock.Lock()
-	defer p.downloadStartLock.Unlock()
-	var has *fixedbits.Bits
-	p.lock.RLock()
-	if !p.bail && !p.peerChoking && len(p.pieces) == 0 {
-		has = p.has.Clone()
-	}
-	p.lock.RUnlock()
-	if has != nil {
-		if index := p.client.tracker.selectForDownloading(p, has); index != -1 {
-			p.queuePieceDownload(index)
+	claimed := false
+	for {
+		var has *fixedbits.Bits
+		p.lock.RLock()
+		if !p.bail && !p.peerChoking && len(p.pieces) == 0 {
+			has = p.has.Clone()
 		}
+		p.lock.RUnlock()
+		if has == nil {
+			break
+		}
+		index := p.client.tracker.selectForDownloading(p, has)
+		if index == -1 {
+			break
+		}
+		if p.queuePieceDownload(index) {
+			claimed = true
+			break
+		}
+	}
+	p.downloadStartLock.Unlock()
+	// A fresh claim that takes the last piece nothing was fetching is the moment the endgame begins, and that moment
+	// has to be carried to the other peers: they are already connected, unchoked and idle, and in a swarm of seeders no
+	// have or unchoke is coming that would wake them, so the peers the endgame exists to recruit would never be asked.
+	// Releases nudge the same way, which is why only claims are handled here. A claim made once the endgame is already
+	// under way re-fires the fan-out harmlessly: every peer that could still duplicate anything is holding a piece by
+	// then and drops out at the gate above.
+	//
+	// The check is made after the serialization lock is released because startDownloadsOnOtherPeers reaches
+	// startDownloadIfNeeded for every other peer on this same goroutine, and through their own nudges possibly back
+	// into this one, and the lock is not reentrant. The cascade is finite for the same reason it is harmless: a peer
+	// that already holds a piece claims nothing and so nudges no one, which leaves each peer at most one claim, and one
+	// nudge, per cascade.
+	//
+	// Asking the tracker after the claim rather than deciding it as part of the claim is benignly racy: a release
+	// landing in between hides the endgame from this claimant, and costs nothing, since every path that releases a
+	// piece runs startDownloadsOnOtherPeers itself. Outside the endgame the whole of the cost is one read lock on the
+	// tracker per successful claim.
+	if claimed && p.client.tracker.inEndgame() {
+		p.startDownloadsOnOtherPeers()
 	}
 }
 
-func (p *peer) queuePieceDownload(index int) {
+// queuePieceDownload records the piece the tracker has handed this peer and queues up the requests for what we still
+// need of it, reporting whether the peer has anything to do as a result. False is answered for exactly one outcome:
+// the piece was given straight back because the torrent turns out to already hold it, which leaves the peer idle and
+// is the only case in which looking for another piece makes sense. Everything else answers true, the piece taken on
+// along with the two that end the search — a peer on its way out, which is going nowhere, and an index the peer was
+// already downloading, which is the piece it is working on.
+func (p *peer) queuePieceDownload(index int) bool {
 	length := int(p.client.torrentFile.LengthOf(index))
 	p.lock.Lock()
 	// The piece has to be given back if we're already on our way out. Our teardown releases everything it finds in the
 	// map and then leaves for good, so a piece recorded after that would be left marked as being downloaded by a peer
 	// that no longer exists, with nothing to ever release it and no other peer able to take it.
 	bailing := p.bail
-	_, ok := p.pieces[index]
+	one, ok := p.pieces[index]
 	if !bailing && !ok {
 		now := time.Now()
 		// The deadline recorded here doesn't start running until the requests for the piece actually reach the wire,
 		// which processWriteQueue is what knows. Claiming a piece only puts it on the queue of things to ask for, and
 		// that queue is drained by a goroutine that has to wait its turn behind everything else we owe the peer.
-		p.pieces[index] = &piece{
+		one = &piece{
 			buffer:       make([]byte, length),
 			timeout:      now.Add(downloadReadDeadline),
 			lastProgress: now,
 		}
+		p.pieces[index] = one
 		p.downloadStarted = now
 	}
 	p.lock.Unlock()
 	if bailing {
 		p.client.tracker.clearDownload(index, p)
-		return
+		return true
 	}
-	if !ok {
-		p.queueChunkRequests(index)
+	if ok {
+		return true
 	}
+	// The claim was registered under the tracker's lock before this peer had any record of the piece, so a completion
+	// that landed in that window — another peer's markBlockValid, which sets the have bit and drops every claim on the
+	// index in the same critical section — leaves this peer set to pull a whole piece of data we already hold off the
+	// network. Recording the piece and asking afterwards is what closes that: the common case, where the completion is
+	// already in, is caught here before a single request has gone out, and a completion this check does miss must have
+	// landed after the record existed rather than in the blind window before it. Missing one costs a piece fetched
+	// twice, which is what the endgame deliberately arranges anyway, and nothing more: the data validates and a repeat
+	// markBlockValid says nothing.
+	if p.client.tracker.hasPiece(index) {
+		p.lock.Lock()
+		// Only the very piece just recorded is taken back out, which is the re-check releaseIfStillOurs makes and for
+		// the same reason: the index may have been given back and claimed again for a piece of its own while the
+		// tracker was being asked, and dropping whatever is there would throw that away.
+		if p.pieces[index] == one {
+			delete(p.pieces, index)
+		}
+		p.lock.Unlock()
+		// Usually nothing is left to give back, the winner having dropped every claim on the index as it set the have
+		// bit, but what this peer registered is this peer's to release and nothing else would do it.
+		p.client.tracker.clearDownload(index, p)
+		return false
+	}
+	p.queueChunkRequests(index)
+	return true
 }
 
 func (p *peer) receivedChunk(index, begin int, buffer []byte) error {
@@ -1075,10 +1233,15 @@ func (p *peer) completePiece(index int, one *piece, buffer []byte) error {
 	// Only the claim this very piece holds is given up, which is the same re-check releaseIfStillOurs makes and for the
 	// same reason. Nothing has held the piece's lock since the buffer was taken, so clearExpiredDownloads may have
 	// released the index in the meantime and another goroutine re-claimed it here for a piece of its own — it is
-	// available again, since the block isn't marked valid until further down — and deleting whatever is there would
-	// throw that fresh claim away while its chunk requests were already on the wire. The peer would then send us a
-	// piece we are about to mark as had, every chunk of it landing in the branch of receivedChunk that ignores chunks
-	// for pieces we aren't downloading, and the whole of it charged to the tracker's downloaded total.
+	// available again, since the block isn't marked valid until further down.
+	//
+	// A fresh claim on this index is on its way out either way, since the announcement further down abandons every
+	// record of a piece we now hold, but which of the two drops it decides what the peer is left owing us. Deleting
+	// whatever is there loses the requests already on the wire along with it, and they are never taken back: the peer
+	// answers with a piece we have just marked as had, every chunk of it landing in the branch of receivedChunk that
+	// ignores chunks for pieces we aren't downloading, and the whole of it charged to the tracker's downloaded total.
+	// It is also what the storage failure below would give back, handing away an index that belongs to whoever took it
+	// up rather than to the write that failed.
 	p.lock.Lock()
 	if p.pieces[index] == one {
 		delete(p.pieces, index)

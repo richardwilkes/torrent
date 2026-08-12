@@ -57,6 +57,12 @@ func PeersWanted(wanted int) func(*Client) error {
 // the same time. Peers beyond this many are still connected to, and still
 // uploaded to, but are not asked for pieces until one of the peers downloading
 // finishes or gives up its piece. Default is 4.
+//
+// What the cap governs is how many peers hold a fresh claim on a piece. In the
+// endgame, once every piece still missing has already been claimed, further
+// peers may take a duplicate of a claim regardless of the cap — the peers
+// holding it are the ones being backed up — with at most maxPieceOwners peers
+// fetching any one piece.
 func ConcurrentDownloads(concurrent int) func(*Client) error {
 	return func(c *Client) error {
 		if concurrent < 1 {

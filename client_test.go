@@ -38,12 +38,13 @@ const peerMgmtWait = 5 * time.Second
 // documentation, so nothing can be listening on it and no dial to it is ever actually made.
 const testDialHost = "203.0.113.2"
 
-// testPeerHost1, testPeerHost2 and testPeerPort stand in for the remote ends of peers that have to look like they come
-// from hosts of their own. They come from the range reserved for documentation, and since a peer we already have is
-// never dialed, no connection to them is ever attempted.
+// testPeerHost1, testPeerHost2, testPeerHost3 and testPeerPort stand in for the remote ends of peers that have to look
+// like they come from hosts of their own. They come from the range reserved for documentation, and since a peer we
+// already have is never dialed, no connection to them is ever attempted.
 const (
 	testPeerHost1 = "203.0.113.10"
 	testPeerHost2 = "203.0.113.11"
+	testPeerHost3 = "203.0.113.12"
 	testPeerPort  = 6881
 )
 
