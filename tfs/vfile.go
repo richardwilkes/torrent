@@ -12,12 +12,20 @@ package tfs
 import (
 	"io"
 	"os"
+	"sync"
 )
 
+// vfile is one of a torrent's files, presented as an open file over the region of the storage file that holds it. The
+// os.File it stands in for may be closed while another goroutine is reading it, and answers that read with an error
+// rather than a panic, so the same has to hold here: the lock is what makes the closed check mean anything, since
+// without it a read that has passed the check can be descheduled past a concurrent Close and then dereference the
+// section reader that Close just nil'd out. Reads serialize against each other as a consequence, which a shared
+// io.SectionReader requires in any case, since the offset it advances is state the readers share.
 type vfile struct {
 	owner *vfs
 	file  *os.File
 	sr    *io.SectionReader
+	lock  sync.Mutex
 }
 
 func (v *vfile) Stat() (os.FileInfo, error) {
@@ -25,6 +33,8 @@ func (v *vfile) Stat() (os.FileInfo, error) {
 }
 
 func (v *vfile) Seek(offset int64, whence int) (int64, error) {
+	v.lock.Lock()
+	defer v.lock.Unlock()
 	if v.file == nil {
 		return 0, os.ErrClosed
 	}
@@ -32,6 +42,8 @@ func (v *vfile) Seek(offset int64, whence int) (int64, error) {
 }
 
 func (v *vfile) Read(p []byte) (int, error) {
+	v.lock.Lock()
+	defer v.lock.Unlock()
 	if v.file == nil {
 		return 0, os.ErrClosed
 	}
@@ -39,6 +51,8 @@ func (v *vfile) Read(p []byte) (int, error) {
 }
 
 func (v *vfile) ReadAt(p []byte, offset int64) (int, error) {
+	v.lock.Lock()
+	defer v.lock.Unlock()
 	if v.file == nil {
 		return 0, os.ErrClosed
 	}
@@ -50,6 +64,8 @@ func (v *vfile) Readdir(_ int) ([]os.FileInfo, error) {
 }
 
 func (v *vfile) Close() error {
+	v.lock.Lock()
+	defer v.lock.Unlock()
 	if v.file == nil {
 		return os.ErrClosed
 	}

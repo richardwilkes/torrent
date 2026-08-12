@@ -23,6 +23,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"testing/fstest"
 	"unicode/utf8"
@@ -1069,4 +1070,239 @@ func TestReadDirFollowsTheFSContract(t *testing.T) {
 	c.NoError(err)
 	c.Equal(0, len(entries))
 	c.NoError(d.Close())
+}
+
+// TestNewFileFromBytesBoundsTheName covers the limit on the torrent's own name, the one dimension of the metadata that
+// used to be left open. Only the single-file form presents the name as a path, where the bound on a path's length
+// applies to it; the multi-file form never does, yet NewFileFromBytes still materializes a sanitized copy of it — up
+// to twice its length — into Path, which lives as long as the File does and is stamped onto every log line naming the
+// torrent. A 62,914,692 byte torrent, comfortably under MaxTorrentFileLength, whose name was 60MB of '@' parsed
+// successfully, allocating roughly a gigabyte on the way, and NewFileFromReader is documented as taking a reader
+// attached to a network stream.
+func TestNewFileFromBytesBoundsTheName(t *testing.T) {
+	c := check.New(t)
+
+	// A name at the limit is accepted in both of the forms a torrent may take, and what is retained from it is bounded
+	// even when every byte of it is one that sanitizing expands.
+	longest := strings.Repeat("@", tfs.MaxNameLength)
+	info := multiFileInfo()
+	info["name"] = longest
+	f, err := tfs.NewFileFromBytes(encodeTorrent(t, info))
+	c.NoError(err)
+	c.Equal(longest, f.Info.Name)
+	c.True(len(f.Path) <= 2*tfs.MaxNameLength, "%d bytes retained for a %d byte name", len(f.Path), tfs.MaxNameLength)
+
+	info = singleFileInfo()
+	info["name"] = longest
+	_, err = tfs.NewFileFromBytes(encodeTorrent(t, info))
+	c.NoError(err)
+
+	// One byte beyond it is refused, in both forms and without the name reaching the message.
+	for _, one := range []struct {
+		info map[string]any
+		name string
+	}{
+		{name: "the multi-file form", info: multiFileInfo()},
+		{name: "the single-file form", info: singleFileInfo()},
+	} {
+		t.Run(one.name, func(t *testing.T) {
+			sub := check.New(t)
+			one.info["name"] = longest + "@"
+			_, nameErr := tfs.NewFileFromBytes(encodeTorrent(t, one.info))
+			sub.HasError(nameErr)
+			if nameErr != nil {
+				message, _, _ := strings.Cut(nameErr.Error(), "\n")
+				sub.True(len(message) < 256, "%d byte message", len(message))
+			}
+		})
+	}
+}
+
+// TestNewFileFromBytesRefusesUnsafePathComponents covers the components a path may not be assembled from. The tree is
+// exported as an fs.FS, and what a consumer does with a path out of it is turn it back into a local one, with
+// something on the order of filepath.Join(dir, filepath.FromSlash(p)); a component carrying a byte that separates or
+// ends a path elsewhere is no longer one component below that directory when it does, so `..\..\evil.exe` is a lone,
+// unremarkable looking node here and an escape from the target directory on Windows.
+func TestNewFileFromBytesRefusesUnsafePathComponents(t *testing.T) {
+	for _, one := range []struct {
+		name  string
+		parts []string
+	}{
+		{name: "a backslash escape", parts: []string{`..\..\evil.exe`}},
+		{name: "a backslash separator", parts: []string{subDir + `\` + fileA}},
+		{name: "a drive designation", parts: []string{"C:", "Windows", "evil.exe"}},
+		{name: "a drive-relative name", parts: []string{"c:evil.exe"}},
+		{name: "a NUL byte", parts: []string{subDir, "a\x00.txt"}},
+		{name: "a device name", parts: []string{subDir, "CON"}},
+		{name: "a device name with an extension", parts: []string{"COM1.txt"}},
+		{name: "a device name with trailing spaces", parts: []string{"nul  "}},
+	} {
+		t.Run(one.name, func(t *testing.T) {
+			_, err := tfs.NewFileFromBytes(encodeTorrent(t, infoWithPath(one.parts...)))
+			check.New(t).HasError(err)
+		})
+	}
+
+	// A name that merely resembles one of those is an ordinary name, and the torrent carrying it parses.
+	for _, one := range []struct {
+		name  string
+		parts []string
+	}{
+		{name: "a longer name starting with a device name", parts: []string{"CONSOLE.txt"}},
+		{name: "a device name beyond the numbered ones", parts: []string{"COM10"}},
+		{name: "a colon that isn't a drive", parts: []string{"12:30", fileA}},
+		{name: "a colon further along", parts: []string{"ep 1: pilot.mkv"}},
+	} {
+		t.Run(one.name, func(t *testing.T) {
+			sub := check.New(t)
+			f, err := tfs.NewFileFromBytes(encodeTorrent(t, infoWithPath(one.parts...)))
+			sub.NoError(err)
+			if f != nil {
+				fi, statErr := fs.Stat(f, strings.Join(one.parts, "/"))
+				sub.NoError(statErr)
+				sub.Equal(int64(12), fi.Size())
+			}
+		})
+	}
+}
+
+// TestStorageIsResolvedWhenItIsNeeded verifies that a Path assigned after the virtual tree was built is the one the
+// tree reads from. The tree used to cache the storage path the first time anything opened the torrent, and nothing
+// invalidated it, so a caller that opened a file before the download directory was known — which fails, there being no
+// storage yet — left every later read pointed at a path that StoragePath itself no longer reported. Path is exported
+// and is set after construction by everything that uses this package, so the ordering was easy to fall into.
+func TestStorageIsResolvedWhenItIsNeeded(t *testing.T) {
+	c := check.New(t)
+	f, err := tfs.NewFileFromBytes(encodeTorrent(t, multiFileInfo()))
+	c.NoError(err)
+
+	// The first Open comes before the storage exists, which is what builds the tree.
+	_, err = f.Open(fileB)
+	c.HasError(err)
+	c.True(errors.Is(err, fs.ErrNotExist))
+
+	// The download directory is only known afterwards, so the storage lands where Path says once it has been set.
+	f.Path = filepath.Join(t.TempDir(), f.Path)
+	c.NoError(os.WriteFile(f.StoragePath(), []byte("0123456789abcdefghij"), 0o600))
+
+	data, err := fs.ReadFile(f, fileB)
+	c.NoError(err)
+	c.Equal("cdefghij", string(data))
+	data, err = fs.ReadFile(f, subDir+"/"+fileA)
+	c.NoError(err)
+	c.Equal("0123456789ab", string(data))
+}
+
+// TestStatAnswersFromTheMetadata verifies that stat-ing a node doesn't touch the storage file behind it. Without a
+// Stat of its own, fs.Stat falls back to Open, which opens that file: a plain metadata query then failed with "no such
+// file or directory" for every torrent whose data hadn't been downloaded yet, while fs.ReadDir of the directory
+// holding it answered the same question correctly from the same tree, and cost an open and a close of it once it had.
+func TestStatAnswersFromTheMetadata(t *testing.T) {
+	c := check.New(t)
+	f, err := tfs.NewFileFromBytes(encodeTorrent(t, multiFileInfo()))
+	c.NoError(err)
+	f.Path = filepath.Join(t.TempDir(), f.Path) // The storage file is never created.
+	_, ok := any(f).(fs.StatFS)
+	c.True(ok, "*tfs.File must implement fs.StatFS")
+
+	// Everything a stat reports is known from the metadata, so it is reported whether the data is there or not.
+	fi, err := fs.Stat(f, fileB)
+	c.NoError(err)
+	c.Equal(fileB, fi.Name())
+	c.Equal(int64(8), fi.Size())
+	c.False(fi.IsDir())
+	fi, err = fs.Stat(f, subDir)
+	c.NoError(err)
+	c.True(fi.IsDir())
+
+	// Which is the same answer the directory listing gives for the same node...
+	entries, err := fs.ReadDir(f, subDir)
+	c.NoError(err)
+	c.Equal(1, len(entries))
+	info, err := entries[0].Info()
+	c.NoError(err)
+	c.Equal(fi.ModTime(), info.ModTime())
+
+	// ...while opening it still reports the storage that isn't there.
+	_, err = f.Open(fileB)
+	c.HasError(err)
+	c.True(errors.Is(err, fs.ErrNotExist))
+
+	// The fs.StatFS contract: a name that isn't valid, and one that is but names nothing.
+	for _, one := range []struct {
+		target error
+		name   string
+	}{
+		{name: "../evil", target: fs.ErrInvalid},
+		{name: "/b.txt", target: fs.ErrInvalid},
+		{name: "nope.txt", target: fs.ErrNotExist},
+		{name: subDir + "/nope.txt", target: fs.ErrNotExist},
+	} {
+		t.Run(one.name, func(t *testing.T) {
+			sub := check.New(t)
+			_, statErr := f.Stat(one.name)
+			sub.True(errors.Is(statErr, one.target), "stat %q: %v", one.name, statErr)
+			var pathErr *fs.PathError
+			if !errors.As(statErr, &pathErr) {
+				t.Fatalf("stat %q should yield an *fs.PathError, got %T", one.name, statErr)
+			}
+			sub.Equal("stat", pathErr.Op)
+			sub.Equal(one.name, pathErr.Path)
+		})
+	}
+}
+
+// TestCloseWhileReadingIsSafe verifies that closing a file out from under the goroutines reading it reports itself
+// rather than taking the process down. The use-after-close guards tested the file handle but then dereferenced the
+// section reader, which Close nils out afterwards, so a read that had passed the guard and was descheduled panicked
+// inside the section reader — and under -race the pair is a data race outright. os.File, which these files stand in
+// for, is safe against a concurrent Close, so anything holding one of these is entitled to expect the same.
+func TestCloseWhileReadingIsSafe(t *testing.T) {
+	c := check.New(t)
+	f := newPopulatedFile(t, multiFileInfo(), []byte("0123456789abcdefghij"))
+	for range 25 {
+		file, err := f.Open(subDir + "/" + fileA)
+		c.NoError(err)
+		readerAt, ok := file.(io.ReaderAt)
+		c.True(ok)
+		seeker, ok := file.(io.Seeker)
+		c.True(ok)
+
+		// Every goroutine waits on the same channel, so that the close lands while the reads are in flight rather than
+		// before or after all of them.
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for i := range 4 {
+			wg.Go(func() {
+				buffer := make([]byte, 4)
+				<-start
+				for range 32 {
+					switch i % 3 {
+					case 0:
+						_, _ = file.Read(buffer) //nolint:errcheck // A closed file is one of the answers
+					case 1:
+						_, _ = readerAt.ReadAt(buffer, 0) //nolint:errcheck // A closed file is one of the answers
+					default:
+						_, _ = seeker.Seek(0, io.SeekStart) //nolint:errcheck // A closed file is one of the answers
+					}
+				}
+			})
+		}
+		wg.Go(func() {
+			<-start
+			_ = file.Close() //nolint:errcheck // Whether this or a later close wins isn't what is being judged
+		})
+		close(start)
+		wg.Wait()
+
+		// Once it is closed, every operation says so instead of pretending to have read something.
+		n, err := file.Read(make([]byte, 4))
+		c.True(errors.Is(err, os.ErrClosed), "read after close: %v", err)
+		c.Equal(0, n)
+		_, err = readerAt.ReadAt(make([]byte, 4), 0)
+		c.True(errors.Is(err, os.ErrClosed), "read at after close: %v", err)
+		_, err = seeker.Seek(0, io.SeekStart)
+		c.True(errors.Is(err, os.ErrClosed), "seek after close: %v", err)
+		c.True(errors.Is(file.Close(), os.ErrClosed), "the second close")
+	}
 }

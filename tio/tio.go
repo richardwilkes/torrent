@@ -77,6 +77,12 @@ const (
 // and layers that report the same conditions without one of those values attached. Each condition is listed three
 // times over — as a POSIX errno, as its Winsock counterpart, and as wording — because no one of those reaches every
 // platform this builds for.
+//
+// The text match is applied only to errors a socket operation produced. Matching on wording alone is a judgment made
+// from bytes, and not all of the bytes an error carries are ours: a tracker's bencoded "failure reason" is returned
+// verbatim as an error, and that error is asked about here. A tracker — or anything that can answer as one — wording
+// its refusal "connection refused" would otherwise silence every announce failure for as long as it cared to keep
+// saying it, leaving the operator with a client that retries forever and a log with nothing in it.
 func ShouldLogIOError(err error) bool {
 	if err == nil {
 		return false
@@ -106,6 +112,9 @@ func ShouldLogIOError(err error) bool {
 		if errors.Is(err, ignore) {
 			return false
 		}
+	}
+	if !fromSocketOperation(err) {
+		return true
 	}
 	msg := err.Error()
 	for _, ignore := range []string{
@@ -145,4 +154,19 @@ func ShouldLogIOError(err error) bool {
 		}
 	}
 	return true
+}
+
+// fromSocketOperation reports whether the error came out of an operation on a socket, which is what makes matching it
+// by wording a judgment about our own I/O rather than about a string someone else chose. The net package wraps
+// everything a connection fails with in *net.OpError, and the operating system's own errors arrive inside
+// *os.SyscallError, so a condition that survived only as its wording still has one of those around it however many
+// layers of ours it has passed through. What doesn't is an error assembled from a remote party's words. The value is
+// what is judged rather than the match alone, since a typed nil in the chain matches while saying nothing about where
+// the error came from.
+func fromSocketOperation(err error) bool {
+	if opErr, ok := errors.AsType[*net.OpError](err); ok && opErr != nil {
+		return true
+	}
+	syscallErr, ok := errors.AsType[*os.SyscallError](err)
+	return ok && syscallErr != nil
 }

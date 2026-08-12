@@ -26,7 +26,7 @@ var (
 )
 
 type vfs struct {
-	storage  string
+	owner    *File  // The torrent this node came from, which is asked for the storage path at the moment it is needed
 	path     string // The full, slash-separated, fs.ValidPath-conforming path of this node; the root is "."
 	modTime  time.Time
 	children []*vfs
@@ -75,7 +75,12 @@ func (v *vfs) open() (fs.File, error) {
 	if v.IsDir() {
 		return &vdir{owner: v}, nil
 	}
-	f, err := os.Open(v.storage)
+	// The storage path is resolved here rather than captured when the tree was built. Path is exported, and the
+	// download directory it names typically isn't known until after the metadata has been parsed — the package's own
+	// callers set it afterwards — so a node holding a copy taken at the first Open would go on reading a file that
+	// StoragePath itself no longer names, reporting "no such file or directory" for content sitting right where the
+	// caller put it.
+	f, err := os.Open(v.owner.StoragePath())
 	if err != nil {
 		// The fs.FS contract calls for an *fs.PathError naming the path that was opened. The one os.Open produced
 		// names the on-disk storage file, which isn't part of this filesystem's namespace, so only its underlying

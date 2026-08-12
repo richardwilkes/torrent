@@ -145,6 +145,25 @@ func TestCleanVirtualPath(t *testing.T) {
 		{name: "nothing", parts: nil},
 		{name: "only empties", parts: []string{"", ""}},
 		{name: "only dots", parts: []string{".", "..", "/"}},
+
+		// Components that stop being one component of a path below the directory a consumer joins them onto
+		{name: "a backslash escape", parts: []string{`..\..\evil.exe`}},
+		{name: "a backslash separator", parts: []string{"a", `b\` + fileB}},
+		{name: "a drive designation", parts: []string{"C:", "Windows", "evil.exe"}},
+		{name: "a drive-relative name", parts: []string{"c:evil.exe"}},
+		{name: "a NUL byte", parts: []string{"a", "b\x00.txt"}},
+		{name: "a device name", parts: []string{"a", "CON"}},
+		{name: "a device name in another case", parts: []string{"nul"}},
+		{name: "a device name with an extension", parts: []string{"COM1.txt"}},
+		{name: "a device name with trailing spaces", parts: []string{"lpt9  "}},
+
+		// Names that merely resemble one of those are ordinary names
+		{name: "a longer name starting with a device name", parts: []string{"CONS"}, expected: "CONS", ok: true},
+		{name: "a device name without its number", parts: []string{"COM"}, expected: "COM", ok: true},
+		{name: "a device name beyond the numbered ones", parts: []string{"COM10"}, expected: "COM10", ok: true},
+		{name: "a device name as an extension", parts: []string{"a.con"}, expected: "a.con", ok: true},
+		{name: "a colon that isn't a drive", parts: []string{"12:30", fileB}, expected: "12:30/" + fileB, ok: true},
+		{name: "a colon further along", parts: []string{"ep 1: pilot.mkv"}, expected: "ep 1: pilot.mkv", ok: true},
 	} {
 		t.Run(one.name, func(t *testing.T) {
 			c := check.New(t)

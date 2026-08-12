@@ -27,9 +27,16 @@ import (
 // enough that a deadline left over from an earlier call would have expired well before it does.
 const testDeadlineWait = 50 * time.Millisecond
 
-// bareMessagePrefix is what the net package puts in front of the reason a connection operation failed, which is all
-// that is left of an error whose errno an intervening layer stripped away.
+// bareMessagePrefix is what the net package puts in front of the reason a connection operation failed. An error
+// carrying it and nothing else is a message that merely reads like a connection failure, which is what anything able
+// to put words into an error of ours can produce.
 const bareMessagePrefix = "read tcp 10.0.0.1:6881->10.0.0.2:51413: "
+
+// The wordings more than one test below is written against.
+const (
+	refusedWording    = "connection refused"
+	brokenPipeWording = "broken pipe"
+)
 
 // TestReadWithNoDeadlineClearsAPreviousOne verifies that a read asking for no deadline clears whatever an earlier call
 // armed on the connection instead of leaving it in place. A deadline stays on the connection until it is replaced, so
@@ -113,9 +120,9 @@ func TestShouldLogIOErrorIgnoresRoutinePeerErrors(t *testing.T) {
 		{name: "dial refused", err: wrappedOpError("dial", syscall.ECONNREFUSED)},
 		{name: "host unreachable", err: wrappedOpError("dial", syscall.EHOSTUNREACH)},
 		{name: "network unreachable", err: wrappedOpError("dial", syscall.ENETUNREACH)},
-		{name: "broken pipe by text alone", err: errs.New("write tcp 10.0.0.1:6881->10.0.0.2:51413: broken pipe")},
-		{name: "no route to host by text alone", err: errs.New("dial tcp 10.0.0.2:51413: no route to host")},
-		{name: "unreachable network by text alone", err: errs.New("dial tcp 10.0.0.2:51413: network is unreachable")},
+		{name: "broken pipe by text alone", err: wrappedTextError(brokenPipeWording)},
+		{name: "no route to host by text alone", err: wrappedTextError("no route to host")},
+		{name: "unreachable network by text alone", err: wrappedTextError("network is unreachable")},
 		{name: "anything else", err: errs.New("the piece hash didn't match"), log: true},
 		{name: "a wrapped anything else", err: errs.Wrap(io.ErrShortWrite), log: true},
 	} {
@@ -138,20 +145,28 @@ func wrappedTextError(msg string) error {
 	return errs.Wrap(&net.OpError{Op: "read", Net: "tcp", Err: errs.New(msg)})
 }
 
+// syscallTextError builds the same for the layer below: an operating system error whose errno was stripped, still
+// inside the *os.SyscallError that says which call produced it, but with no *net.OpError above it.
+func syscallTextError(msg string) error {
+	return errs.Wrap(&os.SyscallError{Syscall: "read", Err: errs.New(msg)})
+}
+
 // TestShouldLogIOErrorIgnoresPOSIXPeerErrorWordings verifies that the text fallback recognizes the routine peer
 // departures as the POSIX systems actually word them, which is all an error carries once it has crossed a boundary that
 // kept only the message. Wording a condition by its own name is a guess rather than a rule — ECONNABORTED is "software
 // caused connection abort" and never "connection aborted" — and the two systems don't even agree with each other, since
 // ETIMEDOUT is "operation timed out" on darwin and "connection timed out" on linux, so every wording has to be listed
-// for the fallback to cover the platforms this builds for.
+// for the fallback to cover the platforms this builds for. Each is checked in both of the forms an error that lost its
+// errno still arrives in, and the same wording with nothing around it to say a socket produced it is checked to still
+// reach the log, since that form is one anything we quote can supply.
 func TestShouldLogIOErrorIgnoresPOSIXPeerErrorWordings(t *testing.T) {
 	for _, one := range []struct {
 		name string
 		msg  string
 	}{
-		{name: "peer gone mid-write by POSIX wording", msg: "broken pipe"},
+		{name: "peer gone mid-write by POSIX wording", msg: brokenPipeWording},
 		{name: "peer reset by POSIX wording", msg: "connection reset by peer"},
-		{name: "dial refused by POSIX wording", msg: "connection refused"},
+		{name: "dial refused by POSIX wording", msg: refusedWording},
 		{name: "connection aborted by POSIX wording", msg: "software caused connection abort"},
 		{name: "host unreachable by POSIX wording", msg: "no route to host"},
 		{name: "network unreachable by POSIX wording", msg: "network is unreachable"},
@@ -161,8 +176,9 @@ func TestShouldLogIOErrorIgnoresPOSIXPeerErrorWordings(t *testing.T) {
 	} {
 		t.Run(one.name, func(t *testing.T) {
 			c := check.New(t)
-			c.False(ShouldLogIOError(errs.New(bareMessagePrefix+one.msg)), "the bare message: %s", one.msg)
 			c.False(ShouldLogIOError(wrappedTextError(one.msg)), "the wrapped message: %s", one.msg)
+			c.False(ShouldLogIOError(syscallTextError(one.msg)), "the syscall message: %s", one.msg)
+			c.True(ShouldLogIOError(errs.New(bareMessagePrefix+one.msg)), "the bare message: %s", one.msg)
 		})
 	}
 }
@@ -191,9 +207,10 @@ func TestShouldLogIOErrorIgnoresThisPlatformsErrorWordings(t *testing.T) {
 	} {
 		t.Run(one.name, func(t *testing.T) {
 			// The errno is deliberately dropped, leaving only what it was worded as: with it still attached the
-			// sentinel checks would answer and the fallback this is about would never be consulted.
+			// sentinel checks would answer and the fallback this is about would never be consulted. What produced it
+			// is not dropped, since the fallback is only consulted for errors a socket operation produced.
 			msg := one.errno.Error()
-			check.New(t).False(ShouldLogIOError(errs.New(bareMessagePrefix+msg)),
+			check.New(t).False(ShouldLogIOError(wrappedTextError(msg)),
 				"%s is worded %q here, which the fallback doesn't recognize", one.name, msg)
 		})
 	}
@@ -257,8 +274,32 @@ func TestShouldLogIOErrorIgnoresWindowsPeerErrorWordings(t *testing.T) {
 	} {
 		t.Run(one.name, func(t *testing.T) {
 			c := check.New(t)
-			c.False(ShouldLogIOError(errs.New("wsarecv: "+one.msg)), "the bare message: %s", one.msg)
 			c.False(ShouldLogIOError(wrappedTextError(one.msg)), "the wrapped message: %s", one.msg)
+			c.False(ShouldLogIOError(syscallTextError(one.msg)), "the syscall message: %s", one.msg)
+		})
+	}
+}
+
+// TestShouldLogIOErrorLogsWordingsARemotePartySupplied verifies that text a remote party chose can't decide whether
+// our own failures are logged. A tracker's bencoded "failure reason" is returned verbatim as an error and then asked
+// about here, so a tracker — or anything able to answer as one — that words its refusal as a routine socket failure
+// would otherwise suppress every announce failure for as long as it kept saying it, leaving a client that retries
+// forever and a log with nothing in it to say why nothing is happening.
+func TestShouldLogIOErrorLogsWordingsARemotePartySupplied(t *testing.T) {
+	for _, one := range []struct {
+		name    string
+		failure string
+	}{
+		{name: "the wording of a refused dial", failure: refusedWording},
+		{name: "a real reason with a wording appended", failure: "Torrent not registered; i/o timeout"},
+		{name: "the wording of a peer gone mid-write", failure: brokenPipeWording},
+		{name: "the wording of our own close", failure: "use of closed network connection"},
+		{name: "a Windows wording", failure: "The specified network name is no longer available."},
+	} {
+		t.Run(one.name, func(t *testing.T) {
+			// Built exactly the way the tracker code builds one from the failure reason it was handed.
+			check.New(t).True(ShouldLogIOError(errs.New(one.failure)),
+				"a failure reason of %q must still reach the log", one.failure)
 		})
 	}
 }

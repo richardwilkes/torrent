@@ -31,7 +31,10 @@ import (
 	"github.com/zeebo/bencode"
 )
 
-var _ fs.FS = &File{}
+var (
+	_ fs.FS     = &File{}
+	_ fs.StatFS = &File{}
+)
 
 const (
 	// DownloadExt is the extension used for the torrent download data file.
@@ -79,6 +82,25 @@ const (
 	// MaxPathDepth it keeps the work done per entry proportional to the bytes the torrent spent on it.
 	MaxPathLength = 4096
 
+	// MaxNameLength is the largest number of bytes the torrent's name may occupy. The single-file form already carries
+	// this bound, since there the name is the whole of the entry's path and cleanVirtualPath judges it as such, but
+	// the multi-file form never routes it through there while NewFileFromBytes still materializes a sanitized copy of
+	// it — up to twice its length — into Path, where it is retained for the life of the File and stamped onto every
+	// log line naming the torrent. Nothing ever uses more than the 206 bytes StoragePath truncates the name to, so
+	// matching MaxPathLength keeps every torrent that was acceptable before acceptable while denying a 64MB file
+	// carrying nothing but a name the gigabyte of allocation that name would otherwise cost to parse.
+	MaxNameLength = MaxPathLength
+
+	// componentDelimiters are the bytes that end a path component somewhere a path of ours may be used. A backslash
+	// separates components on Windows, so a component carrying one is several components there: the lone,
+	// unremarkable looking node `..\..\evil.exe` is two levels above the directory a consumer joined it onto. A NUL
+	// ends the path outright in every interface that hands it to the operating system as a C string.
+	componentDelimiters = "\\\x00"
+
+	// maxReservedNameLength is the length of the longest name Windows resolves to a device ("COM9" and its kind),
+	// which bounds the work usableComponent does before it can rule a component out as one of them.
+	maxReservedNameLength = 4
+
 	// maxStorageNameLength is the largest number of bytes a single path element may occupy in the storage path. 255 is
 	// the limit imposed by nearly every filesystem in common use.
 	maxStorageNameLength = 255
@@ -89,6 +111,9 @@ const (
 
 	// openOp is the operation name carried by the *fs.PathError values this package returns.
 	openOp = "open"
+
+	// statOp is the operation name carried by the *fs.PathError values Stat returns.
+	statOp = "stat"
 )
 
 // InfoHash holds the hash of the torrent info.
@@ -265,6 +290,11 @@ func skipBencodedString(data []byte, i int) (int, error) {
 func (f *File) validate() error {
 	if f.Info.Name == "" {
 		return errs.New("torrent name may not be empty")
+	}
+	// Bounded here rather than left to the entry walk, since only the single-file form presents the name as a path
+	// there; the multi-file form uses it for the storage path alone, which is where an unbounded one does its damage.
+	if len(f.Info.Name) > MaxNameLength {
+		return errs.Newf("torrent name length of %d exceeds the maximum of %d", len(f.Info.Name), MaxNameLength)
 	}
 	if f.Info.PieceLength <= 0 || f.Info.PieceLength > MaxPieceLength {
 		return errs.Newf("invalid torrent piece length: %d", f.Info.PieceLength)
@@ -485,6 +515,23 @@ func (f *File) Open(name string) (fs.File, error) {
 	return file.open()
 }
 
+// Stat implements the fs.StatFS interface. Without it, fs.Stat falls back to Open, which opens the on-disk storage
+// file behind the node: a metadata query would then fail with "no such file or directory" for every torrent whose
+// data hasn't been downloaded yet, while fs.ReadDir of the directory holding it answers the same question correctly
+// out of the same tree, and would cost an open and a close of that file even once it has. Everything a stat reports
+// comes from the metadata, which is fully known from the moment the torrent was parsed.
+func (f *File) Stat(name string) (fs.FileInfo, error) {
+	if !fs.ValidPath(name) {
+		return nil, &fs.PathError{Op: statOp, Path: name, Err: fs.ErrInvalid}
+	}
+	f.buildFS()
+	file, ok := f.fs[name]
+	if !ok {
+		return nil, &fs.PathError{Op: statOp, Path: name, Err: fs.ErrNotExist}
+	}
+	return file, nil
+}
+
 // fileEntry is a single file within the torrent, with the single-file form normalized into the multi-file one.
 type fileEntry struct {
 	path   []string
@@ -511,10 +558,9 @@ func (f *File) buildFS() {
 		return
 	}
 	f.fs = make(map[string]*vfs)
-	storage := f.StoragePath()
 	modTime := time.Now()
 	f.root = &vfs{
-		storage: storage,
+		owner:   f,
 		path:    ".",
 		mode:    os.ModeDir | 0o775,
 		modTime: modTime,
@@ -540,7 +586,7 @@ func (f *File) buildFS() {
 			continue
 		}
 		child := &vfs{
-			storage: storage,
+			owner:   f,
 			path:    p,
 			offset:  start,
 			length:  one.length,
@@ -578,7 +624,7 @@ func (f *File) mkdirs(dirPath string) (*vfs, bool) {
 			continue
 		}
 		d := &vfs{
-			storage: dir.storage,
+			owner:   f,
 			path:    name,
 			mode:    os.ModeDir | 0o775,
 			modTime: dir.modTime,
@@ -592,8 +638,9 @@ func (f *File) mkdirs(dirPath string) (*vfs, bool) {
 
 // cleanVirtualPath turns the path components of a torrent file entry into a slash-separated path usable with io/fs,
 // dropping empty and dot components rather than letting them escape or collapse onto the root. false is returned if
-// nothing usable remains, or if the result would be deeper than MaxPathDepth or longer than MaxPathLength, since
-// everything downstream of here does work per ancestor of a path and a torrent is free to claim any depth at all.
+// nothing usable remains, if the result would be deeper than MaxPathDepth or longer than MaxPathLength, since
+// everything downstream of here does work per ancestor of a path and a torrent is free to claim any depth at all, or
+// if any component is one that can't be handed out safely as part of a path (see usableComponent).
 func cleanVirtualPath(parts []string) (string, bool) {
 	list := make([]string, 0, min(len(parts), MaxPathDepth))
 	length := 0
@@ -608,7 +655,12 @@ func cleanVirtualPath(parts []string) (string, bool) {
 				if length != 0 {
 					length++ // The separator this component will be joined with.
 				}
+				// The bounds are applied before the component is examined, so that a hostile path is turned away by
+				// the O(1) checks rather than by a scan of however many megabytes it spent on one component.
 				if length += len(sub); length > MaxPathLength {
+					return "", false
+				}
+				if !usableComponent(sub) {
 					return "", false
 				}
 				list = append(list, sub)
@@ -623,6 +675,51 @@ func cleanVirtualPath(parts []string) (string, bool) {
 		return "", false
 	}
 	return result, true
+}
+
+// windowsReservedNames are the names Windows resolves to a device rather than to a file, in the upper case form the
+// comparison is made against.
+var windowsReservedNames = map[string]bool{
+	"CON": true, "PRN": true, "AUX": true, "NUL": true,
+	"COM0": true, "COM1": true, "COM2": true, "COM3": true, "COM4": true,
+	"COM5": true, "COM6": true, "COM7": true, "COM8": true, "COM9": true,
+	"LPT0": true, "LPT1": true, "LPT2": true, "LPT3": true, "LPT4": true,
+	"LPT5": true, "LPT6": true, "LPT7": true, "LPT8": true, "LPT9": true,
+}
+
+// usableComponent reports whether one component of a torrent file entry's path can be handed out as part of a path of
+// this filesystem's. What a consumer does with such a path is turn it back into a local one, with something on the
+// order of filepath.Join(dir, filepath.FromSlash(p)), and what is refused here are the components that stop being one
+// component of a path below dir when it does: those carrying a byte that separates or ends a path elsewhere, those
+// naming a drive, and those Windows resolves to a device rather than to a file, which CreateFile answers with the
+// device itself in any directory and whatever extension the name carries, before the filesystem is consulted at all.
+// The torrent is refused rather than the name quietly rewritten, since the tree has to keep describing the torrent it
+// came from; nothing legitimate is lost by it, as a torrent carrying such a name is one no Windows client can unpack
+// in the first place.
+func usableComponent(sub string) bool {
+	if strings.ContainsAny(sub, componentDelimiters) {
+		return false
+	}
+	// A leading drive designation makes the path drive-relative on Windows — "C:" and "C:dir" alike — so what it names
+	// no longer hangs from the directory it was joined onto.
+	if len(sub) > 1 && sub[1] == ':' {
+		if c := sub[0] | 0x20; c >= 'a' && c <= 'z' {
+			return false
+		}
+	}
+	// Windows resolves the device from what precedes the first '.', ignoring trailing spaces, so "COM1.txt" and "CON "
+	// name devices just as bare "CON" does.
+	device := sub
+	if i := strings.IndexByte(device, '.'); i != -1 {
+		device = device[:i]
+	}
+	device = strings.TrimRight(device, " ")
+	// Measured before the case fold, which would otherwise copy however much of the component precedes its first dot,
+	// and that is as much as the torrent cared to spend on it.
+	if len(device) > maxReservedNameLength {
+		return true
+	}
+	return !windowsReservedNames[strings.ToUpper(device)]
 }
 
 // describePath renders the path components of a torrent file entry for an error message. Only the first
