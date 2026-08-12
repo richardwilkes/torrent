@@ -333,16 +333,25 @@ func TestNewFileFromBytesRejectsDeeplyNestedData(t *testing.T) {
 // the length claimed rather than the bytes that arrived.
 func TestNewFileFromBytesRejectsOverlongStrings(t *testing.T) {
 	const claimed = 1 << 30
+	claim := strconv.Itoa(claimed)
+	// Which of the two guards each case has to trip is named, since both of them answer with an error and the decoder
+	// behind them answers a truncated file with one as well: without this, a case aimed at one guard passes just as
+	// well when that guard has been deleted and something further along reports the same input.
+	const beyondEverything = "at least"
+	const beyondWhatRemains = "bytes remain"
 	for _, one := range []struct {
-		name string
-		data string
+		name    string
+		data    string
+		refusal string
 	}{
-		{name: "the reported case", data: "d4:infod4:name1500000000:xe"},
-		{name: "as a value", data: "d8:announce" + strconv.Itoa(claimed) + ":xe"},
-		{name: "as a key", data: "d" + strconv.Itoa(claimed) + ":xi0ee"},
-		{name: "one byte more than remains", data: "d4:name5:abcde"},
-		{name: "nested inside the info dictionary", data: "d4:infod6:pieces" + strconv.Itoa(claimed) + ":xee"},
-		{name: "no digits could bring it back", data: "d4:name99999999999999999999:xe"},
+		{name: "the reported case", data: "d4:infod4:name1500000000:xe", refusal: beyondEverything},
+		{name: "as a value", data: "d8:announce" + claim + ":xe", refusal: beyondEverything},
+		{name: "as a key", data: "d" + claim + ":xi0ee", refusal: beyondEverything},
+		// Six declared bytes with five behind them, so the length is within the data as a whole and beyond what is
+		// left of it, which is the only way to reach the second guard.
+		{name: "one byte more than remains", data: "d4:name6:abcde", refusal: beyondWhatRemains},
+		{name: "nested inside the info dictionary", data: "d4:infod6:pieces" + claim + ":xee", refusal: beyondEverything},
+		{name: "no digits could bring it back", data: "d4:name99999999999999999999:xe", refusal: beyondEverything},
 	} {
 		t.Run(one.name, func(t *testing.T) {
 			c := check.New(t)
@@ -351,6 +360,9 @@ func TestNewFileFromBytesRejectsOverlongStrings(t *testing.T) {
 			allocated := allocatedBy(func() { f, err = tfs.NewFileFromBytes([]byte(one.data)) })
 			c.Nil(f)
 			c.HasError(err)
+			if err != nil {
+				c.Contains(err.Error(), one.refusal)
+			}
 			// The point of refusing it before the decoder sees it: the claim never becomes an allocation.
 			c.True(allocated < 1<<20, "%d bytes were allocated for a %d byte input", allocated, len(one.data))
 		})
@@ -1136,6 +1148,10 @@ func TestNewFileFromBytesRefusesUnsafePathComponents(t *testing.T) {
 		{name: "a device name", parts: []string{subDir, "CON"}},
 		{name: "a device name with an extension", parts: []string{"COM1.txt"}},
 		{name: "a device name with trailing spaces", parts: []string{"nul  "}},
+		{name: "a device name in trailing colon form", parts: []string{"NUL:"}},
+		{name: "a numbered device name in trailing colon form", parts: []string{subDir, "COM1:"}},
+		{name: "a device name with a colon and more behind it", parts: []string{"con:fusion.txt"}},
+		{name: "a device name with spaces before its colon", parts: []string{"prn :"}},
 	} {
 		t.Run(one.name, func(t *testing.T) {
 			_, err := tfs.NewFileFromBytes(encodeTorrent(t, infoWithPath(one.parts...)))
@@ -1305,4 +1321,64 @@ func TestCloseWhileReadingIsSafe(t *testing.T) {
 		c.True(errors.Is(err, os.ErrClosed), "seek after close: %v", err)
 		c.True(errors.Is(file.Close(), os.ErrClosed), "the second close")
 	}
+}
+
+// TestCloseWhileReadingADirectoryIsSafe verifies that the directory handles Open hands out are as safe against a
+// concurrent Close as the file handles alongside them. The package commits to os.File parity for that close on its
+// files, and the directories came from the very same Open, but their read position and closed flag were touched with
+// no synchronization at all: a Close racing a read is a data race outright, and two reads racing each other advance
+// the shared position between the check and the slice it takes, which is how the same child is handed out twice.
+func TestCloseWhileReadingADirectoryIsSafe(t *testing.T) {
+	c := check.New(t)
+	f := newPopulatedFile(t, multiFileInfo(), []byte("0123456789abcdefghij"))
+	for range 25 {
+		dir, err := f.Open(".")
+		c.NoError(err)
+		readDirFile, ok := dir.(fs.ReadDirFile)
+		c.True(ok)
+		legacy, ok := dir.(readdirFile)
+		c.True(ok)
+
+		// Every goroutine waits on the same channel, so that the close lands while the reads are in flight rather than
+		// before or after all of them.
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for i := range 4 {
+			wg.Go(func() {
+				<-start
+				for range 32 {
+					if i%2 == 0 {
+						_, _ = readDirFile.ReadDir(1) //nolint:errcheck // A closed directory is one of the answers
+					} else {
+						_, _ = legacy.Readdir(1) //nolint:errcheck // A closed directory is one of the answers
+					}
+				}
+			})
+		}
+		wg.Go(func() {
+			<-start
+			_ = dir.Close() //nolint:errcheck // Whether this or a later close wins isn't what is being judged
+		})
+		close(start)
+		wg.Wait()
+
+		// Once it is closed, every read says so instead of handing back an entry.
+		entries, err := readDirFile.ReadDir(1)
+		c.True(errors.Is(err, os.ErrClosed), "read dir after close: %v", err)
+		c.Equal(0, len(entries))
+		_, err = legacy.Readdir(1)
+		c.True(errors.Is(err, os.ErrClosed), "readdir after close: %v", err)
+		c.True(errors.Is(dir.Close(), os.ErrClosed), "the second close")
+	}
+
+	// Nothing above depends on a read having actually succeeded, so one is made on its own: a directory that answered
+	// every read with an error would satisfy the whole of it.
+	dir, err := f.Open(".")
+	c.NoError(err)
+	readDirFile, ok := dir.(fs.ReadDirFile)
+	c.True(ok)
+	entries, err := readDirFile.ReadDir(-1)
+	c.NoError(err)
+	c.Equal(2, len(entries))
+	c.NoError(dir.Close())
 }

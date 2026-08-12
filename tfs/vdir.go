@@ -13,12 +13,20 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"sync"
 )
 
+// vdir is one of a torrent's directories, presented as an open directory over the tree the metadata describes. The
+// os.File it stands in for may be closed while another goroutine is reading it, and answers that read with an error
+// rather than with undefined behavior, so the same has to hold here: the lock is what makes the closed check mean
+// anything, since without it a read that has passed the check races the Close that sets the flag. Reads serialize
+// against each other as a consequence, which the shared read position requires in any case, since two of them
+// advancing it at once is how the same batch of children is handed out twice.
 type vdir struct {
 	owner  *vfs
 	next   int
 	closed bool
+	lock   sync.Mutex
 }
 
 func (v *vdir) Stat() (os.FileInfo, error) {
@@ -68,6 +76,8 @@ func (v *vdir) ReadDir(count int) ([]fs.DirEntry, error) {
 
 // read returns the next batch of children, advancing the read position.
 func (v *vdir) read(count int) ([]*vfs, error) {
+	v.lock.Lock()
+	defer v.lock.Unlock()
 	if v.closed {
 		return nil, os.ErrClosed
 	}
@@ -88,6 +98,8 @@ func (v *vdir) read(count int) ([]*vfs, error) {
 }
 
 func (v *vdir) Close() error {
+	v.lock.Lock()
+	defer v.lock.Unlock()
 	if v.closed {
 		return os.ErrClosed
 	}

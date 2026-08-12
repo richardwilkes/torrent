@@ -369,8 +369,12 @@ func TestTrackerResponseIsBounded(t *testing.T) {
 	in, err := fetchAnnounceResponse(&tr, srv.URL)
 	c.NoError(err)
 	c.Equal(1800, in.Interval)
-	c.Equal(2, in.Seeders)
-	c.Equal(1, in.Leechers)
+	seeders, ok := swarmCount(in.Seeders)
+	c.True(ok)
+	c.Equal(2, seeders)
+	leechers, ok := swarmCount(in.Leechers)
+	c.True(ok)
+	c.Equal(1, leechers)
 	peers, err := parsePeers(discardLogger(), in.PeerAddresses, "<unknown>", 0, testPeerLimit)
 	c.NoError(err)
 	c.Equal([]peerAddr{{ip: testPeerIP1, port: 6881}}, peers)
@@ -1392,6 +1396,44 @@ func TestAnnounceKeepsThePeerListWhenNoneIsReturned(t *testing.T) {
 	response.setBody(noPeersResponse)
 	c.NoError(client.tracker.announce(context.Background(), ""))
 	c.Equal(0, len(client.tracker.knownPeers()))
+}
+
+// TestAnnounceKeepsTheSwarmCountsWhenNoneAreReturned verifies that the seeder and leecher counts survive a response
+// that doesn't carry them, and that a nonsense count never reaches the Status a caller reads. The "complete" and
+// "incomplete" keys are optional and commonly left out, so applying them unconditionally has every such response
+// silently report an empty swarm, and a tracker that is buggy or hostile can put a negative number in front of whoever
+// is watching the download.
+func TestAnnounceKeepsTheSwarmCountsWhenNoneAreReturned(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client, response := newTestTrackerClient(t, d)
+
+	response.setBody("d8:intervali1800e8:completei7e10:incompletei3e5:peers0:e")
+	c.NoError(client.tracker.announce(context.Background(), startedMsg))
+	status := client.tracker.status(0, 0)
+	c.Equal(7, status.Seeders)
+	c.Equal(3, status.Leechers)
+
+	// No counts at all, so the swarm we know about is still the one we knew about
+	response.setBody(noPeersResponse)
+	c.NoError(client.tracker.announce(context.Background(), ""))
+	status = client.tracker.status(0, 0)
+	c.Equal(7, status.Seeders)
+	c.Equal(3, status.Leechers)
+
+	// A count no swarm can have is refused rather than reported
+	response.setBody("d8:intervali1800e8:completei-1e10:incompletei-2e5:peers0:e")
+	c.NoError(client.tracker.announce(context.Background(), ""))
+	status = client.tracker.status(0, 0)
+	c.Equal(7, status.Seeders)
+	c.Equal(3, status.Leechers)
+
+	// An explicit zero is a statement about the swarm, and is recorded like any other count
+	response.setBody("d8:intervali1800e8:completei0e10:incompletei0e5:peers0:e")
+	c.NoError(client.tracker.announce(context.Background(), ""))
+	status = client.tracker.status(0, 0)
+	c.Equal(0, status.Seeders)
+	c.Equal(0, status.Leechers)
 }
 
 // TestAnnounceReportsAnIPv6PeerListItCannotUse verifies that a tracker answering under BEP-7's peers6 key is heard

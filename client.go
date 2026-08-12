@@ -29,6 +29,7 @@ import (
 	"github.com/richardwilkes/toolbox/v2/rate"
 	"github.com/richardwilkes/toolbox/v2/xfilepath"
 	"github.com/richardwilkes/toolbox/v2/xio"
+	"github.com/richardwilkes/toolbox/v2/xos"
 	"github.com/richardwilkes/torrent/dispatcher"
 	"github.com/richardwilkes/torrent/tfs"
 	"github.com/richardwilkes/torrent/tio"
@@ -456,7 +457,7 @@ func (c *Client) HandleConnection(conn net.Conn, logger *slog.Logger, _ dispatch
 			if tio.ShouldLogIOError(err) {
 				errs.LogTo(logger, err)
 			}
-			c.dispatcher.GateKeeper().BlockAddress(remoteAddr)
+			c.blockAddressOnHandshakeFailure(remoteAddr, err)
 			return
 		}
 	}
@@ -465,7 +466,7 @@ func (c *Client) HandleConnection(conn net.Conn, logger *slog.Logger, _ dispatch
 		if tio.ShouldLogIOError(err) {
 			errs.LogTo(logger, err)
 		}
-		c.dispatcher.GateKeeper().BlockAddress(remoteAddr)
+		c.blockAddressOnHandshakeFailure(remoteAddr, err)
 		return
 	}
 	// A remote presenting our own ID is us. That happens when the tracker hands back our own address, which parsePeers
@@ -497,6 +498,20 @@ func (c *Client) HandleConnection(conn net.Conn, logger *slog.Logger, _ dispatch
 		c.peerWaitGroup.Done()
 	}()
 	p.processIncomingMessages()
+}
+
+// blockAddressOnHandshakeFailure blocks the remote's address unless the exchange failed on routine churn rather than
+// on something the peer did wrong. A remote that hangs up between its handshake header and its peer ID, and a
+// connection we closed ourselves, would otherwise be banned for the full block duration — and a block applies in both
+// directions, so a peer that is merely firewalled or behind a NAT, which is the common case in a real swarm, also
+// loses the connection it would have gone on to make to us. This is the exemption blockAddressOnReadFailure already
+// applies to the peer session that follows, and the policy connectToPeer states for a dial that doesn't get through;
+// what the remote says, as opposed to whether it says it, is still blocked by the callers above.
+func (c *Client) blockAddressOnHandshakeFailure(remoteAddr net.Addr, err error) {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
+		return
+	}
+	c.dispatcher.GateKeeper().BlockAddress(remoteAddr)
 }
 
 // admitPeer takes the peer on, making room for it by giving up an existing one if every slot is taken, and returns
@@ -542,6 +557,12 @@ func (c *Client) admitPeer(conn net.Conn, p *peer) bool {
 // ours that failed would drop the connection it goes on to make to us as well.
 func (c *Client) connectToPeer(addr string, port int) {
 	defer c.finishDial(addr)
+	// A panic is contained to the connection that provoked it, exactly as the dispatcher does for the connections it
+	// accepts. This goroutine goes on to run the whole of the peer session — parsing binary messages the remote
+	// composes — so a panic escaping it takes the process down and every other torrent along with it, and the address
+	// it is talking to came from a tracker, which is untrusted input. The deferred release and close run on the unwind
+	// either way; the process kill is the whole of what this prevents.
+	defer xos.PanicRecovery(func(err error) { errs.LogTo(c.logger, err) })
 	c.logger.Debug("dialing peer", "address", addr, "port", port)
 	conn, err := net.DialTimeout("tcp", net.JoinHostPort(addr, strconv.Itoa(port)), peerDialTimeout)
 	if err != nil {

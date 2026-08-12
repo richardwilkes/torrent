@@ -150,10 +150,24 @@ type trackerWire struct { //nolint:govet // We can't change the order of these f
 	// with nothing but IPv6 peers leaves the client with no one to talk to and nothing said about why; with it, the
 	// announce reports what it was offered and couldn't use.
 	PeerAddresses6 bencode.RawMessage `bencode:"peers6"`
-	Seeders        int                `bencode:"complete"`
-	Leechers       int                `bencode:"incomplete"`
-	TrackerID      string             `bencode:"tracker id"`
-	Failure        string             `bencode:"failure reason"`
+	// Seeders and Leechers are pointers so that a response leaving the key out — which the spec allows and trackers
+	// commonly do — can be told apart from one that says the swarm holds none of that kind. Decoded into plain ints,
+	// the two are both zero, and the counts already in hand are silently thrown away by every response that omits them.
+	Seeders   *int   `bencode:"complete"`
+	Leechers  *int   `bencode:"incomplete"`
+	TrackerID string `bencode:"tracker id"`
+	Failure   string `bencode:"failure reason"`
+}
+
+// swarmCount reports the count a tracker supplied for one kind of peer, and whether it supplied a usable one. A key
+// that was left out isn't taking away the count we already have, any more than an omitted interval or peer list is,
+// and a negative count is a tracker that is buggy or hostile: the number flows straight into the public Status, so
+// neither is allowed to land there.
+func swarmCount(value *int) (int, bool) {
+	if value == nil || *value < 0 {
+		return 0, false
+	}
+	return *value, true
 }
 
 // peerWire is one entry of a tracker's dict-model peer list.
@@ -729,8 +743,14 @@ func (t *tracker) announce(ctx context.Context, event string) error {
 	if in.TrackerID != "" {
 		t.trackerID = in.TrackerID
 	}
-	t.seeders = in.Seeders
-	t.leechers = in.Leechers
+	if seeders, ok := swarmCount(in.Seeders); ok {
+		t.seeders = seeders
+	}
+	if leechers, ok := swarmCount(in.Leechers); ok {
+		t.leechers = leechers
+	}
+	seeders := t.seeders
+	leechers := t.leechers
 	// A response that simply leaves the peers key out isn't telling us the swarm is empty, any more than one leaving
 	// the interval or the tracker id out is taking those away, so the list already in hand is what dialCandidates goes
 	// on offering until an announce actually says otherwise. Cleared unconditionally, a single such response leaves
@@ -746,7 +766,9 @@ func (t *tracker) announce(ctx context.Context, event string) error {
 	if event == "" {
 		event = "update"
 	}
-	t.client.logger.Info("announce", "event", event, "seeders", in.Seeders, "leechers", in.Leechers, "peers",
+	// The counts logged are the ones now in hand rather than whatever the response carried, since a response that
+	// omitted them or supplied a nonsense one left the previous counts standing.
+	t.client.logger.Info("announce", "event", event, "seeders", seeders, "leechers", leechers, "peers",
 		len(peerAddresses))
 	return nil
 }

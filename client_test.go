@@ -773,6 +773,35 @@ func TestFailedDialIsNotLeftInFlight(t *testing.T) {
 	c.True(client.startDial(host))
 }
 
+// TestAPanicOnADialedConnectionIsContained verifies that a panic on the goroutine an outgoing connection runs on is
+// contained to that connection rather than taking the process down. The dispatcher already wraps the identical call
+// for the connections it accepts, and both go on to run the whole of the peer session — parsing binary messages the
+// remote composes — so without the same guard here the very same panic is survivable when the peer connected to us and
+// fatal for the process, and every other torrent the dispatcher is serving, when we connected to it: at an address the
+// tracker chose, which is untrusted input.
+func TestAPanicOnADialedConnectionIsContained(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	sink := &logSink{}
+	client.logger = slog.New(slog.NewTextHandler(sink, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	host, port, accepted := listenForTestDials(t)
+
+	// A torrent file taken away after the client was built stands in for a panic anywhere in the dial and the session
+	// behind it; what is under test is the containment rather than what provoked it. A panic that escapes doesn't so
+	// much fail this test as end the whole test binary, which is the harm being guarded against.
+	client.torrentFile = nil
+	c.True(client.startDial(host))
+	waitFor(t, "connectToPeer", func() { client.connectToPeer(host, port) })
+
+	c.Contains(sink.contents(), "recovered from panic",
+		"nothing panicked, so the containment this rests on was never exercised")
+	c.False(client.hostsInUse(nil)[host], "a connection attempt that panicked must not be left in flight")
+	if conn := <-accepted; conn != nil {
+		xio.CloseIgnoringErrors(conn)
+	}
+}
+
 // listenForTestDials starts a listener on the loopback interface and returns its host and port, along with the channel
 // the connections made to it are delivered on. Closing the listener, which happens when the test ends, delivers a nil
 // connection.
@@ -1400,6 +1429,59 @@ func TestConnectionToOurselvesIsRefused(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+}
+
+// TestAHandshakeTheRemoteHangsUpOnIsNotBlocked verifies that a remote which goes away part way through the handshake
+// is left able to reach us rather than banned for it. A block applies in both directions and lasts minutes, so a peer
+// that simply hung up between its handshake header and its peer ID — routine churn, and what the dial side already
+// treats as such — loses the connection it would have gone on to make to us, which in a small swarm can shut out the
+// only well-behaved peers there are.
+func TestAHandshakeTheRemoteHangsUpOnIsNotBlocked(t *testing.T) {
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	// An ID of our own, so that the all zeros ID a remote presents isn't taken for a connection to ourselves
+	for i := range client.id {
+		client.id[i] = urlQuerySafeBytes[i%len(urlQuerySafeBytes)]
+	}
+	var extensions dispatcher.ProtocolExtensions
+
+	for _, one := range []struct {
+		name string
+		sent int
+	}{
+		{name: "before the peer ID"},
+		{name: "part way through the peer ID", sent: 4},
+	} {
+		t.Run(one.name, func(t *testing.T) {
+			c := check.New(t)
+			conn, remote := newTestConnPair(t)
+			if one.sent != 0 {
+				_, err := conn.Write(make([]byte, one.sent))
+				c.NoError(err)
+			}
+			xio.CloseIgnoringErrors(conn)
+			waitFor(t, "HandleConnection", func() {
+				client.HandleConnection(remote, client.logger, extensions, client.torrentFile.InfoHash, false, nil)
+			})
+			c.Equal(0, len(client.currentPeers()))
+			c.False(d.GateKeeper().IsAddressBlocked(remote.RemoteAddr()),
+				"a remote that hung up mid-handshake must not be banned in both directions for it")
+		})
+	}
+
+	// The exemption is for how the exchange ended rather than for the exchange itself: a remote that answers for a
+	// torrent we didn't ask about is still blocked, as TestConnectionToOurselvesIsRefused covers for the other check
+	// the handshake makes.
+	c := check.New(t)
+	conn, remote := newTestConnPair(t)
+	xio.CloseIgnoringErrors(conn)
+	var otherHash tfs.InfoHash
+	otherHash[0] = client.torrentFile.InfoHash[0] + 1
+	waitFor(t, "HandleConnection", func() {
+		client.HandleConnection(remote, client.logger, extensions, otherHash, false, nil)
+	})
+	c.True(d.GateKeeper().IsAddressBlocked(remote.RemoteAddr()),
+		"a remote answering for a torrent we didn't ask about must still be blocked")
 }
 
 // TestHandshakeCompletionIsReportedAfterThePeerIDIsRead verifies that the dispatcher isn't told the handshake is over

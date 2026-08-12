@@ -707,10 +707,10 @@ func usableComponent(sub string) bool {
 			return false
 		}
 	}
-	// Windows resolves the device from what precedes the first '.', ignoring trailing spaces, so "COM1.txt" and "CON "
-	// name devices just as bare "CON" does.
+	// Windows resolves the device from what precedes the first '.' or ':', ignoring trailing spaces, so "COM1.txt",
+	// "CON " and the classic trailing-colon device syntax "NUL:" all name devices just as bare "CON" does.
 	device := sub
-	if i := strings.IndexByte(device, '.'); i != -1 {
+	if i := strings.IndexAny(device, ".:"); i != -1 {
 		device = device[:i]
 	}
 	device = strings.TrimRight(device, " ")

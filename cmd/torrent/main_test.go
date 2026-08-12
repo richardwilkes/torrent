@@ -287,23 +287,38 @@ func TestStopAtExitResumesOnceTheMonitorIsDone(t *testing.T) {
 func TestStopAtExitInterruptsWorkThatOutlastsTheWait(t *testing.T) {
 	interrupt := make(chan struct{})
 	finished := make(chan struct{})
-	registered := registerStopAtExit(t, func(_ time.Duration) {}, interrupt, finished, time.Millisecond, notifyWait)
+	// The second wait is generous, so that what the interrupt is followed by can be judged rather than raced: an exit
+	// that gave up on the extraction the moment the first wait ran out would otherwise return just as promptly as one
+	// that interrupted it and waited, and the test could not tell them apart.
+	registered := registerStopAtExit(t, func(_ time.Duration) {}, interrupt, finished, time.Millisecond, time.Hour)
 
-	// Stands in for the extraction, which only reports that it is finished once the interrupt has reached it and it
-	// has taken back what it wrote
-	go func() {
-		<-interrupt
-		close(finished)
-	}()
 	returned := make(chan struct{})
 	go func() {
 		defer close(returned)
 		registered()
 	}()
+
+	// The interrupt is what the extraction has to be told to stop by. Without it, the exit that follows kills the copy
+	// where it stands — the exact harm this is here to prevent — however promptly the exit itself returns.
+	select {
+	case <-interrupt:
+	case <-time.After(notifyWait):
+		t.Fatal("the extraction was never told to stop, so the exit left it to be killed where it stood")
+	}
+
+	// Telling it to stop is only half of it: the exit has to give it the moment that taking back what it wrote costs.
+	select {
+	case <-returned:
+		t.Fatal("the exit did not wait for the interrupted extraction to clean up after itself")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Released rather than left to run out its wait, so that the goroutine running it doesn't outlive the test
+	close(finished)
 	select {
 	case <-returned:
 	case <-time.After(notifyWait):
-		t.Fatal("the extraction was never interrupted, so the exit waited on work that had no way to stop")
+		t.Fatal("the exit did not resume once the extraction had stopped")
 	}
 }
 
@@ -690,6 +705,67 @@ func TestAFailedExtractionLeavesNothingBehind(t *testing.T) {
 	c.True(os.IsNotExist(err), "a partial extraction must not be left behind: %v", err)
 
 	// And with nothing in the way, the retry that failure leaves room for succeeds
+	c.NoError(copyToNewFile(target, strings.NewReader(sampleContent)))
+	data, err := os.ReadFile(target)
+	c.NoError(err)
+	c.Equal(sampleContent, string(data))
+}
+
+// extractionRecorder stands in for the file an extraction writes into, recording what was asked of it and failing the
+// commit on demand. No real filesystem can be asked to fail an fsync, and the commit is what the removal of the
+// storage that follows a successful extraction rests on.
+type extractionRecorder struct {
+	syncErr error
+	written strings.Builder
+	calls   []string
+}
+
+func (e *extractionRecorder) Write(p []byte) (int, error) {
+	e.calls = append(e.calls, "write")
+	return e.written.Write(p)
+}
+
+func (e *extractionRecorder) Sync() error {
+	e.calls = append(e.calls, "sync")
+	return e.syncErr
+}
+
+func (e *extractionRecorder) Close() error {
+	e.calls = append(e.calls, "close")
+	return nil
+}
+
+// TestAnExtractedFileReachesTheDiskBeforeItIsCalledDone verifies that an extracted file is committed to the disk
+// before the copy reports success, and that a commit which fails is treated exactly like a copy that failed. The
+// monitor removes the storage file — the only other copy of the data — as soon as the extraction reports success, so
+// without the commit the invariant that removal rests on holds against process death but not against an OS crash or a
+// power loss: extracted data still sitting in the page cache is lost in the writeback window the unlink commits
+// inside, leaving truncated files that look complete with the download they could have come from again already gone.
+func TestAnExtractedFileReachesTheDiskBeforeItIsCalledDone(t *testing.T) {
+	c := check.New(t)
+	t.Chdir(t.TempDir())
+	const target = "committed.bin"
+
+	// The commit comes after everything has been written and before the file is closed and called done
+	recorder := &extractionRecorder{}
+	c.NoError(os.WriteFile(target, nil, 0o600))
+	c.NoError(copyIntoNewFile(target, recorder, strings.NewReader(sampleContent)))
+	c.Equal([]string{"write", "sync", "close"}, recorder.calls)
+	c.Equal(sampleContent, recorder.written.String())
+	_, err := os.Stat(target)
+	c.NoError(err, "a completed extraction must be left in place")
+
+	// A commit that fails means the content may never have reached the disk, so the target goes the way a failed copy's
+	// does rather than being left behind looking complete
+	recorder = &extractionRecorder{syncErr: errors.New("the disk went away")}
+	c.NoError(os.WriteFile(target, []byte(sampleContent), 0o600))
+	err = copyIntoNewFile(target, recorder, strings.NewReader(sampleContent))
+	c.HasError(err, "a commit that fails must be reported")
+	c.Equal([]string{"write", "sync", "close"}, recorder.calls)
+	_, err = os.Stat(target)
+	c.True(os.IsNotExist(err), "a file that may never have reached the disk must not be left behind: %v", err)
+
+	// And the real path, which is what every extraction takes, commits the file it wrote just the same
 	c.NoError(copyToNewFile(target, strings.NewReader(sampleContent)))
 	data, err := os.ReadFile(target)
 	c.NoError(err)

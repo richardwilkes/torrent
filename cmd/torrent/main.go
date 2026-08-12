@@ -559,25 +559,49 @@ func (r *interruptibleReader) Read(p []byte) (int, error) {
 	return r.r.Read(p)
 }
 
+// extractionTarget is the file an extraction writes into: an *os.File everywhere but the test that covers a commit
+// which fails, which no real filesystem can be asked for on demand.
+type extractionTarget interface {
+	io.Writer
+	Sync() error
+	Close() error
+}
+
 // copyToNewFile creates target, which must not already exist, and copies everything r has into it.
-//
-// A copy that fails part way — a full disk, a storage file that can't be read — takes the target with it. What it
-// would otherwise leave behind is a truncated file that is indistinguishable from a completed extraction, and since
-// the target is created exclusively, every later extraction and every -unpack retry then fails with "file exists" on
-// that partial file rather than replacing it. That defeats the retry the monitor deliberately keeps the storage around
-// for and leaves whoever asked for the extraction to work out which file to delete by hand. A close that fails is
-// treated the same way, since data buffered on our behalf may never have reached the disk.
 func copyToNewFile(target string, r io.Reader) error {
 	f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}
-	if _, err = io.Copy(f, r); err != nil {
+	return copyIntoNewFile(target, f, r)
+}
+
+// copyIntoNewFile copies everything r has into f, which was just created at target, and commits it to the disk.
+//
+// A copy that fails part way — a full disk, a storage file that can't be read — takes the target with it. What it
+// would otherwise leave behind is a truncated file that is indistinguishable from a completed extraction, and since
+// the target is created exclusively, every later extraction and every -unpack retry then fails with "file exists" on
+// that partial file rather than replacing it. That defeats the retry the monitor deliberately keeps the storage around
+// for and leaves whoever asked for the extraction to work out which file to delete by hand. A sync or a close that
+// fails is treated the same way, since data buffered on our behalf may never have reached the disk.
+func copyIntoNewFile(target string, f extractionTarget, r io.Reader) error {
+	if _, err := io.Copy(f, r); err != nil {
 		xio.CloseIgnoringErrors(f) // The copy failure is the more meaningful error, so keep it
 		removePartialExtraction(target)
 		return err
 	}
-	if err = f.Close(); err != nil {
+	// The content reaches the disk before the copy is called a success, since the monitor removes the storage file —
+	// the only other copy of the data — as soon as the extraction reports one. Without this, the invariant that removal
+	// rests on ("the storage is only given up once its content is safely somewhere else") holds against process death
+	// but not against an OS crash or a power loss: extracted data still sitting in the page cache is lost in the
+	// writeback window the unlink commits inside, leaving truncated files that look complete with the download they
+	// could have been extracted from again already gone.
+	if err := f.Sync(); err != nil {
+		xio.CloseIgnoringErrors(f) // The sync failure is the more meaningful error, so keep it
+		removePartialExtraction(target)
+		return err
+	}
+	if err := f.Close(); err != nil {
 		removePartialExtraction(target)
 		return err
 	}
