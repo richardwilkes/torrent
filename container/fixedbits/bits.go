@@ -100,6 +100,36 @@ func (b *Bits) SetBytes(buffer []byte) {
 	b.clearSpareBits()
 }
 
+// SpareBitsSet returns true if the buffer has a bit set at a position beyond
+// the number of bits this object holds, which is what SetBytes would discard.
+// A caller that has to refuse such a buffer rather than take it in — BEP 3
+// requires the trailing bits of the last byte of a bit field to be zero and
+// has a downloader drop a peer that sets them — asks this before handing it
+// over, since afterwards there is nothing left to see.
+func (b *Bits) SpareBitsSet(buffer []byte) bool {
+	var mask byte
+	if spare := len(b.data)*8 - b.size; spare > 0 {
+		mask = ^(byte(0xFF) << uint(spare))
+	}
+	last := len(b.data) - 1
+	for i, one := range buffer {
+		switch {
+		case i < last:
+			// Every bit of this byte is one the set holds
+		case i == last:
+			if one&mask != 0 {
+				return true
+			}
+		default:
+			// Whole bytes past the backing storage are spare, whatever the size rounds up to
+			if one != 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // clearSpareBits clears any bits in the backing storage that are beyond the
 // number of bits this object holds, since they aren't valid and would
 // otherwise be seen as set by the methods that scan the backing storage.

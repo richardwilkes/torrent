@@ -97,6 +97,50 @@ func TestSetBytesDiscardsSpareBits(t *testing.T) {
 	c.Equal(-1, clone.NextUnset(0))
 }
 
+// TestSpareBitsSet verifies that a buffer carrying bits past the end of the set can be told apart from one that
+// doesn't, which is what a caller obliged to refuse the first — BEP 3 requires the trailing bits of a bit field to be
+// zero and has a downloader drop a peer that sets them — has to ask before SetBytes discards the evidence.
+func TestSpareBitsSet(t *testing.T) {
+	c := check.New(t)
+
+	// 12 bits requires 2 bytes of storage, leaving 4 spare bits
+	bm := New(12)
+	c.False(bm.SpareBitsSet([]byte{0xFF, 0xF0}), "every bit the set holds may be set")
+	c.False(bm.SpareBitsSet([]byte{0x00, 0x00}))
+	c.True(bm.SpareBitsSet([]byte{0x00, 0x08}), "the first spare bit must be noticed")
+	c.True(bm.SpareBitsSet([]byte{0xFF, 0xFF}))
+	c.True(bm.SpareBitsSet([]byte{0x00, 0x01}), "the last spare bit must be noticed")
+
+	// A size that fills its storage exactly has no spare bits at all
+	bm = New(16)
+	c.False(bm.SpareBitsSet([]byte{0xFF, 0xFF}))
+
+	// Whole bytes past the storage are spare too, however the size rounds up
+	bm = New(4)
+	c.False(bm.SpareBitsSet([]byte{0xF0}))
+	c.True(bm.SpareBitsSet([]byte{0xF0, 0x00, 0x01}))
+	c.False(bm.SpareBitsSet([]byte{0xF0, 0x00, 0x00}))
+
+	// A buffer that stops short of the storage carries no spare bits, since none of it reaches them
+	bm = New(20)
+	c.False(bm.SpareBitsSet([]byte{0xFF}))
+	c.False(bm.SpareBitsSet(nil))
+
+	// A set holding nothing has nothing but spare bits
+	bm = New(0)
+	c.False(bm.SpareBitsSet(nil))
+	c.False(bm.SpareBitsSet([]byte{0x00}))
+	c.True(bm.SpareBitsSet([]byte{0x01}))
+
+	// What it reports is exactly what SetBytes would throw away
+	for _, buffer := range [][]byte{{0xFF, 0xFF}, {0xFF, 0xF0}, {0x00, 0x08}, {0x12, 0x34}} {
+		bm = New(12)
+		reported := bm.SpareBitsSet(buffer)
+		bm.SetBytes(buffer)
+		c.Equal(reported, !bytes.Equal(buffer, bm.data), "buffer %v", buffer)
+	}
+}
+
 func TestFirstAvailable(t *testing.T) {
 	c := check.New(t)
 	const pieceCount = 5

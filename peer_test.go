@@ -20,7 +20,9 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -207,47 +209,59 @@ func TestBitFieldLargerThanTheRateCapIsAccepted(t *testing.T) {
 	}
 }
 
-// TestBitFieldSpareBitsAreIgnored verifies that a peer that sets the spare bits at the end of its bit field, which
-// correspond to pieces that don't exist, can't get us to request a piece index beyond the end of the torrent. Doing so
-// would panic when the piece it returned was validated against the piece hashes.
-func TestBitFieldSpareBitsAreIgnored(t *testing.T) {
-	c := check.New(t)
-	d := newTestDispatcher(t)
-	client := newTestClient(d)
+// TestABitFieldWithSpareBitsSetIsRejected verifies that a peer whose bit field sets the bits past the end of the
+// field, which correspond to pieces the torrent doesn't contain, is dropped rather than quietly corrected. BEP 3
+// requires those bits to be zero and has a downloader drop a peer that sets them, and fixedbits.SetBytes normalizes
+// them away, so the careful check the field's length gets has no counterpart at all for its content: a peer claiming
+// pieces that don't exist would otherwise go on looking like a healthy one.
+func TestABitFieldWithSpareBitsSetIsRejected(t *testing.T) {
+	// The test torrent has four pieces, so the low four bits of the single byte a bit field for it carries are the
+	// spare ones
+	for _, one := range []struct {
+		name     string
+		bits     byte
+		rejected bool
+	}{
+		{name: "the spare bits are zero", bits: 0xF0},
+		{name: "one spare bit is set", bits: 0xF8, rejected: true},
+		{name: "every spare bit is set", bits: 0xFF, rejected: true},
+	} {
+		t.Run(one.name, func(t *testing.T) {
+			c := check.New(t)
+			// A dispatcher of its own, since blocking the address would otherwise carry into the other cases
+			d := newTestDispatcher(t)
+			client := newTestClient(d)
+			conn, p, done := startTestPeer(t, client)
+			defer xio.CloseIgnoringErrors(conn)
+			c.Equal(1, p.has.ByteLength())
+			c.Equal(testPieceCount, p.has.Length())
 
-	// We already have every piece in the torrent, so only the spare bits could be seen as something to download
-	client.tracker.lock.Lock()
-	for i := range testPieceCount {
-		client.tracker.have.Set(i)
-	}
-	client.tracker.lock.Unlock()
+			_, err := conn.Write(newTestMessage(bitFieldID, one.bits))
+			c.NoError(err)
+			if one.rejected {
+				waitForConnClose(t, conn, peerMgmtWait)
+				<-done
+				c.True(d.GateKeeper().IsAddressBlocked(p.conn.RemoteAddr()))
+				p.lock.RLock()
+				taken := p.has.AnySet()
+				p.lock.RUnlock()
+				c.False(taken, "a bit field that was refused must not have been taken in either")
+				return
+			}
 
-	conn, p, done := startTestPeer(t, client)
-	defer xio.CloseIgnoringErrors(conn)
-	expectBitField(t, conn, 0xF0)
-
-	// The peer claims to have everything, including the pieces that don't exist
-	c.Equal(1, p.has.ByteLength())
-	_, err := conn.Write(newTestMessage(bitFieldID, 0xFF))
-	c.NoError(err)
-	_, err = conn.Write(newTestMessage(unchokeID))
-	c.NoError(err)
-
-	// Nothing should be requested, since there is nothing left to download
-	c.NoError(conn.SetReadDeadline(time.Now().Add(time.Second)))
-	buffer := make([]byte, 64)
-	if n, rerr := conn.Read(buffer); rerr == nil {
-		t.Fatalf("the peer had nothing to say, but sent %v", buffer[:n])
-	}
-	p.lock.RLock()
-	requested := slices.Sorted(maps.Keys(p.pieces))
-	p.lock.RUnlock()
-	c.Equal(0, len(requested), "requested piece indexes: %v", requested)
-
-	select {
-	case <-done:
-		t.Fatal("peer closed the connection for well-formed messages")
-	default:
+			// A field whose spare bits are zero is taken in, and since we have nothing of a torrent this peer has all
+			// of, it is answered with an interested message
+			c.NoError(conn.SetReadDeadline(time.Now().Add(msgReadDeadline)))
+			response := make([]byte, 5)
+			_, err = io.ReadFull(conn, response)
+			c.NoError(err)
+			c.Equal(newTestMessage(interestedID), response)
+			select {
+			case <-done:
+				t.Fatal("the peer was dropped over a bit field that says nothing wrong")
+			default:
+			}
+		})
 	}
 }
 
@@ -560,6 +574,8 @@ func TestProtocolViolationsCloseTheConnection(t *testing.T) {
 		{name: "an oversized message", message: []byte{0xFF, 0xFF, 0xFF, 0xFF}},
 		{name: "a message length that doesn't match its ID", message: newTestMessage(haveID)},
 		{name: "a bit field of the wrong length", message: newTestMessage(bitFieldID, 0, 0)},
+		{name: "a have for a piece the torrent doesn't contain", message: newTestHave(testPieceCount)},
+		{name: "a have for an index that doesn't fit in an int on a 32 bit platform", message: newTestHave(math.MaxUint32)},
 		{name: "a request for data that doesn't exist", message: newTestPieceRequest(requestID, testPieceCount, 0, 1)},
 		{
 			name:    "a chunk we never asked for",
@@ -1011,6 +1027,121 @@ func TestAPieceReclaimedWhileItsQueueEntryIsSettledKeepsIt(t *testing.T) {
 	c.False(queued, "a piece we no longer hold must leave the queue")
 }
 
+// TestACompletedPieceOnlyGivesUpTheClaimItFinished verifies that finishing a piece gives up the very piece that was
+// finished rather than whatever is claimed for that index by the time it is done. The hash and the disk write sit
+// between taking the buffer and giving the claim up and nothing holds the piece's lock across them, so
+// clearExpiredDownloads can release the index while the write is in flight and another peer's goroutine re-claim it —
+// it is available again, since the block isn't marked valid until afterwards. Giving up whatever is there then throws
+// that fresh claim away with its chunk requests already on the wire, and the peer answers with a whole piece we are
+// about to mark as had: every chunk of it ignored, and all of it charged to the tracker's downloaded total.
+func TestACompletedPieceOnlyGivesUpTheClaimItFinished(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClientForTorrent(d, newTestTorrentFileWithHashes())
+	defer client.closeRateLimiters()
+	client.file = newTestStorage(t, client)
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+
+	p.queuePieceDownload(0)
+	p.lock.RLock()
+	one := p.pieces[0]
+	p.lock.RUnlock()
+
+	// The index is released and re-claimed, which is what a completion still working through its hash and its write
+	// would find had happened underneath it
+	c.True(p.releaseIfStillOurs(0, one))
+	p.queuePieceDownload(0)
+	p.lock.RLock()
+	fresh := p.pieces[0]
+	p.lock.RUnlock()
+	c.True(fresh != nil && fresh != one, "the index must have been re-claimed for a piece of its own")
+
+	c.NoError(p.completePiece(0, one, testStorageBytes(0, 0, chunkSize)))
+	c.True(client.tracker.hasPiece(0), "the piece that was finished must still be counted as one we have")
+	p.lock.RLock()
+	held := p.pieces[0]
+	p.lock.RUnlock()
+	c.True(held == fresh, "finishing a piece must not throw away the claim that replaced it")
+}
+
+// TestCompletingAPieceDoesNotHoldThePiecesLock verifies that the hash and the disk write a finished piece goes through
+// don't run with that piece's lock held. clearExpiredDownloads takes it for every piece of every peer, and the peer
+// management goroutine reaches that from its expiry tick and from adjustPeers, so holding it across a full-piece SHA-1
+// and a write of up to tfs.MaxPieceLength stalls choke rotation, expiry clearing and dialing for every peer at once —
+// with Client.Stop's bounded wait for peer management and this peer's own processChunkRequests along with them.
+func TestCompletingAPieceDoesNotHoldThePiecesLock(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClientForTorrent(d, newTestTorrentFileWithHashes())
+	defer client.closeRateLimiters()
+	client.file = newTestStorage(t, client)
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+	p.queuePieceDownload(0)
+	p.lock.RLock()
+	one := p.pieces[0]
+	p.lock.RUnlock()
+
+	// Held for the whole of the completion, which must not need it. Released by the deferred unlock whatever happens,
+	// so a completion that does wait for it is freed rather than left parked for the rest of the run.
+	one.lock.Lock()
+	defer one.lock.Unlock()
+	completed := make(chan error, 1)
+	go func() { completed <- p.completePiece(0, one, testStorageBytes(0, 0, chunkSize)) }()
+	select {
+	case err := <-completed:
+		c.NoError(err)
+	case <-time.After(peerMgmtWait):
+		t.Fatal("completing a piece waited for that piece's own lock")
+	}
+	c.True(client.tracker.hasPiece(0))
+}
+
+// TestOnlyOnePieceIsClaimedForAPeerAtATime verifies that two callers deciding at once that a peer is idle can't both
+// claim a piece for it. Whether it may take one on is read from what it already holds and acted on afterwards, with
+// the tracker's lock taken in between, and both the peer's own read goroutine — every unchoke, have, bit field and
+// completed piece reaches it — and the peer management goroutine, through clearExpiredDownloads, make that decision.
+// Two pieces on one peer cost two piece buffers instead of one and share a single maxOutstandingChunkRequests budget
+// that the first can consume entirely, leaving the second claimed but never asked for until maxDownloadStall gives it
+// back two minutes later, and no other peer can take it for any of that time.
+func TestOnlyOnePieceIsClaimedForAPeerAtATime(t *testing.T) {
+	c := check.New(t)
+	d := newTestDispatcher(t)
+	client := newTestClient(d)
+	conn, p := newTestPeer(t, client)
+	defer xio.CloseIgnoringErrors(conn)
+	p.lock.Lock()
+	p.peerChoking = false
+	p.has = everyTestPiece()
+	p.lock.Unlock()
+
+	// Claiming a piece needs the tracker's lock, so holding it parks the first caller between reading what the peer
+	// holds and recording the piece it took, which is the whole of the window a second caller has to get into
+	client.tracker.lock.Lock()
+	first := make(chan struct{})
+	go func() { defer close(first); p.startDownloadIfNeeded() }()
+	waitForParkedGoroutines(t, 1, "torrent.(*tracker).selectForDownloading(")
+
+	// A second caller arrives while the first is parked, and must be parked itself rather than deciding from a peer
+	// that is about to have a piece recorded for it
+	second := make(chan struct{})
+	go func() { defer close(second); p.startDownloadIfNeeded() }()
+	waitForParkedGoroutines(t, 2, "torrent.(*peer).startDownloadIfNeeded(")
+
+	client.tracker.lock.Unlock()
+	<-first
+	<-second
+	p.lock.RLock()
+	claimed := slices.Sorted(maps.Keys(p.pieces))
+	p.lock.RUnlock()
+	c.Equal(1, len(claimed), "a peer may hold one piece at a time, indexes: %v", claimed)
+	client.tracker.lock.RLock()
+	who := maps.Clone(client.tracker.who)
+	client.tracker.lock.RUnlock()
+	c.Equal(1, len(who), "the tracker must be left with the one claim the peer actually holds")
+}
+
 // TestAStorageReadFailureStopsTheTorrent verifies that storage we can't read isn't left as one connection's problem.
 // Nothing a peer does fixes it, so every other peer asking for data runs into the same failure and is dropped for it,
 // leaving a torrent that goes on running as a seeder which serves no one and says nothing about it beyond a log line
@@ -1395,10 +1526,14 @@ func TestChokeDoesNotCostTheConnectionOrThePiece(t *testing.T) {
 	conn, p, done := startTestPeer(t, client)
 	defer xio.CloseIgnoringErrors(conn)
 
-	// The peer unchokes us and we ask it for a piece
+	// The peer unchokes us and we ask it for a piece. The unchoke is waited for rather than merely sent, since resuming
+	// what we hold is part of taking it in: a claim that won that race would have the unchoke queue a second, identical
+	// request, and the read at the end of this test — the assertion that the request the choke discarded is made again
+	// — could be satisfied by that leftover rather than by the resend it is about.
 	c.NoError(conn.SetDeadline(time.Now().Add(peerMgmtWait)))
 	_, err := conn.Write(newTestMessage(unchokeID))
 	c.NoError(err)
+	waitForMessagesToBeProcessed(t, conn, p)
 	p.queuePieceDownload(0)
 	buffer := make([]byte, 17)
 	_, err = io.ReadFull(conn, buffer)
@@ -1590,6 +1725,69 @@ func waitForMessagesToBeProcessed(t *testing.T, conn net.Conn, p *peer) {
 			t.Fatal("the peer never processed the messages sent to it")
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+// waitForParkedGoroutines waits until the given number of goroutines are parked inside the named function, and fails
+// the test if they never are. A goroutine that has reached a lock the test itself is holding can go no further until
+// the test lets go, so finding it there is what lets a test sequence a race exactly rather than sleeping and trusting
+// that the scheduler cooperated — a sleep that is too short doesn't fail the test, it quietly stops testing anything.
+// Only goroutines that are actually blocked count, since one still running through the function says nothing about
+// where it will end up.
+func waitForParkedGoroutines(t *testing.T, count int, marker string) {
+	t.Helper()
+	deadline := time.Now().Add(peerMgmtWait)
+	for {
+		parked := parkedGoroutinesIn(marker)
+		if parked >= count {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d of %d goroutines ever parked inside %s:\n%s", parked, count, marker, goroutineStacks())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// parkedGoroutinesIn returns how many blocked goroutines have the named function on their stack.
+func parkedGoroutinesIn(marker string) int {
+	count := 0
+	// A traceback separates one goroutine's stack from the next with a blank line
+	for one := range strings.SplitSeq(goroutineStacks(), "\n\n") {
+		if strings.Contains(one, marker) && !goroutineIsRunning(one) {
+			count++
+		}
+	}
+	return count
+}
+
+// goroutineIsRunning reports whether the stack belongs to a goroutine that is on a processor rather than blocked. The
+// state is the bracketed word on the header line every stack starts with, so "goroutine 7 [running]:" and
+// "goroutine 8 [sync.RWMutex.RLock]:" are told apart by it. A header that can't be read is treated as running, which
+// is the answer that makes a caller wait rather than proceed on a goroutine that may not be parked at all.
+func goroutineIsRunning(stack string) bool {
+	header, _, ok := strings.Cut(stack, "]:")
+	if !ok {
+		return true
+	}
+	_, state, ok := strings.Cut(header, "[")
+	if !ok {
+		return true
+	}
+	// A state may carry how long it has been in it, as in "[semacquire, 2 minutes]"
+	state, _, _ = strings.Cut(state, ",")
+	return state == "running" || state == "runnable" || state == "syscall"
+}
+
+// goroutineStacks returns the stacks of every goroutine running right now.
+func goroutineStacks() string {
+	buffer := make([]byte, 1<<16)
+	for {
+		n := runtime.Stack(buffer, true)
+		if n < len(buffer) {
+			return string(buffer[:n])
+		}
+		buffer = make([]byte, 2*len(buffer))
 	}
 }
 
@@ -2135,14 +2333,14 @@ func TestUpdateInterestDoesNotRecordAStaleDecision(t *testing.T) {
 	client.tracker.lock.Lock()
 	first := make(chan struct{})
 	go func() { defer close(first); p.updateInterest() }()
+	waitForParkedGoroutines(t, 1, "torrent.(*tracker).isInteresting(")
 
-	// A second update starts while the first is still parked. The waits are only here to give each goroutine time to
-	// reach the point it will block at; whether they are long enough decides whether a stale decision could be
-	// recorded, not whether a fresh one is.
-	time.Sleep(50 * time.Millisecond)
+	// A second update starts while the first is parked, and is waited for rather than slept past: it has to be parked
+	// itself before the peer is told anything, since one that hasn't started yet would take its snapshot of the fresh
+	// state and the stale decision would have nothing left to contradict
 	second := make(chan struct{})
 	go func() { defer close(second); p.updateInterest() }()
-	time.Sleep(50 * time.Millisecond)
+	waitForParkedGoroutines(t, 2, "torrent.(*peer).updateInterest(")
 
 	// The peer tells us it has a piece we need, which only an update that has yet to look at the peer can take in
 	p.lock.Lock()
@@ -2702,6 +2900,13 @@ func newTestPieceRequest(id byte, index, begin, length uint32) []byte {
 	binary.BigEndian.PutUint32(payload[4:8], begin)
 	binary.BigEndian.PutUint32(payload[8:], length)
 	return newTestMessage(id, payload...)
+}
+
+// newTestHave creates the message saying a peer has the piece with the given index.
+func newTestHave(index uint32) []byte {
+	payload := make([]byte, 4)
+	binary.BigEndian.PutUint32(payload, index)
+	return newTestMessage(haveID, payload...)
 }
 
 // newTestMessage creates a peer message with the given ID and payload, prefixed with its length.

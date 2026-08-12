@@ -161,6 +161,13 @@ type peer struct {
 	// decision has to be made with the tracker's lock in hand and taking that one while holding the peer's would
 	// order the two.
 	interestLock sync.Mutex
+	// downloadStartLock serializes startDownloadIfNeeded from end to end, for the reason interestLock exists and under
+	// the same restriction: whether the peer may take a piece on is decided from a snapshot of what it already holds
+	// and acted on afterwards, with the tracker's lock taken in between, so two callers left to interleave both find
+	// it holding nothing and both claim. The peer's own read goroutine reaches it from every unchoke, have, bit field
+	// and completed piece, and the peer management goroutine reaches it through clearExpiredDownloads, so the two run
+	// into each other as a matter of course.
+	downloadStartLock sync.Mutex
 }
 
 type pieceRequest struct {
@@ -779,7 +786,18 @@ func (p *peer) processIncomingMessages() {
 				p.peerInterested = false
 				p.lock.Unlock()
 			case haveID:
+				// The index is unverified data from the peer, and on a platform where int is 32 bits a large enough
+				// one arrives as a negative number, so the sign is checked in its own right. A have naming a piece the
+				// torrent doesn't contain is a protocol violation like every other malformed message this loop
+				// refuses: Set ignores an index it can't hold, so letting one through would leave a broken peer looking
+				// healthy while it could never be interesting to us.
 				index := int(binary.BigEndian.Uint32(buffer[1:]))
+				if index < 0 || index >= p.client.torrentFile.PieceCount() {
+					p.logger.Warn("have for a piece outside the torrent", "index", index,
+						"pieces", p.client.torrentFile.PieceCount())
+					p.rejectPeer()
+					return
+				}
 				p.lock.Lock()
 				p.has.Set(index)
 				p.lock.Unlock()
@@ -790,6 +808,16 @@ func (p *peer) processIncomingMessages() {
 				if length != uint32(1+p.has.ByteLength()) {
 					p.lock.Unlock()
 					p.logger.Warn("unexpected bit field length", "expected", p.has.ByteLength(), "actual", length-1)
+					p.rejectPeer()
+					return
+				}
+				// BEP 3 requires the bits past the end of the field to be zero and has a downloader drop a peer that
+				// sets them, which is a peer claiming pieces the torrent doesn't contain. SetBytes normalizes them
+				// away, so refusing them has to happen before the field is taken in — and the check the length gets
+				// just above says nothing about the content it admits.
+				if p.has.SpareBitsSet(buffer[1:]) {
+					p.lock.Unlock()
+					p.logger.Warn("bit field with spare bits set", "pieces", p.client.torrentFile.PieceCount())
 					p.rejectPeer()
 					return
 				}
@@ -895,7 +923,15 @@ func (p *peer) startDownloadsOnOtherPeers() {
 	}
 }
 
+// startDownloadIfNeeded claims a piece for this peer to work on, unless it already holds one, is being choked, or is
+// on its way out. The whole of it is serialized, since whether the peer may take one on is decided from a snapshot of
+// what it holds and acted on afterwards, with the tracker's lock taken in between: two callers left to interleave both
+// find it holding nothing and both claim, leaving it with two pieces, a single maxOutstandingChunkRequests budget that
+// the first can consume entirely, and a second piece that is never asked for and that no other peer can take until
+// maxDownloadStall gives it back two minutes later.
 func (p *peer) startDownloadIfNeeded() {
+	p.downloadStartLock.Lock()
+	defer p.downloadStartLock.Unlock()
 	var has *fixedbits.Bits
 	p.lock.RLock()
 	if !p.bail && !p.peerChoking && len(p.pieces) == 0 {
@@ -1003,52 +1039,72 @@ func (p *peer) receivedChunk(index, begin int, buffer []byte) error {
 		p.lock.Unlock()
 	}
 	if len(one.spans.Spans) == 1 && one.spans.Spans[0].Start == 0 && one.spans.Spans[0].Length == len(one.buffer) {
-		if p.client.torrentFile.Validate(index, one.buffer) {
-			var n int
-			err := errStorageClosed
-			if f := p.client.storageFile(); f != nil {
-				n, err = f.WriteAt(one.buffer, p.client.torrentFile.OffsetOf(index))
-			}
-			one.lock.Unlock()
-			p.lock.Lock()
-			delete(p.pieces, index)
-			p.lock.Unlock()
-			if err != nil && (!errors.Is(err, io.EOF) || n != len(one.buffer)) {
-				p.client.tracker.clearDownload(index, p)
-				writeErr := errs.NewWithCause("unable to write piece", err)
-				// As on the read side, storage the shutdown has already closed isn't a failure to write
-				if !storageClosed(err) {
-					errs.LogTo(p.logger, writeErr, "index", index)
-				}
-				// Nothing a peer can do fixes storage we can't write to, so the piece is not simply downloaded again:
-				// doing that would have us pull whole pieces off the network, forever, for as long as the disk stayed
-				// full or the file unwritable, making no progress and saying nothing about it beyond another log line
-				// each time around. The torrent is stopped with the error instead.
-				p.client.failWithStorageError(writeErr)
-				return nil
-			}
-			p.client.tracker.markBlockValid(index)
-			p.client.tracker.setProgress(-1)
-			if p.client.tracker.isDownloadComplete() {
-				p.client.tracker.setState(Seeding)
-			}
-			p.updateInterest()
-			p.startDownloadIfNeeded()
-		} else {
-			one.lock.Unlock()
-			p.rejectPeer()
-			return errs.Newf("discarding invalid piece %d", index)
-		}
-	} else {
+		// The piece is whole, so nothing writes to its buffer any more and the reference alone is all that finishing
+		// it needs. The lock is dropped here rather than after that work for the reason completePiece gives.
+		whole := one.buffer
 		one.lock.Unlock()
-		if bailIfNotFinish {
-			p.bailOut()
-		} else {
-			// The chunk that just arrived freed room under the cap on how many requests we keep in front of a peer, so
-			// this is what carries the rest of a piece too large to ask for in one go out to it, a batch at a time.
-			p.signalChunkRequests()
-		}
+		return p.completePiece(index, one, whole)
 	}
+	one.lock.Unlock()
+	if bailIfNotFinish {
+		p.bailOut()
+	} else {
+		// The chunk that just arrived freed room under the cap on how many requests we keep in front of a peer, so
+		// this is what carries the rest of a piece too large to ask for in one go out to it, a batch at a time.
+		p.signalChunkRequests()
+	}
+	return nil
+}
+
+// completePiece verifies a piece whose every chunk has arrived, writes it to storage and gives up the claim on it. The
+// buffer is handed in rather than read back out of the piece because the piece's lock is deliberately not held for any
+// of this: a full-piece SHA-1 and a write of up to tfs.MaxPieceLength both run here, and that lock is taken for every
+// piece of every peer by clearExpiredDownloads, which the peer management goroutine reaches from its expiry tick and
+// from adjustPeers. Holding it across them stalls choke rotation, expiry clearing and dialing for every peer at once,
+// along with Client.Stop's bounded wait for peer management and this peer's own processChunkRequests.
+func (p *peer) completePiece(index int, one *piece, buffer []byte) error {
+	if !p.client.torrentFile.Validate(index, buffer) {
+		p.rejectPeer()
+		return errs.Newf("discarding invalid piece %d", index)
+	}
+	var n int
+	err := errStorageClosed
+	if f := p.client.storageFile(); f != nil {
+		n, err = f.WriteAt(buffer, p.client.torrentFile.OffsetOf(index))
+	}
+	// Only the claim this very piece holds is given up, which is the same re-check releaseIfStillOurs makes and for the
+	// same reason. Nothing has held the piece's lock since the buffer was taken, so clearExpiredDownloads may have
+	// released the index in the meantime and another goroutine re-claimed it here for a piece of its own — it is
+	// available again, since the block isn't marked valid until further down — and deleting whatever is there would
+	// throw that fresh claim away while its chunk requests were already on the wire. The peer would then send us a
+	// piece we are about to mark as had, every chunk of it landing in the branch of receivedChunk that ignores chunks
+	// for pieces we aren't downloading, and the whole of it charged to the tracker's downloaded total.
+	p.lock.Lock()
+	if p.pieces[index] == one {
+		delete(p.pieces, index)
+	}
+	p.lock.Unlock()
+	if err != nil && (!errors.Is(err, io.EOF) || n != len(buffer)) {
+		p.client.tracker.clearDownload(index, p)
+		writeErr := errs.NewWithCause("unable to write piece", err)
+		// As on the read side, storage the shutdown has already closed isn't a failure to write
+		if !storageClosed(err) {
+			errs.LogTo(p.logger, writeErr, "index", index)
+		}
+		// Nothing a peer can do fixes storage we can't write to, so the piece is not simply downloaded again: doing
+		// that would have us pull whole pieces off the network, forever, for as long as the disk stayed full or the
+		// file unwritable, making no progress and saying nothing about it beyond another log line each time around.
+		// The torrent is stopped with the error instead.
+		p.client.failWithStorageError(writeErr)
+		return nil
+	}
+	p.client.tracker.markBlockValid(index)
+	p.client.tracker.setProgress(-1)
+	if p.client.tracker.isDownloadComplete() {
+		p.client.tracker.setState(Seeding)
+	}
+	p.updateInterest()
+	p.startDownloadIfNeeded()
 	return nil
 }
 
